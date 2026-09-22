@@ -26,6 +26,7 @@ namespace jvm
 {
 const std::vector<Obj *> &jme_threads();
 void jme_threadForget(Obj *r);
+bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls);
 
 namespace midp
 {
@@ -47,8 +48,10 @@ std::vector<std::pair<std::string, std::string>> g_appProps;
 Obj *g_screenGfx = nullptr;
 Obj *g_fontCache[4][3] = {};
 
-// Buffer RGB565 hors-heap pour les GameCanvas (taille écran max : 240x320).
-static uint16_t g_canvas565[240 * 320];
+// Buffer RGB565 hors-heap pour les GameCanvas, dimensionné à la résolution
+// écran effective (cf. init(), appelé après hal::display_init). Allocation
+// unique au démarrage -- pas de (re)allocation en cours de partie.
+static uint16_t *g_canvas565 = nullptr;
 
 uint32_t g_keyStates = 0; // masque MIDP getKeyStates()
 int g_tickN = 0;
@@ -556,11 +559,69 @@ void g_drawImage(NativeContext *ctx)
             p.put(x - ox + xx, y - oy + yy, buf->cells[yy * iw + xx].u);
 }
 
+void g_drawRegion(NativeContext *ctx)
+{
+    Obj *img = argRef(ctx, 1);
+    int xs = argInt(ctx, 2), ys = argInt(ctx, 3);
+    int w = argInt(ctx, 4), h = argInt(ctx, 5);
+    int tfm = argInt(ctx, 6);
+    int x = argInt(ctx, 7), y = argInt(ctx, 8), anchor = argInt(ctx, 9);
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "gfx drawRegion img=%p src=(%d,%d %dx%d) tfm=%d dst=(%d,%d) anc=%d\n",
+                (void *)img, xs, ys, w, h, tfm, x, y, anchor);
+    if (!img || img->kind != ObjKind::Instance) return;
+    int iw = img->cells[IMG_W].i, ih = img->cells[IMG_H].i;
+    Obj *buf = img->cells[IMG_BUF].o;
+    if (!buf) return;
+    // Région ramenée dans les bornes de la source (CLDC : découpe au clip source).
+    if (xs < 0) { w += xs; xs = 0; }
+    if (ys < 0) { h += ys; ys = 0; }
+    if (w > iw - xs) w = iw - xs;
+    if (h > ih - ys) h = ih - ys;
+    if (w <= 0 || h <= 0) return;
+
+    // Dimensions du bloc destination : les rotations échangent largeur/hauteur.
+    bool swap = (tfm == 5 || tfm == 6 || tfm == 7 || tfm == 4); // ROT90/270, MIRROR_ROT*
+    int Wp = swap ? h : w, Hp = swap ? w : h;
+
+    int ox = 0, oy = 0;
+    if (anchor & 0x01) ox = Wp / 2;
+    else if (anchor & 0x08) ox = Wp;
+    if (anchor & 0x02) oy = Hp / 2;
+    else if (anchor & 0x20) oy = Hp;
+    else if (anchor & 0x40) oy = Hp;
+
+    Pix p(ctx->thisObj);
+    for (int dy = 0; dy < Hp; dy++)
+    {
+        for (int dx = 0; dx < Wp; dx++)
+        {
+            int sx, sy;
+            switch (tfm)
+            {
+                case 3: sx = w - 1 - dx; sy = h - 1 - dy; break;            // ROT180
+                case 2: sx = w - 1 - dx; sy = dy; break;                    // MIRROR
+                case 1: sx = dx; sy = h - 1 - dy; break;                    // MIRROR_ROT180
+                case 4: sx = dy; sy = dx; break;                            // MIRROR_ROT270
+                case 5: sx = dy; sy = w - 1 - dx; break;                    // ROT90
+                case 6: sx = h - 1 - dy; sy = dx; break;                    // ROT270
+                case 7: sx = w - 1 - dy; sy = h - 1 - dx; break;            // MIRROR_ROT90
+                default: sx = dx; sy = dy; break;                           // NONE / inconnu
+            }
+            p.put(x - ox + dx, y - oy + dy, buf->cells[(ys + sy) * iw + (xs + sx)].u);
+        }
+    }
+}
+
 void g_drawRGB(NativeContext *ctx)
 {
     Obj *rgb = argRef(ctx, 1);
     int off = argInt(ctx, 2), scan = argInt(ctx, 3);
     int x = argInt(ctx, 4), y = argInt(ctx, 5), w = argInt(ctx, 6), h = argInt(ctx, 7);
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "gfx drawRGB rgb=%p x=%d y=%d w=%d h=%d sample=0x%08x\n",
+                (void*)rgb, x, y, w, h,
+                (rgb && rgb->kind == ObjKind::IntArray && rgb->arrayLen > 0) ? rgb->cells[0].u : 0);
     if (!rgb || rgb->kind != ObjKind::IntArray || w <= 0 || h <= 0) return;
     Pix p(ctx->thisObj);
     int idx = off;
@@ -614,7 +675,7 @@ void g_getTranslateY(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[G_TY]
 
 void f_getFont(NativeContext *ctx)
 {
-    int face = argInt(ctx, 1), style = argInt(ctx, 2), size = argInt(ctx, 3);
+    int face = argInt(ctx, 0), style = argInt(ctx, 1), size = argInt(ctx, 2);
     int si = size == 8 ? 0 : (size == 16 ? 2 : 1);
     int st = style & 0x03;
     Obj *f = g_fontCache[st][si];
@@ -646,6 +707,8 @@ void f_charsWidth(NativeContext *ctx) { (void)ctx; setInt(ctx, 6 * argInt(ctx, 3
 // Image natives
 // ---------------------------------------------------------------------
 
+Obj *decodePng(const uint8_t *data, size_t len); // défini plus bas, décode en Image immuable
+
 Obj *makeImage(int w, int h, bool mutable_, Obj *buf)
 {
     Obj *img = makeInstance("javax/microedition/lcdui/Image");
@@ -660,7 +723,7 @@ Obj *makeImage(int w, int h, bool mutable_, Obj *buf)
 
 void img_createWH(NativeContext *ctx)
 {
-    int w = argInt(ctx, 1), h = argInt(ctx, 2);
+    int w = argInt(ctx, 0), h = argInt(ctx, 1);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, w * h);
@@ -670,9 +733,9 @@ void img_createWH(NativeContext *ctx)
 }
 void img_createRGB(NativeContext *ctx)
 {
-    Obj *rgb = argRef(ctx, 1);
-    int w = argInt(ctx, 2), h = argInt(ctx, 3);
-    bool processAlpha = argInt(ctx, 4) != 0;
+    Obj *rgb = argRef(ctx, 0);
+    int w = argInt(ctx, 1), h = argInt(ctx, 2);
+    bool processAlpha = argInt(ctx, 3) != 0;
     if (w < 1) w = 1; if (h < 1) h = 1;
     Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, w * h);
     if (!buf) { g_rt->reportOom(); setRef(ctx, nullptr); return; }
@@ -686,7 +749,7 @@ void img_createRGB(NativeContext *ctx)
 }
 void img_copy(NativeContext *ctx)
 {
-    Obj *src = argRef(ctx, 1);
+    Obj *src = argRef(ctx, 0);
     if (!src || src->kind != ObjKind::Instance) { setRef(ctx, nullptr); return; }
     int w = src->cells[IMG_W].i, h = src->cells[IMG_H].i;
     Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, w * h);
@@ -698,10 +761,29 @@ void img_copy(NativeContext *ctx)
 }
 void img_createString(NativeContext *ctx)
 {
-    const std::string &path = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : "";
-    // Décodage PNG non implémenté : retourne 1x1 ? Non — on tente une image
-    // opaque 1x1 pour éviter les null. À remplacer par un décodeur PNG/RLE.
-    fprintf(stderr, "[midp] createImage(\"%s\") : décodage image non implémenté\n", path.c_str());
+    std::string path = (argRef(ctx, 0) && argRef(ctx, 0)->kind == ObjKind::String) ? argRef(ctx, 0)->str : "";
+    while (!path.empty() && path[0] == '/')
+        path.erase(0, 1);
+    jme::JarReader *jar = ctx->rt->jar();
+    jme::JarEntry e;
+    if (jar && !path.empty() && jar->findEntry(path, e) && e.uncompressedSize <= 4u * 1024 * 1024)
+    {
+        uint8_t *tmp = static_cast<uint8_t *>(std::malloc(e.uncompressedSize ? e.uncompressedSize : 1));
+        if (tmp)
+        {
+            size_t n = jar->extractEntry(path, tmp, e.uncompressedSize);
+            Obj *img = (n > 0) ? decodePng(tmp, n) : nullptr;
+            std::free(tmp);
+            if (img)
+            {
+                if (getenv("JME_DEBUG"))
+                    fprintf(stderr, "[midp] createImage(\"%s\") : decode OK (%zu octets)\n", path.c_str(), n);
+                setRef(ctx, img);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "[midp] createImage(\"%s\") : introuvable ou décodage échoué\n", path.c_str());
     Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, 1);
     if (buf) buf->cells[0].u = 0xFFFFFFFF;
     setRef(ctx, makeImage(1, 1, false, buf));
@@ -791,6 +873,37 @@ void cv_repaintRegion(NativeContext *ctx) { (void)ctx; g_paintRequested = true; 
 void cv_service(NativeContext *ctx) { (void)ctx; }
 void cv_showNotify(NativeContext *ctx) { (void)ctx; }
 void cv_hideNotify(NativeContext *ctx) { (void)ctx; }
+
+// Constantes standard MIDP Canvas.{UP,DOWN,LEFT,RIGHT,FIRE,GAME_A..D}. Notre
+// HAL (halKeyToMidp, plus bas) envoie déjà directement ces valeurs comme
+// "keyCode" pour le D-pad/FIRE -- getGameAction est donc quasi l'identité
+// pour ces touches, plus le mapping des touches numériques 1/3/7/9 vers les
+// GAME_A..D (convention MIDP courante sur clavier téléphone).
+int cv_gameActionFor(int keyCode)
+{
+    switch (keyCode)
+    {
+    case 1: case 2: case 5: case 6: case 8: return keyCode; // UP/LEFT/RIGHT/DOWN/FIRE
+    case '1': return 9;  // GAME_A
+    case '3': return 10; // GAME_B
+    case '7': return 11; // GAME_C
+    case '9': return 12; // GAME_D
+    default: return 0;
+    }
+}
+void cv_getGameAction(NativeContext *ctx) { setInt(ctx, cv_gameActionFor(argInt(ctx, 1))); }
+void cv_getKeyCode(NativeContext *ctx)
+{
+    switch (argInt(ctx, 1))
+    {
+    case 1: case 2: case 5: case 6: case 8: setInt(ctx, argInt(ctx, 1)); return;
+    case 9: setInt(ctx, '1'); return;
+    case 10: setInt(ctx, '3'); return;
+    case 11: setInt(ctx, '7'); return;
+    case 12: setInt(ctx, '9'); return;
+    default: setInt(ctx, 0); return;
+    }
+}
 
 // ---------------------------------------------------------------------
 // Display natives
@@ -986,6 +1099,54 @@ void di_readLong(NativeContext *ctx) { setLong(ctx, diReadN(ctx->thisObj, 8)); }
 void di_readFully(NativeContext *ctx) { Obj *d = argRef(ctx, 1); if (d) diFill(ctx->thisObj, d, 0, d->arrayLen); }
 void di_readFullyII(NativeContext *ctx) { diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3)); }
 
+void di_readUTF(NativeContext *ctx)
+{
+    int lenH = diByte(ctx->thisObj), lenL = diByte(ctx->thisObj);
+    if (lenH < 0 || lenL < 0) { setRef(ctx, g_rt->heap().newString("")); return; }
+    int len = (lenH << 8) | lenL;
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 2);
+    for (int i = 0; i < len;)
+    {
+        int b = diByte(ctx->thisObj);
+        if (b < 0) break;
+        if (b == 0xC0)
+        {
+            int b2 = diByte(ctx->thisObj);
+            if (b2 < 0) break;
+            if (b == 0xC0 && b2 == 0x80)
+                out += '\0';
+            else
+            {
+                out += static_cast<char>(b);
+                out += static_cast<char>(b2);
+            }
+            i += 2;
+        }
+        else if (b < 0x80)
+        {
+            out += static_cast<char>(b);
+            i += 1;
+        }
+        else
+        {
+            int need = (b < 0xE0) ? 2 : 3;
+            std::string seq;
+            seq += static_cast<char>(b);
+            int ok = 1;
+            for (int k = 1; k < need; k++)
+            {
+                int b2 = diByte(ctx->thisObj);
+                if (b2 < 0) { ok = 0; break; }
+                seq += static_cast<char>(b2);
+            }
+            if (ok) out += seq;
+            i += need;
+        }
+    }
+    setRef(ctx, g_rt->heap().newString(out));
+}
+
 void di_skipBytes(NativeContext *ctx)
 {
     Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 1 ? ctx->thisObj->cells[0].o : nullptr;
@@ -1065,7 +1226,7 @@ Obj *decodePng(const uint8_t *data, size_t len)
 
 void img_createStream(NativeContext *ctx)
 {
-    Obj *src = argRef(ctx, 1);
+    Obj *src = argRef(ctx, 0);
     if (!src || src->cellCount < 3 || !src->cells[0].o)
     {
         setRef(ctx, nullptr);
@@ -1091,8 +1252,8 @@ void img_createStream(NativeContext *ctx)
 
 void img_createBytes(NativeContext *ctx)
 {
-    Obj *data = argRef(ctx, 1);
-    int off = argInt(ctx, 2), len = argInt(ctx, 3);
+    Obj *data = argRef(ctx, 0);
+    int off = argInt(ctx, 1), len = argInt(ctx, 2);
     if (!data || data->kind != ObjKind::ByteArray || off < 0 || len < 0 || off + len > data->arrayLen)
     {
         setRef(ctx, nullptr);
@@ -1112,6 +1273,30 @@ void img_createBytes(NativeContext *ctx)
 // ---------------------------------------------------------------------
 
 struct N { const char *name; const char *desc; NativeFn fn; };
+
+void mp_createPlayerIS(NativeContext *ctx)
+{
+    Obj *p = makeInstance("javax/microedition/media/Player");
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "[midp] Manager.createPlayer(InputStream, type) -> %p (stub)\n", (void *)p);
+    setRef(ctx, p);
+}
+void mp_createPlayerStr(NativeContext *ctx)
+{
+    Obj *p = makeInstance("javax/microedition/media/Player");
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "[midp] Manager.createPlayer(locator=%s) -> %p (stub)\n",
+                (argRef(ctx, 0) && argRef(ctx, 0)->kind == ObjKind::String) ? argRef(ctx, 0)->str.c_str() : "",
+                (void *)p);
+    setRef(ctx, p);
+}
+void mp_noop(NativeContext *ctx) { (void)ctx; }
+void mp_getInt(NativeContext *ctx) { setInt(ctx, 400); }
+void mp_getLong(NativeContext *ctx) { setLong(ctx, 1000); }
+void mp_getContentType(NativeContext *ctx)
+{
+    setRef(ctx, g_rt->heap().newString(""));
+}
 
 void regClass(Runtime *rt, const char *name, const char *super,
               std::initializer_list<std::pair<const char *, const char *>> methods,
@@ -1187,6 +1372,9 @@ uint32_t halKeyState(hal::KeyCode kc)
 void sendKeyEvent(Obj *target, const char *method, int keyCode)
 {
     if (!target || !g_interp) return;
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "KEY %s keyCode=%d target=%s\n", method, keyCode,
+                target->cls ? target->cls->name.c_str() : "?");
     Value args[2];
     args[0] = Value::fromRef(target);
     args[1] = Value::fromInt(keyCode);
@@ -1205,30 +1393,48 @@ void updateKeyState(uint32_t held)
     g_keyStates = st;
 }
 
+void simulatePointer(int x, int y)
+{
+    if (!g_interp || !g_current) return;
+    Obj *cur = g_current;
+    if (!cur->cls || !isSubclassOf(cur, "javax/microedition/lcdui/Canvas"))
+        return;
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "PTR press+release (%d,%d) target=%s\n", x, y,
+                cur->cls->name.c_str());
+    Value args[3];
+    args[0] = Value::fromRef(cur);
+    args[1] = Value::fromInt(x);
+    args[2] = Value::fromInt(y);
+    Value res;
+    g_interp->invokeVirtual(cur->cls, "pointerPressed", "(II)V", cur, args, 3, res);
+    g_interp->invokeVirtual(cur->cls, "pointerReleased", "(II)V", cur, args, 3, res);
+}
+
 void tick(uint32_t pressedMask, uint32_t justPressedMask, uint32_t justReleasedMask)
 {
     g_tickN++;
+    advanceVirtualMillis(16);
+    if (getenv("JME_VTRACE") && g_tickN % 10 == 0)
+        fprintf(stderr, "VTRACE frame=%d vms=%lld\n", g_tickN, (long long)virtualMillis());
     if (!g_rt || !g_interp) return;
     updateKeyState(pressedMask);
     Obj *cur = g_current;
     if (!cur || cur->kind != ObjKind::Instance)
         return;
 
-    // NOTE (diagnostic 2026-09-21, games/assasin.jar) : execBytecode n'a
-    // aucune continuation (pc/locals ne survivent pas d'une trame à l'autre,
-    // cf. interpreter.cpp) : quand le budget s'épuise en cours de route,
-    // run() est simplement rejoué depuis le début à la trame suivante. Sur
-    // assasin.jar, le thread de fond (classe "g") reste bloqué dans une
-    // boucle de ~30 bytecodes (getstatic/ifXX + 2 invokevirtual + un appel
-    // System.currentTimeMillis() + arithmétique long) qui ne s'est PAS
-    // terminée même avec un budget de 20 000 000 et même en unlimited après
-    // plus de 10 minutes de CPU réelles (des centaines de millions
-    // d'instructions) : ce n'est donc pas juste "augmenter le budget", la
-    // condition de sortie de cette boucle ne devient probablement jamais
-    // vraie dans cet interpréteur (bug d'opcode/natif suspecté, à
-    // investiguer avant de retoucher ce budget). Remis à 4000 (valeur
-    // d'origine) pour ne pas geler l'appli plusieurs minutes par trame.
-    constexpr int64_t kThreadInstrBudget = 4000;
+    // Chaque thread tourne dans sa propre fibre (ucontext, cf. jme_threadResume
+    // dans natives.cpp) : Thread.sleep()/yield(), ou l'épuisement du budget
+    // d'instructions ci-dessous, suspend RÉELLEMENT son exécution (pc,
+    // locales, pile d'appel C++ intacts) et la reprend exactement là à la
+    // trame suivante -- au lieu de relancer run() depuis le début à chaque
+    // trame (ce qui empêchait toute progression pour les jeux dont la
+    // boucle principale dépasse le budget par trame, ex. limiteurs de FPS
+    // en bytecode qui font des dizaines de milliers d'itérations entre deux
+    // Thread.sleep()). Le budget ci-dessous n'est donc plus qu'un
+    // garde-fou anti-boucle-infinie-sans-yield, pas la seule source de
+    // suspension.
+    constexpr int64_t kThreadInstrBudget = 200000;
 
     const std::vector<Obj *> &threads = jme_threads();
     std::vector<Obj *> done;
@@ -1238,20 +1444,18 @@ void tick(uint32_t pressedMask, uint32_t justPressedMask, uint32_t justReleasedM
         if (getenv("JME_DEBUG") && !rm)
             fprintf(stderr, "run()V introuvable sur %s (runnable=%p)\n", r->cls->name.c_str(), (void *)r);
         g_interp->setInstrBudget(kThreadInstrBudget);
-        Value res;
-        bool finished = g_interp->invokeVirtual(r->cls, "run", "()V", r, nullptr, 0, res);
+        bool finished = jme_threadResume(r, g_interp, r->cls);
+        g_interp->setInstrBudget(-1);
         if (getenv("JME_DEBUG") && jme_tickCount())
-            fprintf(stderr, "run_frame=%d fmt=%zu ops=%lld finished=%d left=%lld\n",
-                    jme_tickCount(), threads.size(), kThreadInstrBudget - g_interp->instrBudgetLeft(),
-                    finished ? 1 : 0, (long long)g_interp->instrBudgetLeft());
-        if (finished && g_interp->instrBudgetLeft() >= 0)
+            fprintf(stderr, "run_frame=%d fmt=%zu finished=%d\n",
+                    jme_tickCount(), threads.size(), finished ? 1 : 0);
+        if (finished)
             done.push_back(r);
     }
     for (Obj *r : done) jme_threadForget(r);
-    g_interp->setInstrBudget(-1);
 
     bool isCanvas = isSubclassOf(cur, "javax/microedition/lcdui/Canvas");
-    bool isGameCanvas = isSubclassOf(cur, "javax/microedition/lcdui/GameCanvas");
+    bool isGameCanvas = isSubclassOf(cur, "javax/microedition/lcdui/game/GameCanvas");
 
     if (isCanvas && !isGameCanvas)
     {
@@ -1283,6 +1487,9 @@ void init(Runtime *rt, Interpreter *interp)
     g_rt = rt;
     g_interp = interp;
 
+    delete[] g_canvas565;
+    g_canvas565 = new uint16_t[static_cast<size_t>(screenW()) * static_cast<size_t>(screenH())]();
+
     const std::initializer_list<std::pair<const char *, const char *>> none = {};
 
     // --- java.lang ---
@@ -1290,13 +1497,13 @@ void init(Runtime *rt, Interpreter *interp)
              {{"<init>", "()V"}, {"getClass", "()Ljava/lang/Class;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"}},
              none);
     regClass(rt, "java/lang/String", "java/lang/Object",
-             {{"<init>", "()V"}, {"<init>", "(Ljava/lang/String;)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(I)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}},
+             {{"<init>", "()V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "([BLjava/lang/String;)V"}, {"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(Ljava/lang/String;I)I"}, {"indexOf", "(I)I"}, {"indexOf", "(II)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}},
              none);
     regClass(rt, "java/lang/Math", "java/lang/Object",
              {{"abs", "(I)I"}, {"abs", "(J)J"}, {"min", "(II)I"}, {"min", "(JJ)J"}, {"max", "(II)I"}, {"max", "(JJ)J"}, {"sqrt", "(D)D"}, {"floor", "(D)D"}, {"ceil", "(D)D"}, {"round", "(D)J"}, {"pow", "(DD)D"}, {"random", "()D"}},
              none);
     regClass(rt, "java/lang/System", "java/lang/Object",
-             {{"currentTimeMillis", "()J"}, {"arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"}, {"gc", "()V"}, {"identityHashCode", "(Ljava/lang/Object;)I"}},
+             {{"currentTimeMillis", "()J"}, {"arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"}, {"gc", "()V"}, {"identityHashCode", "(Ljava/lang/Object;)I"}, {"getProperty", "(Ljava/lang/String;)Ljava/lang/String;"}},
              {{"out", "Ljava/io/PrintStream;"}});
     regClass(rt, "java/io/PrintStream", "java/lang/Object",
              {{"println", "(Ljava/lang/String;)V"}, {"println", "(I)V"}, {"println", "()V"}, {"print", "(Ljava/lang/String;)V"}, {"print", "(I)V"}, {"flush", "()V"}},
@@ -1313,7 +1520,7 @@ void init(Runtime *rt, Interpreter *interp)
              {{"<init>", "()V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "(I)V"}, {"append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;"}, {"append", "(I)Ljava/lang/StringBuffer;"}, {"append", "(C)Ljava/lang/StringBuffer;"}, {"append", "(J)Ljava/lang/StringBuffer;"}, {"append", "(Z)Ljava/lang/StringBuffer;"}, {"append", "(Ljava/lang/Object;)Ljava/lang/StringBuffer;"}, {"append", "(F)Ljava/lang/StringBuffer;"}, {"append", "(D)Ljava/lang/StringBuffer;"}, {"toString", "()Ljava/lang/String;"}, {"length", "()I"}, {"charAt", "(I)C"}, {"setCharAt", "(IC)V"}, {"setLength", "(I)V"}, {"delete", "(II)Ljava/lang/StringBuffer;"}},
              {{"str", "Ljava/lang/String;"}});
     regClass(rt, "java/lang/Thread", "java/lang/Object",
-             {{"<init>", "(Ljava/lang/Runnable;)V"}, {"run", "()V"}, {"start", "()V"}, {"sleep", "(J)V"}, {"currentThread", "()Ljava/lang/Thread;"}, {"setPriority", "(I)V"}, {"interrupt", "()V"}, {"isAlive", "()Z"}, {"join", "()V"}},
+             {{"<init>", "(Ljava/lang/Runnable;)V"}, {"run", "()V"}, {"start", "()V"}, {"sleep", "(J)V"}, {"yield", "()V"}, {"currentThread", "()Ljava/lang/Thread;"}, {"setPriority", "(I)V"}, {"interrupt", "()V"}, {"isAlive", "()Z"}, {"join", "()V"}},
              {{"r", "Ljava/lang/Runnable;"}});
     regClass(rt, "java/util/Hashtable", "java/lang/Object",
              {{"<init>", "()V"}, {"get", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"}, {"remove", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"containsKey", "(Ljava/lang/Object;)Z"}, {"clear", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}},
@@ -1321,6 +1528,15 @@ void init(Runtime *rt, Interpreter *interp)
     regClass(rt, "java/util/Random", "java/lang/Object",
              {{"<init>", "(J)V"}, {"<init>", "()V"}, {"setSeed", "(J)V"}, {"nextInt", "()I"}, {"nextInt", "(I)I"}, {"nextLong", "()J"}, {"nextDouble", "()D"}, {"nextFloat", "()F"}, {"nextBoolean", "()Z"}},
              {{"seed", "J"}});
+    regClass(rt, "java/util/Vector", "java/lang/Object",
+             {{"<init>", "()V"}, {"<init>", "(I)V"},
+              {"addElement", "(Ljava/lang/Object;)V"}, {"elementAt", "(I)Ljava/lang/Object;"},
+              {"setElementAt", "(Ljava/lang/Object;I)V"}, {"insertElementAt", "(Ljava/lang/Object;I)V"},
+              {"removeElement", "(Ljava/lang/Object;)Z"}, {"removeElementAt", "(I)V"},
+              {"removeAllElements", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"},
+              {"contains", "(Ljava/lang/Object;)Z"}, {"indexOf", "(Ljava/lang/Object;)I"},
+              {"firstElement", "()Ljava/lang/Object;"}, {"lastElement", "()Ljava/lang/Object;"}},
+             {{"elementCount", "I"}, {"elementData", "[Ljava/lang/Object;"}});
 
     // --- java.io ---
     regClass(rt, "java/io/InputStream", "java/lang/Object",
@@ -1330,7 +1546,7 @@ void init(Runtime *rt, Interpreter *interp)
              {{"<init>", "([B)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"available", "()I"}, {"skip", "(J)J"}, {"close", "()V"}, {"markSupported", "()Z"}, {"mark", "(I)V"}, {"reset", "()V"}},
              {{"data", "[B"}, {"pos", "I"}, {"limit", "I"}});
     regClass(rt, "java/io/DataInputStream", "java/lang/Object",
-             {{"<init>", "(Ljava/io/InputStream;)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"readBoolean", "()Z"}, {"readByte", "()B"}, {"readUnsignedByte", "()I"}, {"readShort", "()S"}, {"readUnsignedShort", "()I"}, {"readChar", "()C"}, {"readInt", "()I"}, {"readLong", "()J"}, {"readFully", "([B)V"}, {"readFully", "([BII)V"}, {"skipBytes", "(I)I"}, {"available", "()I"}, {"close", "()V"}},
+             {{"<init>", "(Ljava/io/InputStream;)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"readBoolean", "()Z"}, {"readByte", "()B"}, {"readUnsignedByte", "()I"}, {"readShort", "()S"}, {"readUnsignedShort", "()I"}, {"readChar", "()C"}, {"readInt", "()I"}, {"readLong", "()J"}, {"readFully", "([B)V"}, {"readFully", "([BII)V"}, {"readUTF", "()Ljava/lang/String;"}, {"skipBytes", "(I)I"}, {"available", "()I"}, {"close", "()V"}},
              {{"in", "Ljava/io/InputStream;"}});
 
     // --- MIDlet ---
@@ -1342,14 +1558,52 @@ void init(Runtime *rt, Interpreter *interp)
     regClass(rt, "javax/microedition/lcdui/Displayable", "java/lang/Object",
              {{"setTitle", "(Ljava/lang/String;)V"}, {"getTitle", "()Ljava/lang/String;"}, {"addCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setCommandListener", "(Ljavax/microedition/lcdui/CommandListener;)V"}, {"isShown", "()Z"}, {"getWidth", "()I"}, {"getHeight", "()I"}},
              none);
+    // GC_FULLSCREEN/GC_GFX (cf. plus bas) indexent cells[0]/cells[1] de
+    // l'instance via les accesseurs gc_* -- et CES ACCESSEURS SONT PARTAGÉS
+    // entre Canvas ET GameCanvas (setFullScreenMode/getGraphics/
+    // flushGraphics/getKeyStates sont enregistrés sur les DEUX classes, cf.
+    // plus bas). Les 2 champs doivent donc être réservés ici, sur Canvas
+    // lui-même (l'ancêtre commun), et non sur GameCanvas seul : un jeu qui
+    // étend directement Canvas (ou FullCanvas, qui étend Canvas) et appelle
+    // setFullScreenMode()/getGraphics() sans jamais passer par GameCanvas
+    // écrivait sinon directement dans cells[0]/cells[1] de l'instance --
+    // silencieusement aliasés avec les 2 premiers champs applicatifs de la
+    // sous-classe concrète (observé sur games/prince.jar : cells[0] d'un
+    // Canvas obfusqué, son propre champ "bi" (référence vers le MIDlet),
+    // écrasé par le booléen passé à setFullScreenMode(true), provoquant un
+    // crash différé bien plus tard sur un getfield lisant ce même champ).
     regClass(rt, "javax/microedition/lcdui/Canvas", "javax/microedition/lcdui/Displayable",
-             {{"getWidth", "()I"}, {"getHeight", "()I"}, {"isDoubleBuffered", "()Z"}, {"repaint", "()V"}, {"repaint", "(IIII)V"}, {"serviceRepaints", "()V"}, {"showNotify", "()V"}, {"hideNotify", "()V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}},
-             none);
-    regClass(rt, "javax/microedition/lcdui/GameCanvas", "javax/microedition/lcdui/Canvas",
+             {{"getWidth", "()I"}, {"getHeight", "()I"}, {"isDoubleBuffered", "()Z"}, {"repaint", "()V"}, {"repaint", "(IIII)V"}, {"serviceRepaints", "()V"}, {"showNotify", "()V"}, {"hideNotify", "()V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}, {"getGameAction", "(I)I"}, {"getKeyCode", "(I)I"}, {"keyPressed", "(I)V"}, {"keyReleased", "(I)V"}, {"keyRepeated", "(I)V"}, {"pointerPressed", "(II)V"}, {"pointerReleased", "(II)V"}, {"pointerDragged", "(II)V"}},
+             {{"__fullscreen", "Z"}, {"__gfx", "Ljavax/microedition/lcdui/Graphics;"}});
+    regClass(rt, "javax/microedition/lcdui/game/GameCanvas", "javax/microedition/lcdui/Canvas",
              {{"<init>", "(Z)V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}},
              none);
+    // com.nokia.mid.ui.FullCanvas : extension Nokia UI API (pas MIDP
+    // standard), très utilisée par les jeux ciblant les téléphones Nokia de
+    // l'époque à la place de javax.microedition.lcdui.Canvas -- observé sur
+    // games/mission.jar (GloftMI3). Son API (paint/keyPressed/keyReleased/
+    // getWidth/getHeight/repaint/setFullScreenMode/...) est un sur-ensemble
+    // de Canvas ; on la fait donc hériter de notre Canvas natif pour
+    // réutiliser telles quelles toutes ses natives. Les constantes de touche
+    // Nokia (KEY_SOFTKEY1, KEY_UP_ARROW, ...) sont `static final int` côté
+    // Java : javac les inline en littéraux au site d'appel, donc aucun champ
+    // à déclarer ici pour qu'un getstatic les résolve.
+    regClass(rt, "com/nokia/mid/ui/FullCanvas", "javax/microedition/lcdui/Canvas",
+             none, none);
+    // javax.microedition.rms.RecordStore : magasin d'enregistrements MIDP
+    // (sauvegardes/scores/préférences). Implémentation minimale en mémoire
+    // côté C++ (natives.cpp, rsRegistry()) -- non persistante entre
+    // lancements, mais suffisante pour le chemin "aucune sauvegarde
+    // existante" (getNumRecords()==0) qu'exercent la plupart des jeux au
+    // premier lancement.
+    regClass(rt, "javax/microedition/rms/RecordStore", "java/lang/Object",
+             {{"openRecordStore", "(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;"},
+              {"getNumRecords", "()I"}, {"getRecord", "(I[BI)I"}, {"getRecordSize", "(I)I"},
+              {"setRecord", "(I[BII)V"}, {"addRecord", "([BII)I"}, {"closeRecordStore", "()V"},
+              {"deleteRecordStore", "(Ljava/lang/String;)V"}},
+             {{"__name", "Ljava/lang/String;"}});
     regClass(rt, "javax/microedition/lcdui/Graphics", "java/lang/Object",
-             {{"setColor", "(I)V"}, {"setColor", "(III)V"}, {"getColor", "()I"}, {"setGrayScale", "(I)V"}, {"getGrayScale", "()I"}, {"fillRect", "(IIII)V"}, {"drawRect", "(IIII)V"}, {"drawLine", "(IIII)V"}, {"fillTriangle", "(IIIIII)V"}, {"drawArc", "(IIIIII)V"}, {"fillArc", "(IIIIII)V"}, {"fillRoundRect", "(IIIIII)V"}, {"drawRoundRect", "(IIIIII)V"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}, {"getFont", "()Ljavax/microedition/lcdui/Font;"}, {"drawString", "(Ljava/lang/String;II)V"}, {"drawChar", "(CII)V"}, {"drawChars", "([CIIII)V"}, {"drawImage", "(Ljavax/microedition/lcdui/Image;II)V"}, {"setClip", "(IIII)V"}, {"clipRect", "(IIII)V"}, {"getClipX", "()I"}, {"getClipY", "()I"}, {"getClipWidth", "()I"}, {"getClipHeight", "()I"}, {"translate", "(II)V"}, {"getTranslateX", "()I"}, {"getTranslateY", "()I"}, {"drawRGB", "([IIIIII)V"}},
+             {{"setColor", "(I)V"}, {"setColor", "(III)V"}, {"getColor", "()I"}, {"setGrayScale", "(I)V"}, {"getGrayScale", "()I"}, {"fillRect", "(IIII)V"}, {"drawRect", "(IIII)V"}, {"drawLine", "(IIII)V"}, {"fillTriangle", "(IIIIII)V"}, {"drawArc", "(IIIIII)V"}, {"fillArc", "(IIIIII)V"}, {"fillRoundRect", "(IIIIII)V"}, {"drawRoundRect", "(IIIIII)V"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}, {"getFont", "()Ljavax/microedition/lcdui/Font;"}, {"drawString", "(Ljava/lang/String;II)V"}, {"drawString", "(Ljava/lang/String;III)V"}, {"drawChar", "(CII)V"}, {"drawChars", "([CIIII)V"}, {"drawImage", "(Ljavax/microedition/lcdui/Image;III)V"}, {"drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V"}, {"setClip", "(IIII)V"}, {"clipRect", "(IIII)V"}, {"getClipX", "()I"}, {"getClipY", "()I"}, {"getClipWidth", "()I"}, {"getClipHeight", "()I"}, {"translate", "(II)V"}, {"getTranslateX", "()I"}, {"getTranslateY", "()I"}, {"drawRGB", "([IIIIIIIZ)V"}},
              {{"color", "I"}, {"font", "Ljavax/microedition/lcdui/Font;"}, {"translateX", "I"}, {"translateY", "I"}, {"clipX", "I"}, {"clipY", "I"}, {"clipW", "I"}, {"clipH", "I"}, {"mode", "I"}, {"targetW", "I"}, {"targetH", "I"}, {"stride", "I"}, {"buf", "[I"}});
     regClass(rt, "javax/microedition/lcdui/Font", "java/lang/Object",
              {{"getFont", "(III)Ljavax/microedition/lcdui/Font;"}, {"getHeight", "()I"}, {"getBaselinePosition", "()I"}, {"getFace", "()I"}, {"getStyle", "()I"}, {"getSize", "()I"}, {"stringWidth", "(Ljava/lang/String;)I"}, {"charWidth", "(C)I"}, {"charsWidth", "([CII)I"}},
@@ -1368,7 +1622,7 @@ void init(Runtime *rt, Interpreter *interp)
     regClass(rt, "javax/microedition/lcdui/AlertType", "java/lang/Object",
              {{"<init>", "()V"}}, none);
     regClass(rt, "javax/microedition/lcdui/Command", "java/lang/Object",
-             {{"<init>", "(Ljava/lang/String;III)V"}, {"getLabel", "()Ljava/lang/String;"}},
+             {{"<init>", "(Ljava/lang/String;II)V"}, {"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"getLabel", "()Ljava/lang/String;"}},
              none);
     regClass(rt, "javax/microedition/lcdui/Item", "java/lang/Object",
              {{"getLabel", "()Ljava/lang/String;"}, {"setLabel", "(Ljava/lang/String;)V"}}, none);
@@ -1405,42 +1659,36 @@ void init(Runtime *rt, Interpreter *interp)
              {{"<init>", "(Ljava/lang/String;)V"}, {"getMinContentWidth", "()I"}, {"getMinContentHeight", "()I"}, {"getPrefContentWidth", "(I)I"}, {"getPrefContentHeight", "(I)I"}, {"repaint", "()V"}},
              none);
 
+    // --- MMAPI (stub audio : pas de son, débloque Manager.createPlayer) ---
+    regClass(rt, "javax/microedition/media/Player", "java/lang/Object",
+             {{"realize", "()V"}, {"prefetch", "()V"}, {"start", "()V"}, {"stop", "()V"},
+              {"deallocate", "()V"}, {"close", "()V"}, {"setLoopCount", "(I)V"},
+              {"getState", "()I"}, {"getDuration", "()J"}, {"getMediaTime", "()J"},
+              {"setMediaTime", "(J)J"}, {"getContentType", "()Ljava/lang/String;"},
+              {"addPlayerListener", "(Ljavax/microedition/media/PlayerListener;)V"},
+              {"removePlayerListener", "(Ljavax/microedition/media/PlayerListener;)V"}},
+             none);
+    regClass(rt, "javax/microedition/media/Manager", "java/lang/Object",
+             {{"createPlayer", "(Ljava/lang/String;)Ljavax/microedition/media/Player;"},
+              {"createPlayer", "(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/microedition/media/Player;"}},
+             none);
+    regClass(rt, "javax/microedition/media/PlayerListener", "java/lang/Object", none, none);
+
     // ---- Handlers de base (java.lang) ----
-    regN("java/lang/Object.<init>:()V", ui_noop);
-    regN("java/lang/Object.getClass:()Ljava/lang/Class;", ui_noop);
-    regN("java/lang/Object.hashCode:()I", ui_noop);
-    regN("java/lang/Object.toString:()Ljava/lang/String;", ui_noop);
-
-    regN("java/lang/String.<init>:()V", ui_noop);
-    regN("java/lang/String.<init>:(Ljava/lang/String;)V", ui_noop);
-    regN("java/lang/String.length:()I", ui_noop);
-    regN("java/lang/String.charAt:(I)C", ui_noop);
-    regN("java/lang/String.hashCode:()I", ui_noop);
-
-    regN("java/lang/Math.abs:(I)I", ui_noop);
-    regN("java/lang/Math.abs:(J)J", ui_noop);
-    regN("java/lang/Math.min:(II)I", ui_noop);
-    regN("java/lang/Math.max:(II)I", ui_noop);
-    regN("java/lang/Math.sqrt:(D)D", ui_noop);
-    regN("java/lang/Math.floor:(D)D", ui_noop);
-    regN("java/lang/Math.ceil:(D)D", ui_noop);
-    regN("java/lang/Math.round:(D)J", ui_noop);
-    regN("java/lang/Math.pow:(DD)D", ui_noop);
-    regN("java/lang/Math.random:()D", ui_noop);
-
-    regN("java/lang/System.currentTimeMillis:()J", ui_noop);
-    regN("java/lang/System.arraycopy:(Ljava/lang/Object;ILjava/lang/Object;II)V", ui_noop);
-    regN("java/lang/System.gc:()V", ui_noop);
-
+    // ATTENTION : natives.cpp (initNatives(), appelé avant midp::init() —
+    // cf. main.cpp) enregistre déjà des implémentations réelles pour
+    // Object/String/Math/System/PrintStream/Class.getName+forName.
+    // registerNative() fait un simple écrasement de map (registry()[key]=fn) :
+    // réenregistrer ces mêmes clés ici avec `ui_noop` les neutralisait
+    // SILENCIEUSEMENT (aucune erreur, juste un no-op qui ne renseigne jamais
+    // le résultat). Bug sévère et large spectre — entre autres,
+    // System.currentTimeMillis() retournait toujours 0 et System.arraycopy()
+    // ne faisait plus rien pour absolument tous les MIDlets, symptôme
+    // observé indirectement dans plusieurs diagnostics précédents sur ce
+    // dépôt. Seule Class.getResourceAsStream n'est PAS dupliquée par
+    // natives.cpp (elle a besoin d'accéder au jar, propre à cette couche
+    // midp) : c'est la seule entrée qui doit rester ici.
     regN("java/io/PrintStream.<init>:(Ljava/io/OutputStream;)V", ui_noop);
-    regN("java/io/PrintStream.println:(Ljava/lang/String;)V", ui_noop);
-    regN("java/io/PrintStream.println:(I)V", ui_noop);
-    regN("java/io/PrintStream.print:(Ljava/lang/String;)V", ui_noop);
-    regN("java/io/PrintStream.print:(I)V", ui_noop);
-    regN("java/io/PrintStream.flush:()V", ui_noop);
-
-    regN("java/lang/Class.getName:()Ljava/lang/String;", ui_noop);
-    regN("java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;", ui_noop);
     regN("java/lang/Class.getResourceAsStream:(Ljava/lang/String;)Ljava/io/InputStream;", cl_getResourceAsStream);
 
     // ---- Handlers java.io ----
@@ -1477,6 +1725,8 @@ void init(Runtime *rt, Interpreter *interp)
     regN("java/io/DataInputStream.readLong:()J", di_readLong);
     regN("java/io/DataInputStream.readFully:([B)V", di_readFully);
     regN("java/io/DataInputStream.readFully:([BII)V", di_readFullyII);
+    regN("java/io/DataInputStream.readUTF:()Ljava/lang/String;", di_readUTF);
+    regN("java/io/DataInputStream.close:()V", is_close);
     regN("java/io/DataInputStream.skipBytes:(I)I", di_skipBytes);
 
     // ---- Handlers lcdui ----
@@ -1504,9 +1754,11 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Graphics.fillRoundRect:(IIIIII)V", g_fillRoundRect);
     regN("javax/microedition/lcdui/Graphics.drawRoundRect:(IIIIII)V", g_drawRoundRect);
     regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
+    regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
     regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
     regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
-    regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;II)V", g_drawImage);
+    regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
+    regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
     regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);
     regN("javax/microedition/lcdui/Graphics.clipRect:(IIII)V", g_clipRect);
     regN("javax/microedition/lcdui/Graphics.getClipX:()I", g_getClipX);
@@ -1516,11 +1768,13 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Graphics.translate:(II)V", g_translate);
     regN("javax/microedition/lcdui/Graphics.getTranslateX:()I", g_getTranslateX);
     regN("javax/microedition/lcdui/Graphics.getTranslateY:()I", g_getTranslateY);
-    regN("javax/microedition/lcdui/Graphics.drawRGB:([IIIIII)V", g_drawRGB);
+    regN("javax/microedition/lcdui/Graphics.drawRGB:([IIIIIIIZ)V", g_drawRGB);
     regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
+    regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
     regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
     regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
-    regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;II)V", g_drawImage);
+    regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
+    regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
     regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);
     regN("javax/microedition/lcdui/Graphics.clipRect:(IIII)V", g_clipRect);
     regN("javax/microedition/lcdui/Graphics.getClipX:()I", g_getClipX);
@@ -1553,12 +1807,12 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Image.isMutable:()Z", img_isMutable);
     regN("javax/microedition/lcdui/Image.getRGB:([IIIIII)V", img_getRGB);
 
-    regN("javax/microedition/lcdui/GameCanvas.<init>:(Z)V", gc_init);
-    regN("javax/microedition/lcdui/GameCanvas.setFullScreenMode:(Z)V", gc_setFullScreen);
-    regN("javax/microedition/lcdui/GameCanvas.getGraphics:()Ljavax/microedition/lcdui/Graphics;", gc_getGraphics);
-    regN("javax/microedition/lcdui/GameCanvas.flushGraphics:()V", gc_flushGraphics);
-    regN("javax/microedition/lcdui/GameCanvas.flushGraphics:(IIII)V", gc_flushRegion);
-    regN("javax/microedition/lcdui/GameCanvas.getKeyStates:()I", gc_getKeyStates);
+    regN("javax/microedition/lcdui/game/GameCanvas.<init>:(Z)V", gc_init);
+    regN("javax/microedition/lcdui/game/GameCanvas.setFullScreenMode:(Z)V", gc_setFullScreen);
+    regN("javax/microedition/lcdui/game/GameCanvas.getGraphics:()Ljavax/microedition/lcdui/Graphics;", gc_getGraphics);
+    regN("javax/microedition/lcdui/game/GameCanvas.flushGraphics:()V", gc_flushGraphics);
+    regN("javax/microedition/lcdui/game/GameCanvas.flushGraphics:(IIII)V", gc_flushRegion);
+    regN("javax/microedition/lcdui/game/GameCanvas.getKeyStates:()I", gc_getKeyStates);
 
     regN("javax/microedition/lcdui/Canvas.getWidth:()I", cv_getWidth);
     regN("javax/microedition/lcdui/Canvas.getHeight:()I", cv_getHeight);
@@ -1573,6 +1827,18 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Canvas.serviceRepaints:()V", cv_service);
     regN("javax/microedition/lcdui/Canvas.showNotify:()V", cv_showNotify);
     regN("javax/microedition/lcdui/Canvas.hideNotify:()V", cv_hideNotify);
+    regN("javax/microedition/lcdui/Canvas.getGameAction:(I)I", cv_getGameAction);
+    regN("javax/microedition/lcdui/Canvas.getKeyCode:(I)I", cv_getKeyCode);
+    // Implémentations par défaut (no-op) : keyPressed/keyReleased/keyRepeated
+    // et le pointeur tactile sont optionnels en MIDP -- une sous-classe qui
+    // n'en surcharge qu'une partie (ex. keyPressed sans keyReleased) ne doit
+    // pas faire échouer invokeVirtual quand tick() appelle l'autre.
+    regN("javax/microedition/lcdui/Canvas.keyPressed:(I)V", ui_noop);
+    regN("javax/microedition/lcdui/Canvas.keyReleased:(I)V", ui_noop);
+    regN("javax/microedition/lcdui/Canvas.keyRepeated:(I)V", ui_noop);
+    regN("javax/microedition/lcdui/Canvas.pointerPressed:(II)V", ui_noop);
+    regN("javax/microedition/lcdui/Canvas.pointerReleased:(II)V", ui_noop);
+    regN("javax/microedition/lcdui/Canvas.pointerDragged:(II)V", ui_noop);
 
     regN("javax/microedition/lcdui/Display.getDisplay:(Ljavax/microedition/midlet/MIDlet;)Ljavax/microedition/lcdui/Display;", d_getDisplay);
     regN("javax/microedition/lcdui/Display.getCurrent:()Ljavax/microedition/lcdui/Displayable;", d_getCurrent);
@@ -1600,7 +1866,8 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Alert.setTimeout:(I)V", ui_noop);
     regN("javax/microedition/lcdui/Alert.setString:(Ljava/lang/String;)V", ui_noop);
     regN("javax/microedition/lcdui/AlertType.<init>:()V", ui_noop);
-    regN("javax/microedition/lcdui/Command.<init>:(Ljava/lang/String;III)V", ui_noop);
+    regN("javax/microedition/lcdui/Command.<init>:(Ljava/lang/String;II)V", ui_noop);
+    regN("javax/microedition/lcdui/Command.<init>:(Ljava/lang/String;Ljava/lang/String;II)V", ui_noop);
     regN("javax/microedition/lcdui/Command.getLabel:()Ljava/lang/String;", ui_noop);
     regN("javax/microedition/lcdui/Item.getLabel:()Ljava/lang/String;", ui_noop);
     regN("javax/microedition/lcdui/Item.setLabel:(Ljava/lang/String;)V", ui_noop);
@@ -1640,6 +1907,41 @@ void init(Runtime *rt, Interpreter *interp)
     regN("javax/microedition/lcdui/Displayable.addCommand:(Ljavax/microedition/lcdui/Command;)V", ui_noop);
     regN("javax/microedition/lcdui/Displayable.setCommandListener:(Ljavax/microedition/lcdui/CommandListener;)V", ui_noop);
     regN("javax/microedition/lcdui/Displayable.isShown:()Z", ui_true);
+
+    // ---- Handlers MMAPI (stub : pas de son) ----
+    regN("javax/microedition/media/Manager.createPlayer:(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/microedition/media/Player;", mp_createPlayerIS);
+    regN("javax/microedition/media/Manager.createPlayer:(Ljava/lang/String;)Ljavax/microedition/media/Player;", mp_createPlayerStr);
+    regN("javax/microedition/media/Player.realize:()V", mp_noop);
+    regN("javax/microedition/media/Player.prefetch:()V", mp_noop);
+    regN("javax/microedition/media/Player.start:()V", mp_noop);
+    regN("javax/microedition/media/Player.stop:()V", mp_noop);
+    regN("javax/microedition/media/Player.deallocate:()V", mp_noop);
+    regN("javax/microedition/media/Player.close:()V", mp_noop);
+    regN("javax/microedition/media/Player.setLoopCount:(I)V", mp_noop);
+    regN("javax/microedition/media/Player.getState:()I", mp_getInt);
+    regN("javax/microedition/media/Player.getDuration:()J", mp_getLong);
+    regN("javax/microedition/media/Player.getMediaTime:()J", mp_getLong);
+    regN("javax/microedition/media/Player.setMediaTime:(J)J", mp_getLong);
+    regN("javax/microedition/media/Player.getContentType:()Ljava/lang/String;", mp_getContentType);
+    regN("javax/microedition/media/Player.addPlayerListener:(Ljavax/microedition/media/PlayerListener;)V", mp_noop);
+    regN("javax/microedition/media/Player.removePlayerListener:(Ljavax/microedition/media/PlayerListener;)V", mp_noop);
+
+    // java/lang/System.out : en Java réel, c'est le VM bootstrap qui
+    // l'initialise avant tout <clinit> utilisateur -- les classes natives
+    // n'ont pas de <clinit> ici pour le faire. Sans ceci, tout
+    // System.out.println(...) plante sur "thisObj NULL" (out reste à sa
+    // valeur par défaut = référence nulle).
+    {
+        ClassInfo *sysCls = rt->classInfoOfName("java/lang/System");
+        ClassInfo *psCls = rt->classInfoOfName("java/io/PrintStream");
+        const MethodRecord *outField = sysCls ? sysCls->findField("out", "Ljava/io/PrintStream;") : nullptr;
+        if (sysCls && psCls && outField)
+        {
+            Obj *out = rt->heap().newInstance(psCls);
+            if (out)
+                sysCls->statics[outField->slot] = Value::fromRef(out);
+        }
+    }
 }
 
 } // namespace midp

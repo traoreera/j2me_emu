@@ -35,5 +35,10 @@ Obj *currentDisplayable();
 // keyMaskJust/Released : masques bruts du HAL.
 void tick(uint32_t pressedMask, uint32_t justPressedMask, uint32_t justReleasedMask);
 
+// Simule un appui stylet/tactile sur le canvas courant : dispatch
+// pointerPressed puis pointerReleased au point (x, y) (écran logique).
+// Ne fait rien si l'affichable courant n'est pas un Canvas.
+void simulatePointer(int x, int y);
+
 } // namespace midp
 } // namespace jvm

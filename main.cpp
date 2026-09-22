@@ -50,6 +50,10 @@ int main(int argc, char **argv)
            manifest.mainClass.c_str());
 
     hal::DisplayConfig cfg{240, 320};
+    if (const char *w = getenv("JME_WIDTH"))
+        cfg.width = atoi(w);
+    if (const char *h = getenv("JME_HEIGHT"))
+        cfg.height = atoi(h);
     if (!hal::display_init(&cfg))
     {
         fprintf(stderr, "Echec init display\n");
@@ -57,7 +61,10 @@ int main(int argc, char **argv)
     }
     hal::input_init();
 
-    jvm::Runtime rt;
+    size_t heapSize = jvm::Heap::kDefaultPoolSize;
+    if (const char *hs = getenv("JME_HEAP"))
+        heapSize = static_cast<size_t>(atol(hs)) * 1024;
+    jvm::Runtime rt(heapSize);
     jvm::Interpreter interp(&rt);
     rt.setJar(&jar);
 
@@ -153,6 +160,7 @@ int main(int argc, char **argv)
         maxFrames = atoi(mf);
 
     uint32_t autoKey = 0;
+    int autoKeyFrame = -1;
     if (const char *ak = getenv("JME_AUTOKEY"))
     {
         std::string s(ak);
@@ -168,6 +176,17 @@ int main(int argc, char **argv)
         else if (s == "UP") autoKey = hal::KEY_UP;
         else if (s == "DOWN") autoKey = hal::KEY_DOWN;
     }
+    if (const char *akf = getenv("JME_AUTOKEYFRAME"))
+        autoKeyFrame = atoi(akf);
+
+    int autoTouchX = -1, autoTouchY = -1, autoTouchFrame = -1;
+    if (const char *at = getenv("JME_AUTOTOUCH"))
+    {
+        if (std::sscanf(at, "%d,%d", &autoTouchX, &autoTouchY) != 2)
+            { autoTouchX = -1; autoTouchY = -1; }
+        if (const char *atf = getenv("JME_AUTOTOUCHFRAME"))
+            autoTouchFrame = atoi(atf);
+    }
 
     while (running)
     {
@@ -175,12 +194,18 @@ int main(int argc, char **argv)
 
         if (autoKey)
         {
+            bool hold = (autoKeyFrame < 0);
             input.pressed |= autoKey;
-            if (frame < 1) input.justPressed |= autoKey;
+            if (hold ? (frame < 1) : (frame == autoKeyFrame)) input.justPressed |= autoKey;
+            if (!hold && frame == autoKeyFrame) input.pressed &= ~autoKey;
         }
 
         if ((input.justPressed & (hal::KEY_SOFT2 | hal::KEY_SOFT1)) && !(autoKey & (hal::KEY_SOFT2 | hal::KEY_SOFT1)))
             break;
+
+        if (autoTouchX >= 0 && autoTouchY >= 0 &&
+            (autoTouchFrame < 0 || frame == autoTouchFrame))
+            jvm::midp::simulatePointer(autoTouchX, autoTouchY);
 
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 

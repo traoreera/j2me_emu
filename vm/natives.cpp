@@ -6,6 +6,8 @@
 #include <cmath>
 #include <ctime>
 #include <vector>
+#include <unordered_map>
+#include <ucontext.h>
 
 namespace jvm
 {
@@ -103,10 +105,101 @@ void jme_threadStart(Obj *r)
     g_threads.push_back(r);
 }
 const std::vector<Obj *> &jme_threads() { return g_threads; }
+
+// ---------------------------------------------------------------------
+// Fibres coopératives (ucontext) : permettent à Thread.sleep()/yield(), ou
+// à l'épuisement du budget d'instructions (cf. Interpreter::setYieldFn),
+// de suspendre RÉELLEMENT l'exécution d'un run() -- pc, locales et pile
+// d'appel C++ intacts (swapcontext) -- et de la reprendre exactement là à
+// la trame suivante, au lieu de relancer run() depuis le début à chaque
+// trame (ce qui empêchait toute progression pour les jeux dont la boucle
+// principale dépasse le budget par trame, ex. limiteurs de FPS écrits en
+// bytecode qui font des dizaines/centaines de milliers d'itérations).
+// ---------------------------------------------------------------------
+namespace
+{
+struct JmeFiber
+{
+    ucontext_t ctx{};
+    ucontext_t callerCtx{};
+    std::vector<char> stack;
+    bool finished = false;
+    Obj *runnable = nullptr;
+    ClassInfo *cls = nullptr;
+    Interpreter *interp = nullptr;
+};
+
+std::unordered_map<Obj *, JmeFiber *> &fiberMap()
+{
+    static std::unordered_map<Obj *, JmeFiber *> m;
+    return m;
+}
+
+JmeFiber *g_startingFiber = nullptr; // passage d'argument au trampoline (makecontext ne
+                                      // garantit pas le passage fiable de pointeurs 64 bits)
+JmeFiber *g_currentFiber = nullptr;  // fibre en cours d'exécution, pour Thread.sleep/yield
+
+void fiberTrampoline()
+{
+    JmeFiber *f = g_startingFiber;
+    Value res;
+    f->interp->invokeVirtual(f->cls, "run", "()V", f->runnable, nullptr, 0, res);
+    f->finished = true;
+    // Le retour normal de cette fonction déclenche le swapcontext vers
+    // callerCtx via uc_link (cf. jme_threadResume).
+}
+} // namespace
+
+// Reprend (ou démarre) le run() de `r` pour une trame. Retourne true si
+// run() est allé jusqu'au bout (thread terminé, à oublier), false s'il a
+// été suspendu (budget épuisé ou sleep/yield) et devra être repris à la
+// prochaine trame.
+bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
+{
+    if (!r) return true;
+    JmeFiber *&f = fiberMap()[r];
+    if (!f)
+    {
+        f = new JmeFiber();
+        f->stack.resize(256 * 1024);
+        f->runnable = r;
+        f->cls = cls;
+        f->interp = interp;
+        getcontext(&f->ctx);
+        f->ctx.uc_stack.ss_sp = f->stack.data();
+        f->ctx.uc_stack.ss_size = f->stack.size();
+        f->ctx.uc_link = &f->callerCtx;
+        makecontext(&f->ctx, fiberTrampoline, 0);
+    }
+    JmeFiber *prevCurrent = g_currentFiber;
+    g_currentFiber = f;
+    g_startingFiber = f;
+    interp->setYieldFn([f]() { swapcontext(&f->ctx, &f->callerCtx); });
+    swapcontext(&f->callerCtx, &f->ctx);
+    interp->clearYieldFn();
+    g_currentFiber = prevCurrent;
+    return f->finished;
+}
+
+// Appelé par Thread.sleep()/Thread.yield() : suspend immédiatement la
+// fibre courante (no-op si on n'est pas dans une fibre, ex. run() appelé
+// synchroniquement hors ordonnanceur).
+void jme_yieldNow()
+{
+    if (g_currentFiber)
+        swapcontext(&g_currentFiber->ctx, &g_currentFiber->callerCtx);
+}
+
 void jme_threadForget(Obj *r)
 {
     for (size_t i = 0; i < g_threads.size(); i++)
-        if (g_threads[i] == r) { g_threads.erase(g_threads.begin() + (ptrdiff_t)i); return; }
+        if (g_threads[i] == r) { g_threads.erase(g_threads.begin() + (ptrdiff_t)i); break; }
+    auto it = fiberMap().find(r);
+    if (it != fiberMap().end())
+    {
+        delete it->second;
+        fiberMap().erase(it);
+    }
 }
 
 namespace
@@ -114,8 +207,26 @@ namespace
 void n_Object_init(NativeContext *) {}
 void n_Object_getClass(NativeContext *ctx)
 {
+    // o->cls n'est peuplé que pour ObjKind::Instance : les String/tableaux
+    // (o->cls == nullptr par construction, cf. Heap::newString/newArray)
+    // faisaient planter ceci sur o->cls->name. Même correspondance que
+    // runtimeClassOf() dans interpreter.cpp.
     Obj *o = argRef(ctx, 0);
-    Obj *co = ctx->rt->heap().classObjFor(o ? o->cls->name : "");
+    std::string cn;
+    if (o)
+    {
+        switch (o->kind)
+        {
+        case ObjKind::String: cn = "java/lang/String"; break;
+        case ObjKind::Class: cn = "java/lang/Class"; break;
+        case ObjKind::ByteArray: case ObjKind::ShortArray: case ObjKind::IntArray:
+        case ObjKind::LongArray: case ObjKind::FloatArray: case ObjKind::DoubleArray:
+        case ObjKind::CharArray: case ObjKind::BoolArray: case ObjKind::ObjArray:
+            cn = "java/lang/Object"; break;
+        default: cn = o->cls ? o->cls->name : ""; break;
+        }
+    }
+    Obj *co = ctx->rt->heap().classObjFor(cn);
     setRefResult(ctx, co);
 }
 void n_Object_equals(NativeContext *ctx)
@@ -134,6 +245,34 @@ void n_Object_toString(NativeContext *ctx)
     setRefResult(ctx, ctx->rt->heap().newString(buf));
 }
 
+void n_String_initBytes(NativeContext *ctx)
+{
+    Obj *self = argRef(ctx, 0);
+    Obj *data = argRef(ctx, 1);
+    if (!self || !data || data->kind != ObjKind::ByteArray) return;
+    self->kind = ObjKind::String;
+    self->str.clear();
+    self->str.reserve(static_cast<size_t>(data->arrayLen));
+    for (int i = 0; i < data->arrayLen; i++)
+        self->str += static_cast<char>(data->cells[i].u & 0xFF);
+}
+
+void n_String_initBytesRange(NativeContext *ctx)
+{
+    Obj *self = argRef(ctx, 0);
+    Obj *data = argRef(ctx, 1);
+    int off = argInt(ctx, 2);
+    int len = argInt(ctx, 3);
+    if (!self || !data || data->kind != ObjKind::ByteArray) return;
+    if (off < 0) off = 0;
+    if (len < 0) len = 0;
+    if (off + len > data->arrayLen) len = data->arrayLen - off > 0 ? data->arrayLen - off : 0;
+    self->kind = ObjKind::String;
+    self->str.clear();
+    self->str.reserve(static_cast<size_t>(len));
+    for (int i = 0; i < len; i++)
+        self->str += static_cast<char>(data->cells[off + i].u & 0xFF);
+}
 void n_String_length(NativeContext *ctx)
 {
     setIntResult(ctx, static_cast<int32_t>(strOf(argRef(ctx, 0)).size()));
@@ -193,6 +332,28 @@ void n_String_indexOf(NativeContext *ctx)
     const std::string &s = strOf(argRef(ctx, 0));
     const std::string &sub = strOf(argRef(ctx, 1));
     setIntResult(ctx, static_cast<int32_t>(s.find(sub)));
+}
+void n_String_indexOfChar(NativeContext *ctx)
+{
+    const std::string &s = strOf(argRef(ctx, 0));
+    char ch = static_cast<char>(argInt(ctx, 1));
+    setIntResult(ctx, static_cast<int32_t>(s.find(ch)));
+}
+void n_String_indexOfCharFrom(NativeContext *ctx)
+{
+    const std::string &s = strOf(argRef(ctx, 0));
+    char ch = static_cast<char>(argInt(ctx, 1));
+    int from = argInt(ctx, 2);
+    if (from < 0) from = 0;
+    setIntResult(ctx, static_cast<int32_t>(s.find(ch, static_cast<size_t>(from))));
+}
+void n_String_indexOfStrFrom(NativeContext *ctx)
+{
+    const std::string &s = strOf(argRef(ctx, 0));
+    const std::string &sub = strOf(argRef(ctx, 1));
+    int from = argInt(ctx, 2);
+    if (from < 0) from = 0;
+    setIntResult(ctx, static_cast<int32_t>(s.find(sub, static_cast<size_t>(from))));
 }
 void n_String_trim(NativeContext *ctx)
 {
@@ -383,6 +544,12 @@ void n_SB_setStr(NativeContext *ctx, const std::string &s)
 {
     if (ctx->thisObj && ctx->thisObj->cells)
         ctx->thisObj->cells[0] = Value::fromRef(ctx->rt->heap().newString(s));
+    // append() renvoie `this` (StringBuffer) pour permettre le chaînage
+    // (sb.append(a).append(b)...). Sans ceci, l'appel suivant de la chaîne
+    // recevait un récepteur null. Sans effet sur les <init> (void), qui
+    // partagent ce helper et ignorent simplement le résultat.
+    if (ctx->result)
+        *ctx->result = Value::fromRef(ctx->thisObj);
 }
 std::string sbStr(Obj *sb)
 {
@@ -510,7 +677,8 @@ void n_Thread_start(NativeContext *ctx)
                 r && r->cls ? r->cls->name.c_str() : "-");
     jme_threadStart(r);
 }
-void n_Thread_sleep(NativeContext *ctx) { (void)ctx; }
+void n_Thread_sleep(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
+void n_Thread_yield(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
 void n_Thread_setPriority(NativeContext *ctx) { (void)ctx; }
 void n_Thread_interrupt(NativeContext *ctx) { (void)ctx; }
 void n_Thread_join(NativeContext *ctx) { (void)ctx; }
@@ -521,6 +689,91 @@ void n_Thread_currentThread(NativeContext *ctx)
     static Obj *t = nullptr;
     if (!t && c) t = ctx->rt->heap().newInstance(c);
     setRefResult(ctx, t);
+}
+
+// --- javax.microedition.rms.RecordStore ---
+// Implémentation minimale, en mémoire (non persistante d'un lancement à
+// l'autre -- suffisant pour tester le chemin "aucune sauvegarde existante"
+// d'un jeu, cf. games/prince.jar qui fait juste
+// `if (rs.getNumRecords() > 0) charger... else initDefaut()`). Registre
+// tenu côté C++, indexé par nom de magasin (deux openRecordStore(même nom)
+// partagent les mêmes enregistrements, comme le vrai RMS).
+enum { RS_NAME = 0 };
+
+std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> &rsRegistry()
+{
+    static std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> m;
+    return m;
+}
+
+std::string rsName(NativeContext *ctx)
+{
+    Obj *n = ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[RS_NAME].o : nullptr;
+    return (n && n->kind == ObjKind::String) ? n->str : "";
+}
+
+void n_RS_open(NativeContext *ctx)
+{
+    Obj *nameObj = argRef(ctx, 0);
+    std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
+    rsRegistry()[name]; // crée l'entrée si absente (magasin neuf, vide)
+    ClassInfo *c = clsOf(ctx, "javax/microedition/rms/RecordStore");
+    Obj *rs = c ? ctx->rt->heap().newInstance(c) : nullptr;
+    if (rs && rs->cells) rs->cells[RS_NAME] = Value::fromRef(nameObj);
+    setRefResult(ctx, rs);
+}
+void n_RS_getNumRecords(NativeContext *ctx)
+{
+    setIntResult(ctx, static_cast<int32_t>(rsRegistry()[rsName(ctx)].size()));
+}
+void n_RS_getRecord(NativeContext *ctx)
+{
+    auto &recs = rsRegistry()[rsName(ctx)];
+    int id = argInt(ctx, 1);
+    Obj *buf = argRef(ctx, 2);
+    int off = argInt(ctx, 3);
+    if (id < 1 || (size_t)id > recs.size() || !buf) { setIntResult(ctx, 0); return; }
+    const auto &rec = recs[id - 1];
+    for (size_t i = 0; i < rec.size() && off + (int)i < buf->arrayLen; i++)
+        buf->cells[off + i].u = rec[i];
+    setIntResult(ctx, static_cast<int32_t>(rec.size()));
+}
+void n_RS_setRecord(NativeContext *ctx)
+{
+    auto &recs = rsRegistry()[rsName(ctx)];
+    int id = argInt(ctx, 1);
+    Obj *buf = argRef(ctx, 2);
+    int off = argInt(ctx, 3), len = argInt(ctx, 4);
+    if (id < 1 || (size_t)id > recs.size() || !buf || len < 0) return;
+    std::vector<uint8_t> rec(static_cast<size_t>(len));
+    for (int i = 0; i < len && off + i < buf->arrayLen; i++)
+        rec[i] = static_cast<uint8_t>(buf->cells[off + i].u);
+    recs[id - 1] = std::move(rec);
+}
+void n_RS_addRecord(NativeContext *ctx)
+{
+    auto &recs = rsRegistry()[rsName(ctx)];
+    Obj *buf = argRef(ctx, 1);
+    int off = argInt(ctx, 2), len = argInt(ctx, 3);
+    std::vector<uint8_t> rec(static_cast<size_t>(len < 0 ? 0 : len));
+    if (buf)
+        for (int i = 0; i < len && off + i < buf->arrayLen; i++)
+            rec[i] = static_cast<uint8_t>(buf->cells[off + i].u);
+    recs.push_back(std::move(rec));
+    setIntResult(ctx, static_cast<int32_t>(recs.size()));
+}
+void n_RS_getRecordSize(NativeContext *ctx)
+{
+    auto &recs = rsRegistry()[rsName(ctx)];
+    int id = argInt(ctx, 1);
+    setIntResult(ctx, (id >= 1 && (size_t)id <= recs.size()) ? static_cast<int32_t>(recs[id - 1].size()) : 0);
+}
+void n_RS_close(NativeContext *) {}
+void n_RS_deleteStore(NativeContext *ctx)
+{
+    Obj *nameObj = argRef(ctx, 0);
+    std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
+    rsRegistry().erase(name);
 }
 
 // --- java.util.Hashtable ---
@@ -664,6 +917,152 @@ void n_HT_clear(NativeContext *ctx)
 void n_HT_size(NativeContext *ctx) { setIntResult(ctx, htCount(ctx)); }
 void n_HT_isEmpty(NativeContext *ctx) { setIntResult(ctx, htCount(ctx) == 0 ? 1 : 0); }
 
+// --- java.util.Vector ---
+Obj *vecData(NativeContext *ctx)
+{
+    int off = htFieldOff(ctx, "java/util/Vector", "elementData");
+    return (off >= 0 && ctx->thisObj && ctx->thisObj->cells) ? ctx->thisObj->cells[off].o : nullptr;
+}
+int vecCount(NativeContext *ctx)
+{
+    int off = htFieldOff(ctx, "java/util/Vector", "elementCount");
+    return (off >= 0 && ctx->thisObj && ctx->thisObj->cells) ? ctx->thisObj->cells[off].i : 0;
+}
+void vecSetCount(NativeContext *ctx, int v)
+{
+    int off = htFieldOff(ctx, "java/util/Vector", "elementCount");
+    if (off >= 0 && ctx->thisObj && ctx->thisObj->cells)
+        ctx->thisObj->cells[off] = Value::fromInt(v);
+}
+void vecSetData(NativeContext *ctx, Obj *arr)
+{
+    int off = htFieldOff(ctx, "java/util/Vector", "elementData");
+    if (off >= 0 && ctx->thisObj && ctx->thisObj->cells)
+        ctx->thisObj->cells[off] = Value::fromRef(arr);
+}
+void vecEnsureCapacity(NativeContext *ctx, int minCap)
+{
+    Obj *d = vecData(ctx);
+    int cap = d ? d->arrayLen : 0;
+    if (cap >= minCap) return;
+    int nn = cap ? cap * 2 : 10;
+    if (nn < minCap) nn = minCap;
+    Obj *nd = ctx->rt->heap().newArray(ObjKind::ObjArray, nn);
+    int count = vecCount(ctx);
+    for (int i = 0; i < count && d; i++) nd->cells[i] = d->cells[i];
+    vecSetData(ctx, nd);
+}
+void n_Vec_init0(NativeContext *ctx)
+{
+    vecSetData(ctx, ctx->rt->heap().newArray(ObjKind::ObjArray, 10));
+    vecSetCount(ctx, 0);
+}
+void n_Vec_initCap(NativeContext *ctx)
+{
+    int cap = argInt(ctx, 1);
+    vecSetData(ctx, ctx->rt->heap().newArray(ObjKind::ObjArray, cap > 0 ? cap : 1));
+    vecSetCount(ctx, 0);
+}
+void n_Vec_addElement(NativeContext *ctx)
+{
+    int count = vecCount(ctx);
+    vecEnsureCapacity(ctx, count + 1);
+    Obj *d = vecData(ctx);
+    d->cells[count] = Value::fromRef(argRef(ctx, 1));
+    vecSetCount(ctx, count + 1);
+}
+void n_Vec_elementAt(NativeContext *ctx)
+{
+    int idx = argInt(ctx, 1);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    setRefResult(ctx, (d && idx >= 0 && idx < count) ? d->cells[idx].o : nullptr);
+}
+void n_Vec_setElementAt(NativeContext *ctx)
+{
+    Obj *val = argRef(ctx, 1);
+    int idx = argInt(ctx, 2);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (d && idx >= 0 && idx < count) d->cells[idx] = Value::fromRef(val);
+}
+void n_Vec_insertElementAt(NativeContext *ctx)
+{
+    Obj *val = argRef(ctx, 1);
+    int idx = argInt(ctx, 2);
+    int count = vecCount(ctx);
+    if (idx < 0 || idx > count) return;
+    vecEnsureCapacity(ctx, count + 1);
+    Obj *d = vecData(ctx);
+    for (int i = count; i > idx; i--) d->cells[i] = d->cells[i - 1];
+    d->cells[idx] = Value::fromRef(val);
+    vecSetCount(ctx, count + 1);
+}
+void n_Vec_removeElementAt(NativeContext *ctx)
+{
+    int idx = argInt(ctx, 1);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (!d || idx < 0 || idx >= count) return;
+    for (int i = idx; i < count - 1; i++) d->cells[i] = d->cells[i + 1];
+    d->cells[count - 1] = Value::fromRef(nullptr);
+    vecSetCount(ctx, count - 1);
+}
+void n_Vec_removeElement(NativeContext *ctx)
+{
+    Obj *val = argRef(ctx, 1);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (d)
+        for (int i = 0; i < count; i++)
+            if (keyEq(d->cells[i].o, val))
+            {
+                for (int j = i; j < count - 1; j++) d->cells[j] = d->cells[j + 1];
+                d->cells[count - 1] = Value::fromRef(nullptr);
+                vecSetCount(ctx, count - 1);
+                setIntResult(ctx, 1);
+                return;
+            }
+    setIntResult(ctx, 0);
+}
+void n_Vec_removeAllElements(NativeContext *ctx)
+{
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (d) for (int i = 0; i < count; i++) d->cells[i] = Value::fromRef(nullptr);
+    vecSetCount(ctx, 0);
+}
+void n_Vec_size(NativeContext *ctx) { setIntResult(ctx, vecCount(ctx)); }
+void n_Vec_isEmpty(NativeContext *ctx) { setIntResult(ctx, vecCount(ctx) == 0 ? 1 : 0); }
+void n_Vec_contains(NativeContext *ctx)
+{
+    Obj *val = argRef(ctx, 1);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (d) for (int i = 0; i < count; i++) if (keyEq(d->cells[i].o, val)) { setIntResult(ctx, 1); return; }
+    setIntResult(ctx, 0);
+}
+void n_Vec_indexOf(NativeContext *ctx)
+{
+    Obj *val = argRef(ctx, 1);
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    if (d) for (int i = 0; i < count; i++) if (keyEq(d->cells[i].o, val)) { setIntResult(ctx, i); return; }
+    setIntResult(ctx, -1);
+}
+void n_Vec_firstElement(NativeContext *ctx)
+{
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    setRefResult(ctx, (d && count > 0) ? d->cells[0].o : nullptr);
+}
+void n_Vec_lastElement(NativeContext *ctx)
+{
+    Obj *d = vecData(ctx);
+    int count = vecCount(ctx);
+    setRefResult(ctx, (d && count > 0) ? d->cells[count - 1].o : nullptr);
+}
+
 // --- java.util.Random (LCG 63 bits) ---
 uint64_t rndUpdate(Obj *r)
 {
@@ -722,7 +1121,7 @@ void n_Random_nextBoolean(NativeContext *ctx)
 
 void n_System_currentTimeMillis(NativeContext *ctx)
 {
-    setLongResult(ctx, static_cast<int64_t>(clock() * 1000 / CLOCKS_PER_SEC));
+    setLongResult(ctx, virtualMillis());
 }
 void n_System_arraycopy(NativeContext *ctx)
 {
@@ -739,6 +1138,24 @@ void n_System_arraycopy(NativeContext *ctx)
             break;
         dst->cells[dpos + i] = src->cells[spos + i];
     }
+}
+void n_System_getProperty(NativeContext *ctx)
+{
+    Obj *keyObj = argRef(ctx, 0);
+    std::string key = (keyObj && keyObj->kind == ObjKind::String) ? keyObj->str : "";
+    // Propriétés CLDC/MIDP standard connues. Pour le reste (souvent utilisé
+    // par les jeux pour détecter un modèle de téléphone précis via
+    // "microedition.platform".startsWith("NokiaXXXX") et choisir un mapping
+    // de touches propriétaire), on renvoie "" plutôt que de prétendre être
+    // un appareil Nokia/Siemens/etc. spécifique : notre hal::input.cpp émule
+    // un clavier numérique + softkeys standard, pas un layout propriétaire.
+    std::string val;
+    if (key == "microedition.configuration") val = "CLDC-1.1";
+    else if (key == "microedition.profiles") val = "MIDP-2.0";
+    else if (key == "microedition.locale") val = "en-US";
+    else if (key == "microedition.encoding") val = "ISO-8859-1";
+    else val = "";
+    setRefResult(ctx, ctx->rt->heap().newString(val));
 }
 void n_System_gc(NativeContext *) {}
 void n_System_identityHashCode(NativeContext *ctx)
@@ -796,6 +1213,10 @@ void n_Class_forName(NativeContext *ctx)
 
 } // namespace
 
+static int64_t g_virtualMillis = 0;
+int64_t virtualMillis() { return g_virtualMillis; }
+void advanceVirtualMillis(int64_t ms) { g_virtualMillis += ms; }
+
 void initNatives()
 {
     using namespace std::placeholders;
@@ -809,6 +1230,9 @@ void initNatives()
 
     // java.lang.String
     registerNative("java/lang/String.<init>:()V", n_Object_init);
+    registerNative("java/lang/String.<init>:([BLjava/lang/String;)V", n_String_initBytes);
+    registerNative("java/lang/String.<init>:([B)V", n_String_initBytes);
+    registerNative("java/lang/String.<init>:([BII)V", n_String_initBytesRange);
     registerNative("java/lang/String.length:()I", n_String_length);
     registerNative("java/lang/String.charAt:(I)C", n_String_charAt);
     registerNative("java/lang/String.toCharArray:()[C", n_String_toCharArray);
@@ -818,7 +1242,9 @@ void initNatives()
     registerNative("java/lang/String.substring:(I)Ljava/lang/String;", n_String_substring1);
     registerNative("java/lang/String.substring:(II)Ljava/lang/String;", n_String_substring2);
     registerNative("java/lang/String.indexOf:(Ljava/lang/String;)I", n_String_indexOf);
-    registerNative("java/lang/String.indexOf:(I)I", n_String_indexOf);
+    registerNative("java/lang/String.indexOf:(Ljava/lang/String;I)I", n_String_indexOfStrFrom);
+    registerNative("java/lang/String.indexOf:(I)I", n_String_indexOfChar);
+    registerNative("java/lang/String.indexOf:(II)I", n_String_indexOfCharFrom);
     registerNative("java/lang/String.trim:()Ljava/lang/String;", n_String_trim);
     registerNative("java/lang/String.toLowerCase:()Ljava/lang/String;", n_String_toLowerCase);
     registerNative("java/lang/String.toUpperCase:()Ljava/lang/String;", n_String_toUpperCase);
@@ -879,11 +1305,22 @@ void initNatives()
     registerNative("java/lang/Thread.start:()V", n_Thread_start);
     registerNative("java/lang/Thread.run:()V", n_Thread_start);
     registerNative("java/lang/Thread.sleep:(J)V", n_Thread_sleep);
+    registerNative("java/lang/Thread.yield:()V", n_Thread_yield);
     registerNative("java/lang/Thread.currentThread:()Ljava/lang/Thread;", n_Thread_currentThread);
     registerNative("java/lang/Thread.setPriority:(I)V", n_Thread_setPriority);
     registerNative("java/lang/Thread.interrupt:()V", n_Thread_interrupt);
     registerNative("java/lang/Thread.isAlive:()Z", n_Thread_isAlive);
     registerNative("java/lang/Thread.join:()V", n_Thread_join);
+
+    // javax.microedition.rms.RecordStore
+    registerNative("javax/microedition/rms/RecordStore.openRecordStore:(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;", n_RS_open);
+    registerNative("javax/microedition/rms/RecordStore.getNumRecords:()I", n_RS_getNumRecords);
+    registerNative("javax/microedition/rms/RecordStore.getRecord:(I[BI)I", n_RS_getRecord);
+    registerNative("javax/microedition/rms/RecordStore.getRecordSize:(I)I", n_RS_getRecordSize);
+    registerNative("javax/microedition/rms/RecordStore.setRecord:(I[BII)V", n_RS_setRecord);
+    registerNative("javax/microedition/rms/RecordStore.addRecord:([BII)I", n_RS_addRecord);
+    registerNative("javax/microedition/rms/RecordStore.closeRecordStore:()V", n_RS_close);
+    registerNative("javax/microedition/rms/RecordStore.deleteRecordStore:(Ljava/lang/String;)V", n_RS_deleteStore);
 
     // java.util.Hashtable
     registerNative("java/util/Hashtable.<init>:()V", n_HT_init);
@@ -894,6 +1331,23 @@ void initNatives()
     registerNative("java/util/Hashtable.clear:()V", n_HT_clear);
     registerNative("java/util/Hashtable.size:()I", n_HT_size);
     registerNative("java/util/Hashtable.isEmpty:()Z", n_HT_isEmpty);
+
+    // java.util.Vector
+    registerNative("java/util/Vector.<init>:()V", n_Vec_init0);
+    registerNative("java/util/Vector.<init>:(I)V", n_Vec_initCap);
+    registerNative("java/util/Vector.addElement:(Ljava/lang/Object;)V", n_Vec_addElement);
+    registerNative("java/util/Vector.elementAt:(I)Ljava/lang/Object;", n_Vec_elementAt);
+    registerNative("java/util/Vector.setElementAt:(Ljava/lang/Object;I)V", n_Vec_setElementAt);
+    registerNative("java/util/Vector.insertElementAt:(Ljava/lang/Object;I)V", n_Vec_insertElementAt);
+    registerNative("java/util/Vector.removeElement:(Ljava/lang/Object;)Z", n_Vec_removeElement);
+    registerNative("java/util/Vector.removeElementAt:(I)V", n_Vec_removeElementAt);
+    registerNative("java/util/Vector.removeAllElements:()V", n_Vec_removeAllElements);
+    registerNative("java/util/Vector.size:()I", n_Vec_size);
+    registerNative("java/util/Vector.isEmpty:()Z", n_Vec_isEmpty);
+    registerNative("java/util/Vector.contains:(Ljava/lang/Object;)Z", n_Vec_contains);
+    registerNative("java/util/Vector.indexOf:(Ljava/lang/Object;)I", n_Vec_indexOf);
+    registerNative("java/util/Vector.firstElement:()Ljava/lang/Object;", n_Vec_firstElement);
+    registerNative("java/util/Vector.lastElement:()Ljava/lang/Object;", n_Vec_lastElement);
 
     // java.util.Random
     registerNative("java/util/Random.<init>:(J)V", n_Random_init);
@@ -910,6 +1364,7 @@ void initNatives()
     registerNative("java/lang/System.currentTimeMillis:()J", n_System_currentTimeMillis);
     registerNative("java/lang/System.arraycopy:(Ljava/lang/Object;ILjava/lang/Object;II)V", n_System_arraycopy);
     registerNative("java/lang/System.gc:()V", n_System_gc);
+    registerNative("java/lang/System.getProperty:(Ljava/lang/String;)Ljava/lang/String;", n_System_getProperty);
     registerNative("java/lang/System.identityHashCode:(Ljava/lang/Object;)I", n_System_identityHashCode);
 
     // java.io.PrintStream

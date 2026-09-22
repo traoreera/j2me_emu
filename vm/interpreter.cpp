@@ -16,6 +16,50 @@ inline int16_t rb16(const uint8_t *c, int &pc) { int v = (c[pc] << 8) | c[pc + 1
 inline uint16_t rbu16(const uint8_t *c, int &pc) { int v = (c[pc] << 8) | c[pc + 1]; pc += 2; return static_cast<uint16_t>(v); }
 inline int32_t rb32(const uint8_t *c, int &pc) { int v = (c[pc] << 24) | (c[pc + 1] << 16) | (c[pc + 2] << 8) | c[pc + 3]; pc += 4; return v; }
 
+// Mappe le caractère de type restant (après avoir consommé `dims` '[') vers
+// le ObjKind des tableaux "feuille". 'L' ou '[' restants -> ObjArray (cas
+// des dimensions non explicitement dimensionnées, ex. `new int[3][]` : les
+// sous-tableaux restent naturellement null, ce qui est le comportement Java
+// attendu).
+ObjKind leafArrayKind(char baseChar)
+{
+    switch (baseChar)
+    {
+    case 'B': return ObjKind::ByteArray;
+    case 'S': return ObjKind::ShortArray;
+    case 'I': return ObjKind::IntArray;
+    case 'J': return ObjKind::LongArray;
+    case 'F': return ObjKind::FloatArray;
+    case 'D': return ObjKind::DoubleArray;
+    case 'C': return ObjKind::CharArray;
+    case 'Z': return ObjKind::BoolArray;
+    default: return ObjKind::ObjArray; // 'L...;' ou '[' (dimension non dimensionnée)
+    }
+}
+
+// Construit récursivement un tableau multi-dimensionnel (multianewarray) :
+// sizes[0] = taille de la dimension externe ... sizes[n-1] = taille de la
+// dimension la plus interne dimensionnée explicitement.
+Obj *buildMultiArray(Runtime *rt, ObjKind leafKind, const int32_t *sizes, int level, int totalDims)
+{
+    int32_t n = sizes[level];
+    if (n < 0)
+        return nullptr;
+    if (level == totalDims - 1)
+        return rt->heap().newArray(leafKind, n);
+    Obj *outer = rt->heap().newArray(ObjKind::ObjArray, n);
+    if (!outer)
+        return nullptr;
+    for (int32_t i = 0; i < n; i++)
+    {
+        Obj *inner = buildMultiArray(rt, leafKind, sizes, level + 1, totalDims);
+        if (!inner)
+            return nullptr;
+        outer->cells[i] = Value::fromRef(inner);
+    }
+    return outer;
+}
+
 int slotsOfDesc(const std::string &d)
 {
     char c = d.empty() ? 0 : d[0];
@@ -161,6 +205,9 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
                 mn.find("drawRGB") != std::string::npos || mn.find("load") != std::string::npos)
                 fprintf(stderr, "NATIVE %s.%s:%s\n", cls->name.c_str(), m->name.c_str(), m->desc.c_str());
         }
+        if (getenv("JME_TRACEALL"))
+            fprintf(stderr, "NAT %s.%s:%s%s\n", cls->name.c_str(), m->name.c_str(),
+                    m->desc.c_str(), ctx.thisObj && ctx.thisObj->cls ? (std::string(" (caller=") + ctx.thisObj->cls->name + ")").c_str() : "");
         fn(&ctx);
         return true;
     }
@@ -182,31 +229,45 @@ bool Interpreter::invokeStatic(ClassInfo *declClass, const std::string &name, co
         if (m)
         {
             if (!ensureInit(c))
+            {
+                if (getenv("JME_DEBUG"))
+                    fprintf(stderr, "invokeStatic: ensureInit echec sur %s (appel %s%s)\n",
+                            c->name.c_str(), name.c_str(), desc.c_str());
                 return false;
+            }
             return dispatch(c, m, nullptr, args, nargs, result);
         }
         c = c->super;
     }
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "invokeStatic: méthode %s%s introuvable dans %s\n",
+                name.c_str(), desc.c_str(), declClass ? declClass->name.c_str() : "(null)");
     return false;
 }
 
 bool Interpreter::invokeSpecial(ClassInfo *declClass, const std::string &name, const std::string &desc,
                                 Obj *thisObj, Value *args, int nargs, Value &result)
 {
-    ClassInfo *c = declClass ? declClass : thisObj ? runtimeClassOf(rt_, thisObj) : nullptr;
-    const MethodRecord *m = c ? c->findMethod(name, desc) : nullptr;
-    if (!m && c && c->super)
-        m = c->super->findMethod(name, desc);
-    if (!m && thisObj)
-    {
-        ClassInfo *rc = runtimeClassOf(rt_, thisObj);
-        m = rc ? rc->findMethodVirtual(name, desc) : nullptr;
-    }
+    // invokespecial se résout statiquement à partir de la classe référencée
+    // (declClass), en remontant toute la chaîne de super -- jamais depuis le
+    // type runtime de thisObj. L'ancien fallback sur
+    // runtimeClassOf(thisObj)->findMethodVirtual() était faux : pour un
+    // super() vers un <init> natif non enregistré (ex. Canvas, qui n'a pas
+    // de <init> dans midp_natives.cpp) ou vers une classe non résolue
+    // (ex. com/nokia/mid/ui/FullCanvas, non implémentée), il retombait sur
+    // le type réel de thisObj et pouvait retrouver la méthode <init>
+    // ACTUELLEMENT EN COURS D'EXÉCUTION elle-même (même nom/descripteur),
+    // provoquant une récursion infinie jusqu'à épuisement de l'arène de
+    // frames -- observé sur tout MIDlet/Canvas dérivé avec un constructeur
+    // sans argument (cas très courant), ex. games/mission.jar. Si declClass
+    // est nul (classe non résolue), on échoue proprement plutôt que de
+    // deviner via thisObj.
+    const MethodRecord *m = declClass ? declClass->findMethodVirtual(name, desc) : nullptr;
     if (!m)
     {
         fprintf(stderr, "JVM: invokeSpecial: méthode %s%s introuvable dans %s\n",
                 name.c_str(), desc.c_str(),
-                c ? c->name.c_str() : "(null)");
+                declClass ? declClass->name.c_str() : "(null, classe non résolue)");
         return false;
     }
     return dispatch(m->owner, m, thisObj, args, nargs, result);
@@ -287,6 +348,20 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     int codeLen = static_cast<int>(code->code.size());
     const ConstantPool &cp = cls->cf->constantPool;
 
+    static long hAcount = 0;
+    if (getenv("JME_ATRACE") && cls->name == "h" && m->name == "a" && m->desc == "()V")
+    {
+        hAcount++;
+        fprintf(stderr, "ATRACE h.a() #%ld t=%lld\n", hAcount, (long long)virtualMillis());
+    }
+    if (getenv("JME_QRACE") && cls->name == "h" &&
+        ((m->name == "e" && m->desc == "(II)Ljava/lang/String;") ||
+         (m->name == "a" && m->desc == "(Lb;ILjava/lang/String;IIIII)I") ||
+         (m->name == "Q" && m->desc == "()V")))
+        fprintf(stderr, "QRACE enter h.%s:%s t=%lld nargs=%d a0=%d a1=%d\n",
+                m->name.c_str(), m->desc.c_str(), (long long)virtualMillis(), nargs,
+                nargs > 0 ? args[0].i : -1, nargs > 1 ? args[1].i : -1);
+
     size_t mark = arenaOff_;
     size_t nLocals = code->maxLocals;
     size_t nStack = code->maxStack;
@@ -366,6 +441,18 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     {
         if (instrBudget_ >= 0 && --instrBudget_ < 0)
         {
+            if (yieldFn_)
+            {
+                // Suspend la fibre courante ; ne revient que réveillé par le
+                // scheduler à une trame ultérieure. pc/sp/locals/pile C++
+                // sont préservés intacts (swapcontext), on continue juste la
+                // boucle avec un budget neuf pour cette nouvelle trame.
+                yieldFn_();
+                if (getenv("JME_DEBUG"))
+                    fprintf(stderr, "YIELD %s.%s pc=%d op=0x%02x\n", cls->name.c_str(), m->name.c_str(), pc, c[pc]);
+                instrBudget_ = instrBudgetQuota_;
+                continue;
+            }
             okResult = false;
             done = true;
             break;
@@ -483,7 +570,16 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
         case 0x4b: case 0x4c: case 0x4d: case 0x4e: lv[op - 0x4b] = pop(); break;
 
-        case 0x4f: case 0x50: case 0x51: case 0x52: case 0x53:
+        case 0x50: case 0x52: // lastore, dastore : valeur sur 2 slots (catégorie 2)
+        {
+            Value v = Value::fromLong(popLong());
+            int idx = popInt();
+            Obj *arr = popRef();
+            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
+            else arr->cells[idx] = v;
+            break;
+        }
+        case 0x4f: case 0x51: case 0x53:
         {
             Value v = pop();
             int idx = popInt();
@@ -626,9 +722,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0x6d: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a / b); break; }
         case 0x71: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a % b); break; }
         case 0x75: { pushLong(-popLong()); break; }
-        case 0x79: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a << (b & 63)); break; }
-        case 0x7b: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a >> (b & 63)); break; }
-        case 0x7d: { int64_t b = popLong(); int64_t a = popLong(); pushLong(static_cast<int64_t>(static_cast<uint64_t>(a) >> (b & 63))); break; }
+        case 0x79: { int b = popInt(); int64_t a = popLong(); pushLong(a << (b & 63)); break; }
+        case 0x7b: { int b = popInt(); int64_t a = popLong(); pushLong(a >> (b & 63)); break; }
+        case 0x7d: { int b = popInt(); int64_t a = popLong(); pushLong(static_cast<int64_t>(static_cast<uint64_t>(a) >> (b & 63))); break; }
         case 0x7f: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a & b); break; }
         case 0x81: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a | b); break; }
         case 0x83: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a ^ b); break; }
@@ -708,6 +804,16 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
         case 0xaa:
         {
+            // Les offsets (default et table) sont relatifs à l'adresse de
+            // L'OPCODE tableswitch lui-même (spec JVM), pas à `base` (le
+            // début, après padding, des champs default/lo/hi/table). Utiliser
+            // `base` ici faisait systématiquement atterrir 2-3 octets trop
+            // loin (dans le padding/les champs eux-mêmes), exécutant des
+            // octets arbitraires comme du bytecode -- observé concrètement :
+            // atterrissage sur un `iconst_3` au lieu d'un `aload_0`, la
+            // valeur 3 étant ensuite prise pour une référence d'objet par
+            // le getfield suivant (segfault).
+            int opcodePc = pc - 1;
             while ((pc & 3) != 0) pc++;
             int base = pc;
             int def = rb32(c, pc);
@@ -716,25 +822,35 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             int key = popInt();
             if (key < lo || key > hi)
             {
-                pc = base + def;
+                pc = opcodePc + def;
             }
             else
             {
-                const uint8_t *tb = c + base + 12 + (key - lo) * 4;
-                if ((size_t)(base + 12) < (size_t)codeLen)
+                // L'ancienne vérif ne bornait que le DÉBUT de la table (base+12),
+                // jamais l'entrée réellement lue (base+12+(key-lo)*4) -- lecture
+                // hors tableau possible dès qu'un tableswitch a plus de quelques
+                // entrées (ex. dispatch UP/DOWN/LEFT/RIGHT/FIRE d'un jeu), avec
+                // segfault à la clé. On borne l'accès réel ici.
+                int64_t tOff = (int64_t)base + 12 + (int64_t)(key - lo) * 4;
+                if (tOff < 0 || tOff + 4 > (int64_t)codeLen)
                 {
-                    int32_t e = static_cast<int32_t>((tb[0] << 24) | (tb[1] << 16) | (tb[2] << 8) | tb[3]);
-                    pc = base + e;
+                    pc = codeLen;
                 }
                 else
                 {
-                    pc = codeLen;
+                    const uint8_t *tb = c + tOff;
+                    int32_t e = static_cast<int32_t>((tb[0] << 24) | (tb[1] << 16) | (tb[2] << 8) | tb[3]);
+                    pc = opcodePc + e;
                 }
             }
             break;
         }
         case 0xab:
         {
+            // Même correction que tableswitch (0xaa) : les offsets sont
+            // relatifs à l'adresse de l'opcode lookupswitch lui-même, pas à
+            // `base` (début des champs default/npairs/table après padding).
+            int opcodePc = pc - 1;
             while ((pc & 3) != 0) pc++;
             int base = pc;
             int def = rb32(c, pc);
@@ -752,7 +868,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     break;
                 }
             }
-            pc = (found >= 0) ? base + found : base + def;
+            pc = (found >= 0) ? opcodePc + found : opcodePc + def;
             break;
         }
 
@@ -779,11 +895,23 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 fprintf(stderr, "JVM: get/putstatic: classe %s introuvable (0x%02x)\n", classRef.c_str(), op);
                 okResult = false; done = true; break;
             }
+            // Un accès à un champ static doit initialiser la classe cible
+            // (<clinit>) au préalable si ce n'est pas déjà fait -- contexte
+            // manquant ici jusqu'ici (seul invokestatic/new le faisaient),
+            // alors qu'un getstatic peut très bien être le tout premier
+            // accès à une classe (ex. lire un tableau statique alloué dans
+            // son <clinit> avant même le premier appel de méthode dessus) :
+            // observé sur games/mission.jar, un sastore vers un champ static
+            // jamais alloué faute d'avoir lancé <clinit>.
+            if (!ensureInit(tc))
+            {
+                okResult = false; done = true; break;
+            }
             if (op == 0xb2)
             {
                 ClassInfo *owner = tc;
-                const MethodRecord *f = owner->findField(fn);
-                while (!f && owner->super) { owner = owner->super; f = owner->findField(fn); }
+                const MethodRecord *f = owner->findField(fn, fd);
+                while (!f && owner->super) { owner = owner->super; f = owner->findField(fn, fd); }
                 if (!f)
                 {
                     fprintf(stderr, "JVM: get/putstatic: champ %s.%s introuvable (0x%02x)\n",
@@ -791,6 +919,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     okResult = false; done = true; break;
                 }
                 int w = slotsOfDesc(fd);
+                if (getenv("JME_QRACE") && fn == "bW")
+                    fprintf(stderr, "QRACE get bW=%d t=%lld\n", owner->statics[f->slot].i,
+                            (long long)virtualMillis());
                 if (w == 2) pushLong(owner->statics[f->slot].l);
                 else push(owner->statics[f->slot], 1);
             }
@@ -799,14 +930,21 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 int w = slotsOfDesc(fd);
                 Value v = (w == 2) ? Value::fromLong(popLong()) : pop();
                 ClassInfo *owner = tc;
-                const MethodRecord *f = owner->findField(fn);
-                while (!f && owner->super) { owner = owner->super; f = owner->findField(fn); }
+                const MethodRecord *f = owner->findField(fn, fd);
+                while (!f && owner->super) { owner = owner->super; f = owner->findField(fn, fd); }
                 if (!f)
                 {
                     fprintf(stderr, "JVM: get/putstatic: champ %s.%s introuvable (0x%02x)\n",
                             tc->name.c_str(), fn.c_str(), op);
                     okResult = false; done = true; break;
                 }
+                if (getenv("JME_FLAGTRACE") &&
+                    (fn == "bl" || fn == "el" || fn == "bW" || fn == "bm" || fn == "em" ||
+                     fn == "en" || fn == "eo" || fn == "bP" || fn == "G" || fn == "cq" ||
+                     fn == "eF" || fn == "eB" || fn == "eC" || fn == "c" || fn == "bZ" ||
+                     fn == "al" || fn == "ek" || fn == "ac" || fn == "bX" || fn == "bH"))
+                    fprintf(stderr, "PS %s.%s=%d t=%lld\n", owner->name.c_str(), fn.c_str(), v.i,
+                            (long long)virtualMillis());
                 owner->statics[f->slot] = v;
             }
             break;
@@ -825,7 +963,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 Value v = (w == 2) ? Value::fromLong(popLong()) : pop();
                 Obj *o = popRef();
                 if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
-                const MethodRecord *ff = o->cls->findFieldRecursive(fn);
+                const MethodRecord *ff = o->cls->findFieldRecursive(fn, fd);
                 if (!ff)
                 {
                     fprintf(stderr, "JVM: putfield: champ %s.%s introuvable (idx=%u owner=%s fd=%s) (0x%02x)\n",
@@ -838,7 +976,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             }
             Obj *o = popRef();
             if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
-            const MethodRecord *ff = o->cls->findFieldRecursive(fn);
+            const MethodRecord *ff = o->cls->findFieldRecursive(fn, fd);
             if (!ff)
             {
                 fprintf(stderr, "JVM: getfield: champ %s.%s introuvable (idx=%u owner=%s fd=%s) (0x%02x)\n",
@@ -854,6 +992,12 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0xb6: case 0xb7: case 0xb8: case 0xb9:
         {
             uint16_t idx = rbu16(c, pc);
+            if (op == 0xb9)
+            {
+                if (getenv("JME_DEBUG")) fprintf(stderr, "invokeinterface hit, pc before skip=%d\n", pc);
+                rb(c, pc); rb(c, pc);
+                if (getenv("JME_DEBUG")) fprintf(stderr, "invokeinterface pc after skip=%d\n", pc);
+            }
             auto mr = cp.getMethodRef(idx);
             if (mr.first.empty()) { okResult = false; done = true; break; }
             std::string classRef = mr.first;
@@ -869,6 +1013,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             if (op == 0xb8)
             {
                 if (tc) ok = invokeStatic(tc, mname, mdesc, nslots, &st[sp - nslots], mres);
+                else if (getenv("JME_DEBUG"))
+                    fprintf(stderr, "invokestatic: tc NULL pour %s.%s%s (caller=%s.%s pc=%d)\n",
+                            classRef.c_str(), mname.c_str(), mdesc.c_str(), cls->name.c_str(), m->name.c_str(), pc);
                 sp -= nslots;
             }
             else
@@ -913,6 +1060,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         {
             uint8_t atype = rb(c, pc);
             int count = popInt();
+            if (getenv("JME_DEBUG") && count < 0)
+                fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
+                        count, atype, cls->name.c_str(), m->name.c_str());
             ObjKind k;
             switch (atype)
             {
@@ -944,13 +1094,24 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         {
             uint16_t idx = rbu16(c, pc);
             std::string classRef = cp.getClassName(idx);
-            ClassInfo *tc = rt_->classInfoOfName(classRef);
             Obj *o = (sp >= 1) ? st[sp - 1].o : nullptr;
             bool is = false;
-            if (o && o->kind == ObjKind::Instance)
+            if (o && !classRef.empty() && classRef[0] == '[')
             {
-                ClassInfo *oc = o->cls;
-                while (oc) { if (!tc || oc == tc) { is = true; break; } oc = oc->super; }
+                // Cast/instanceof vers un type tableau (ex. "[I", "[Ljava/lang/String;") :
+                // pas de ClassInfo pour ces descripteurs, on compare directement le ObjKind.
+                size_t p = classRef.find_first_not_of('[');
+                char base = (p != std::string::npos) ? classRef[p] : 'I';
+                is = (o->kind == leafArrayKind(base));
+            }
+            else
+            {
+                ClassInfo *tc = rt_->classInfoOfName(classRef);
+                if (o && o->kind == ObjKind::Instance)
+                {
+                    ClassInfo *oc = o->cls;
+                    while (oc) { if (!tc || oc == tc) { is = true; break; } oc = oc->super; }
+                }
             }
             if (op == 0xc1)
                 st[sp - 1].i = is ? 1 : 0;
@@ -994,14 +1155,16 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
         case 0xc5:
         {
-            rbu16(c, pc);
+            uint16_t clsIdx = rbu16(c, pc);
             uint8_t dims = rb(c, pc);
-            (void)dims;
-            // implémentation simple : un seul tableau de taille = count total du dernier dim
-            int total = 1;
-            for (int i = 0; i < dims; i++)
-                total *= popInt();
-            Obj *a = rt_->heap().newArray(ObjKind::ObjArray, total);
+            if (dims < 1 || dims > 32) { okResult = false; done = true; break; }
+            std::vector<int32_t> sizes(dims);
+            for (int i = dims - 1; i >= 0; i--)
+                sizes[i] = popInt();
+            std::string arrDesc = cp.getClassName(clsIdx); // ex: "[[I", "[[Ljava/lang/String;"
+            size_t brackets = arrDesc.find_first_not_of('[');
+            char baseChar = (brackets != std::string::npos) ? arrDesc[brackets] : 'I';
+            Obj *a = buildMultiArray(rt_, leafArrayKind(baseChar), sizes.data(), 0, dims);
             if (!a) { rt_->reportOom(); okResult = false; done = true; break; }
             pushRef(a);
             break;

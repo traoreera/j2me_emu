@@ -97,8 +97,16 @@ struct ClassInfo
 
     const MethodRecord *findMethod(const std::string &nm, const std::string &ds) const;
     const MethodRecord *findMethodVirtual(const std::string &nm, const std::string &ds) const;
-    const MethodRecord *findField(const std::string &nm) const;
-    const MethodRecord *findFieldRecursive(const std::string &nm) const;
+    // `ds` (descripteur de type, ex. "I", "[B", "Ljava/lang/String;") est
+    // optionnel mais fortement recommandé : le bytecode obfusqué réutilise
+    // couramment le même nom de champ pour plusieurs types distincts dans
+    // une même classe (name-mangling agressif pour minimiser la taille du
+    // .class) -- sans désambiguïsation par type, ces champs s'aliasent tous
+    // sur le même slot mémoire (observé : un champ Image et un champ
+    // InputStream tous deux nommés "a" sur la même classe, corrompant l'un
+    // l'autre). `ds` vide = comportement historique (premier match par nom).
+    const MethodRecord *findField(const std::string &nm, const std::string &ds = "") const;
+    const MethodRecord *findFieldRecursive(const std::string &nm, const std::string &ds = "") const;
     int findStaticIndex(const std::string &nm) const;
     const MethodRecord *findClinit() const;
     bool clinitDone = false;
@@ -107,7 +115,13 @@ struct ClassInfo
 class Heap
 {
 public:
-    static constexpr size_t kDefaultPoolSize = 224 * 1024;
+    // 224 KB correspond au budget visé sur RP2040 (264 KB de RAM totale).
+    // Sur PC, le confort de dev prime : sans GC (bump allocator, reset()
+    // seul point de récupération), des jeux qui allouent beaucoup d'objets
+    // courts (ex. génération procédurale) épuisent vite 224 KB. On monte à
+    // 512 KB pour le dev PC ; repasser à 224 * 1024 (ou moins) lors du
+    // portage RP2040 -- même logique que JAR_READER_INDEX_IN_RAM.
+    static constexpr size_t kDefaultPoolSize = 512 * 1024;
     explicit Heap(size_t poolSize = kDefaultPoolSize);
     ~Heap();
 
@@ -120,14 +134,25 @@ public:
     Obj *newArray(ObjKind kind, int32_t len);
     Obj *newInstance(ClassInfo *ci);
     Obj *classObjFor(const std::string &name); // cherche dans le cache des Class Obj
-    size_t used() const { return off_; }
+    size_t used() const { return usedTotal_; }
+    size_t capacity() const { return capTotal_; }
     bool outOfMemory() const { return oom_; }
     void reset();
 
 private:
-    uint8_t *pool_;
-    size_t cap_;
-    size_t off_;
+    // Segments de mémoire : le bump allocator défile dans chaque segment et
+    // pousse un NOUVEAU segment quand besoin (auto-grow). Les objets ne sont
+    // jamais déplacés (un Obj embarque un std::string → non relocalisable par
+    // memcpy), donc chaque segment reste physique et immuable. Cette souplesse
+    // sert le dev PC : des jeux qui allouent beaucoup (texte, typewriter,
+    // ressources) finissaient par mourir en "heap epuisee" sans GC. Sur RP2040
+    // on peut brider via JME_HEAP_MAX ou revenir à un pool unique figé.
+    std::vector<uint8_t *> segs_;
+    std::vector<size_t> segCaps_;
+    size_t initCap_ = 0;    // taille du premier segment (JME_HEAP)
+    size_t capTotal_ = 0;   // capacité totale allouée (init + segments étendus)
+    size_t usedTotal_ = 0;  // octets consommés au total
+    size_t off_ = 0;        // offset courant dans le dernier segment
     bool oom_ = false;
     std::unordered_map<std::string, Obj *> classCache_;
     std::vector<Obj *> strings_; // garde les strings (bump allocator, jamais libérés)

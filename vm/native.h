@@ -29,4 +29,8 @@ void registerNative(const std::string &key, NativeFn fn);
 // Enregistrement de toutes les natives (CLDC + MIDP). À appeler une fois.
 void initNatives();
 
+// Horloge virtuelle (ms) simulée, avancée à chaque frame (déterministe).
+int64_t virtualMillis();
+void advanceVirtualMillis(int64_t ms);
+
 } // namespace jvm

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime.h"
+#include <functional>
 
 namespace jvm
 {
@@ -45,11 +46,25 @@ public:
     Runtime *rt() { return rt_; }
 
     // Budget d'instructions par « trame » coopérative : à -1, illimité.
-    // Quand le budget atteint 0, execBytecode abandonne la pile (okResult=false)
-    // afin de rendre la main pour l'image suivante. Thread.start est alors
-    // relancé depuis le haut de run() à la prochaine trame (état dans les champs).
-    void setInstrBudget(int64_t n) { instrBudget_ = n; }
+    // Quand le budget atteint 0 :
+    //  - si une yieldFn est active (cf. setYieldFn, thread géré par fibre
+    //    dans natives.cpp), elle est appelée -- elle suspend la fibre
+    //    courante (swapcontext) jusqu'à la prochaine trame, PUIS l'exécution
+    //    REPREND exactement là où elle s'était arrêtée (même pc, mêmes
+    //    locales, même pile d'appel C++) avec un budget rafraîchi. C'est le
+    //    cas normal pour Thread.run().
+    //  - sinon (pas de fibre, ex. startApp()/paint() appelés directement),
+    //    ancien comportement : execBytecode abandonne (okResult=false).
+    void setInstrBudget(int64_t n) { instrBudget_ = n; instrBudgetQuota_ = n; }
     int64_t instrBudgetLeft() const { return instrBudget_; }
+
+    // Fonction appelée quand le budget s'épuise pendant l'exécution d'une
+    // fibre : doit suspendre la fibre courante (swapcontext) et ne revenir
+    // que lorsqu'elle est réveillée par le scheduler. nullptr = pas de
+    // fibre active (comportement budget classique : abandon).
+    using YieldFn = std::function<void()>;
+    void setYieldFn(YieldFn fn) { yieldFn_ = std::move(fn); }
+    void clearYieldFn() { yieldFn_ = nullptr; }
 
     // Alloue n octets depuis l'arène de frames (ring bump), aligné sur 8.
     void *frameAlloc(size_t n);
@@ -62,6 +77,8 @@ private:
     size_t arenaOff_ = 0;
     size_t arenaBase_ = 0;
     int64_t instrBudget_ = -1;
+    int64_t instrBudgetQuota_ = -1;
+    YieldFn yieldFn_;
 
     bool dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
                   Value *args, int nargs, Value &result);

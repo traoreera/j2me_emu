@@ -11,19 +11,31 @@ namespace jvm
 // ---------------------------------------------------------------------
 
 Heap::Heap(size_t poolSize)
-    : cap_(poolSize), off_(0)
 {
-    pool_ = new uint8_t[cap_];
+    initCap_ = poolSize ? poolSize : kDefaultPoolSize;
+    auto *seg = new uint8_t[initCap_];
+    segs_.push_back(seg);
+    segCaps_.push_back(initCap_);
+    capTotal_ = initCap_;
 }
 
 Heap::~Heap()
 {
-    delete[] pool_;
+    for (uint8_t *s : segs_)
+        delete[] s;
 }
 
 void Heap::reset()
 {
+    usedTotal_ = 0;
     off_ = 0;
+    for (size_t i = 1; i < segs_.size(); i++)
+    {
+        delete[] segs_[i];
+    }
+    segs_.resize(1);
+    segCaps_.resize(1);
+    capTotal_ = initCap_;
     classCache_.clear();
     strings_.clear();
     oom_ = false;
@@ -33,13 +45,38 @@ Obj *Heap::allocObj(ObjKind kind, int32_t cells)
 {
     cells = (cells > 0) ? cells : 0;
     size_t need = sizeof(Obj) + cells * sizeof(Value);
-    if (off_ + need > cap_)
+    size_t freeInCur = segCaps_.back() - off_;
+    if (need > freeInCur)
     {
-        oom_ = true;
-        return nullptr;
+        // Auto-grow : nouveau segment assez grand (double au moins).
+        size_t growTo = std::max(capTotal_ * 2, initCap_);
+        growTo = std::max(growTo, usedTotal_ + need);
+        size_t segSize = growTo - capTotal_;
+        uint8_t *seg = nullptr;
+        try
+        {
+            seg = new uint8_t[segSize];
+        }
+        catch (...)
+        {
+            seg = nullptr;
+        }
+        if (!seg)
+        {
+            if (getenv("JME_DEBUG"))
+                fprintf(stderr, "allocObj OOM: kind=%d cells=%d need=%zu used=%zu cap=%zu\n",
+                        (int)kind, cells, need, usedTotal_, capTotal_);
+            oom_ = true;
+            return nullptr;
+        }
+        segs_.push_back(seg);
+        segCaps_.push_back(segSize);
+        capTotal_ += segSize;
+        off_ = 0;
     }
-    Obj *o = reinterpret_cast<Obj *>(pool_ + off_);
+    Obj *o = reinterpret_cast<Obj *>(segs_.back() + off_);
     off_ += need;
+    usedTotal_ += need;
     o->kind = kind;
     o->cls = nullptr;
     o->cellCount = cells;
@@ -149,20 +186,27 @@ const MethodRecord *ClassInfo::findClinit() const
     return findMethod("<clinit>", "()V");
 }
 
-const MethodRecord *ClassInfo::findField(const std::string &nm) const
+const MethodRecord *ClassInfo::findField(const std::string &nm, const std::string &ds) const
 {
+    if (ds.empty())
+    {
+        for (const auto &f : fields)
+            if (f.name == nm)
+                return &f;
+        return nullptr;
+    }
     for (const auto &f : fields)
-        if (f.name == nm)
+        if (f.name == nm && f.desc == ds)
             return &f;
     return nullptr;
 }
 
-const MethodRecord *ClassInfo::findFieldRecursive(const std::string &nm) const
+const MethodRecord *ClassInfo::findFieldRecursive(const std::string &nm, const std::string &ds) const
 {
     const ClassInfo *c = this;
     while (c)
     {
-        const MethodRecord *f = c->findField(nm);
+        const MethodRecord *f = c->findField(nm, ds);
         if (f)
             return f;
         c = c->super;
@@ -352,6 +396,20 @@ ClassInfo *Runtime::registerNativeClass(
     {
         f.slot = ci->instanceCells;
         ci->instanceCells += sizeOfSlot(f.desc);
+        // Les champs de classe native déclarés ici (fieldSig) sont toujours
+        // marqués isStatic=false et indexés en cellules d'INSTANCE (voir
+        // plus haut) -- correct pour l'état caché type GC_FULLSCREEN/GC_GFX,
+        // couleur de Graphics, etc. Mais si le bytecode du jeu accède à ce
+        // champ via getstatic/putstatic (ex. le vrai java/lang/System.out,
+        // static par nature), l'interpréteur indexe owner->statics[f.slot]
+        // -- vecteur resté vide faute d'être jamais rempli ici, d'où un
+        // plantage (vector::operator[] hors bornes). On garde `statics`
+        // assez grand pour couvrir n'importe quel slot de champ natif : la
+        // même valeur reste alors lisible/écrivable via getstatic ET
+        // getfield, au prix de quelques cellules perdues (classes natives
+        // ont très peu de champs).
+        if (ci->statics.size() <= static_cast<size_t>(f.slot))
+            ci->statics.resize(f.slot + 1);
     }
 
     ClassInfo *out = ci.get();
@@ -361,7 +419,7 @@ ClassInfo *Runtime::registerNativeClass(
 
 void Runtime::reportOom()
 {
-    fprintf(stderr, "JVM: heap epuisee (%zu/%zu octets)\n", heap_.used(), Heap::kDefaultPoolSize);
+    fprintf(stderr, "JVM: heap epuisee (%zu/%zu octets)\n", heap_.used(), heap_.capacity());
 }
 
 } // namespace jvm
