@@ -135,6 +135,39 @@ ClassInfo *runtimeClassOf(Runtime *rt, Obj *o)
     default: return o->cls;
     }
 }
+
+// Cherche, dans la table d'exceptions de `code`, un handler dont l'étendue
+// [startPc,endPc) couvre `throwPc` (le site d'un athrow, ou d'un appel de
+// méthode qui a échoué en propageant une exception) et dont le catchType
+// correspond au type dynamique de `ex` (0 = catch-all/finally). Les
+// handlers sont dans l'ordre du fichier .class, qui est déjà l'ordre de
+// priorité JVM (premier match retenu).
+bool findExceptionHandler(const CodeAttribute *code, const ConstantPool &cp,
+                           int throwPc, Obj *ex, int &outHandlerPc)
+{
+    if (!ex || ex->kind != ObjKind::Instance)
+        return false;
+    for (const auto &h : code->handlers)
+    {
+        if (throwPc < h.startPc || throwPc >= h.endPc)
+            continue;
+        if (h.catchType == 0)
+        {
+            outHandlerPc = h.handlerPc;
+            return true;
+        }
+        std::string wantName = cp.getClassName(h.catchType);
+        for (ClassInfo *oc = ex->cls; oc; oc = oc->super)
+        {
+            if (oc->name == wantName)
+            {
+                outHandlerPc = h.handlerPc;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 } // namespace
 
 // ---------------------------------------------------------------------
@@ -437,6 +470,63 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     bool okResult = true;
     Value resultVal = Value();
 
+    // Lève une exception Java (ex. NPE / AIOOBE) sur un accès tableau
+    // invalide : l'interpréteur traitait arr==null / index hors bornes comme
+    // un échec d'opcode « dur » (okResult=false), qui tuait toute la chaîne
+    // d'appels sans jamais exécuter les catch(Exception) des jeux. Sur une
+    // vraie JVM c'est une NullPointerException / ArrayIndexOutOfBoundsException
+    // rattrapable (n'importe quel catch(Exception) — GAMELOFT wrappe tout son
+    // rendu dedans). Retourne true si le handler de la frame courante a pris
+    // le relais (peut continuer), false si elle doit se propager aux appelants.
+    auto raiseJava = [&](ClassInfo *excls, int throwPc) -> bool
+    {
+        if (!excls)
+        {
+            if (getenv("JME_DEBUG"))
+                fprintf(stderr, "RAISE excls=NULL (classe exception non enregistrée) throwPc=%d in %s.%s\n",
+                        throwPc, cls->name.c_str(), m->name.c_str());
+            return false;
+        }
+        Obj *ex = rt_->heap().newInstance(excls);
+        if (!ex)
+        {
+            rt_->reportOom();
+            return false;
+        }
+        int handlerPc;
+        if (findExceptionHandler(code, cp, throwPc, ex, handlerPc))
+        {
+            if (getenv("JME_DEBUG"))
+                fprintf(stderr, "RAISE %s caught->%d in %s.%s throwPc=%d\n",
+                        excls->name.c_str(), handlerPc, cls->name.c_str(), m->name.c_str(), throwPc);
+            sp = 0;
+            pushRef(ex);
+            pc = handlerPc;
+            return true;
+        }
+        if (getenv("JME_DEBUG"))
+            fprintf(stderr, "RAISE %s NO-HANDLER in %s.%s throwPc=%d -> pending\n",
+                    excls->name.c_str(), cls->name.c_str(), m->name.c_str(), throwPc);
+        pendingException_ = ex;
+        return false;
+    };
+    auto raiseIfBadArray = [&](Obj *arr, int idx, int throwPc) -> bool
+    {
+        if (!arr)
+        {
+            bool h = raiseJava(rt_->classInfoOfName("java/lang/NullPointerException"), throwPc);
+            if (!h) { okResult = false; done = true; }
+            return true;
+        }
+        if (idx < 0 || idx >= arr->arrayLen)
+        {
+            bool h = raiseJava(rt_->classInfoOfName("java/lang/ArrayIndexOutOfBoundsException"), throwPc);
+            if (!h) { okResult = false; done = true; }
+            return true;
+        }
+        return false;
+    };
+
     while (!done && pc >= 0 && pc < codeLen)
     {
         if (instrBudget_ >= 0 && --instrBudget_ < 0)
@@ -575,8 +665,8 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             Value v = Value::fromLong(popLong());
             int idx = popInt();
             Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else arr->cells[idx] = v;
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            arr->cells[idx] = v;
             break;
         }
         case 0x4f: case 0x51: case 0x53:
@@ -584,8 +674,8 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             Value v = pop();
             int idx = popInt();
             Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else arr->cells[idx] = v;
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            arr->cells[idx] = v;
             break;
         }
         case 0x54: case 0x55: case 0x56:
@@ -593,51 +683,50 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             Value v = pop();
             int idx = popInt();
             Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else arr->cells[idx] = v;
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            arr->cells[idx] = v;
             break;
         }
 
         case 0x2e:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else push(arr->cells[idx], 1);
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            push(arr->cells[idx], 1);
             break;
         }
         case 0x2f:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else pushLong(arr->cells[idx].l);
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            pushLong(arr->cells[idx].l);
             break;
         }
         case 0x30:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else push(arr->cells[idx], 1);
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            push(arr->cells[idx], 1);
             break;
         }
         case 0x31:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else pushLong(arr->cells[idx].l);
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            pushLong(arr->cells[idx].l);
             break;
         }
         case 0x32:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else push(arr->cells[idx], 1);
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
+            push(arr->cells[idx], 1);
             break;
         }
         case 0x33: case 0x34: case 0x35:
         {
             int idx = popInt(); Obj *arr = popRef();
-            if (!arr || idx < 0 || idx >= arr->arrayLen) { okResult = false; done = true; }
-            else
+            if (raiseIfBadArray(arr, idx, pc - 1)) break;
             {
                 int32_t v = arr->cells[idx].i;
                 if (op == 0x33) v = static_cast<int8_t>(v);
@@ -657,12 +746,29 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
         case 0x5a:
         {
-            if (sp >= 2) { Value a = st[sp - 1], b = st[sp - 2]; uint8_t ca = ct[sp - 1], cb = ct[sp - 2]; st[sp - 1] = b; ct[sp - 1] = cb; st[sp] = a; ct[sp] = ca; sp++; }
+            if (sp >= 2)
+            {
+                Value a = st[sp - 1], b = st[sp - 2];
+                uint8_t ca = ct[sp - 1], cb = ct[sp - 2];
+                st[sp - 2] = a; ct[sp - 2] = ca;
+                st[sp - 1] = b; ct[sp - 1] = cb;
+                st[sp] = a; ct[sp] = ca;
+                sp++;
+            }
             break;
         }
         case 0x5b:
         {
-            if (sp >= 3) { Value a = st[sp - 1]; uint8_t ca = ct[sp - 1]; st[sp - 1] = st[sp - 2]; ct[sp - 1] = ct[sp - 2]; st[sp - 2] = st[sp - 3]; ct[sp - 2] = ct[sp - 3]; st[sp] = a; ct[sp] = ca; sp++; }
+            if (sp >= 3)
+            {
+                Value a = st[sp - 1], b = st[sp - 2], c = st[sp - 3];
+                uint8_t ca = ct[sp - 1], cb = ct[sp - 2], cc = ct[sp - 3];
+                st[sp - 3] = a; ct[sp - 3] = ca;
+                st[sp - 2] = c; ct[sp - 2] = cc;
+                st[sp - 1] = b; ct[sp - 1] = cb;
+                st[sp] = a; ct[sp] = ca;
+                sp++;
+            }
             break;
         }
         case 0x5c:
@@ -857,9 +963,22 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             int npairs = rb32(c, pc);
             int key = popInt();
             int found = -1;
-            for (int i = 0; i < npairs && (size_t)(base + 12 + (i + 1) * 8) <= (size_t)codeLen; i++)
+            // En-tête de lookupswitch = default + npairs = 8 octets (pas 12 :
+            // contrairement à tableswitch, qui a 3 champs default/lo/hi avant
+            // sa table, lookupswitch n'en a que 2). Utiliser +12 ici (copié
+            // par erreur depuis tableswitch) désalignait chaque paire de 4
+            // octets : on lisait le offset de la paire i comme si c'était sa
+            // valeur de match, et la valeur de match de la paire i+1 comme
+            // si c'était son offset -- la vraie valeur de match n'était donc
+            // (presque) jamais comparée, et le `key` recherché ne correspondait
+            // (presque) jamais à rien, forçant systématiquement la branche
+            // `default`. Observé sur games/mortal_combat_new_b_240x320_173007.jar :
+            // un dispatch d'état (`switch` sur un champ static, 23 paires)
+            // dans `paint()` ne prenait jamais aucun cas réel, l'écran restant
+            // noir en permanence alors qu'aucune erreur n'était jamais levée.
+            for (int i = 0; i < npairs && (size_t)(base + 8 + (i + 1) * 8) <= (size_t)codeLen; i++)
             {
-                const uint8_t *p = c + base + 12 + i * 8;
+                const uint8_t *p = c + base + 8 + i * 8;
                 int32_t cv = static_cast<int32_t>((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
                 if (cv == key)
                 {
@@ -942,9 +1061,13 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     (fn == "bl" || fn == "el" || fn == "bW" || fn == "bm" || fn == "em" ||
                      fn == "en" || fn == "eo" || fn == "bP" || fn == "G" || fn == "cq" ||
                      fn == "eF" || fn == "eB" || fn == "eC" || fn == "c" || fn == "bZ" ||
-                     fn == "al" || fn == "ek" || fn == "ac" || fn == "bX" || fn == "bH"))
+                     fn == "al" || fn == "ek" || fn == "ac" || fn == "bX" || fn == "bH" ||
+                     fn == "aU" || fn == "aS" || fn == "C" || fn == "k" || fn == "ah" ||
+                     fn == "U" || fn == "X" || fn == "cd" || fn == "bd" || fn == "A"))
                     fprintf(stderr, "PS %s.%s=%d t=%lld\n", owner->name.c_str(), fn.c_str(), v.i,
                             (long long)virtualMillis());
+                if (getenv("JME_DEBUG") && owner->name == "e" && fn == "j")
+                    fprintf(stderr, "PUTSTATIC e.j = %d (caller=%s.%s pc=%d)\n", v.i, cls->name.c_str(), m->name.c_str(), pc);
                 owner->statics[f->slot] = v;
             }
             break;
@@ -991,6 +1114,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
 
         case 0xb6: case 0xb7: case 0xb8: case 0xb9:
         {
+            int opcodePc = pc - 1;
             uint16_t idx = rbu16(c, pc);
             if (op == 0xb9)
             {
@@ -1026,6 +1150,14 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     ok = invokeSpecial(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres);
                 else
                     ok = invokeVirtual(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres);
+                if (getenv("JME_WAITDBG") && mname == "wait")
+                    fprintf(stderr, "waitdbg tc=%s mname=%s mdesc=%s recv=%s nslots=%d ok=%d\n",
+                            tc ? tc->name.c_str() : "?", mname.c_str(), mdesc.c_str(),
+                            receiver && receiver->cls ? receiver->cls->name.c_str() : "?", nslots, ok ? 1 : 0);
+                if (getenv("JME_WAITDBG"))
+                    fprintf(stderr, "invokefn %s.%s%s op=%02x ok=%d (parent=%s.%s)\n",
+                            mname.c_str(), mdesc.c_str(), tc ? tc->name.c_str() : "?", op, ok ? 1 : 0,
+                            cls->name.c_str(), m->name.c_str());
                 sp -= nslots + 1;
             }
             if (!rv)
@@ -1035,11 +1167,41 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 if (rt == 'J' || rt == 'D') pushLong(mres.l);
                 else push(mres, 1);
             }
-            if (!ok && getenv("JME_DEBUG"))
-                fprintf(stderr, "invokeEchec %s.%s%s (caller=%s.%s pc=%d)\n",
-                        tc ? tc->name.c_str() : "?", mname.c_str(), mdesc.c_str(),
-                        cls->name.c_str(), m->name.c_str(), pc);
-            if (!ok) { okResult = false; done = true; }
+            if (!ok)
+            {
+                // Une méthode appelée peut avoir échoué parce qu'une
+                // exception Java (athrow) s'est propagée sans être
+                // rattrapée dans SA propre frame : on tente ici de la
+                // rattraper dans la NÔTRE (table d'exceptions de la méthode
+                // en cours, autour de ce site d'appel), exactement comme le
+                // ferait un vrai déroulement de pile JVM. Sans ça, tout
+                // `try { ... } catch (Exception e) { ... }` autour d'un
+                // appel de méthode était invisible pour l'interpréteur :
+                // n'importe quel échec (throw explicite ou natif manquant)
+                // tuait la frame entière au lieu d'exécuter le bloc catch
+                // (observé sur games/jump.jar : JumpCanvas.<init> fait
+                // `throw new Exception(...)` sur les résolutions d'écran
+                // non prévues, capturé par l'appelant pour retomber sur une
+                // init par défaut -- sans rattrapage, le MIDlet entier
+                // échouait à s'instancier).
+                Obj *pending = pendingException_;
+                pendingException_ = nullptr;
+                int handlerPc;
+                if (pending && findExceptionHandler(code, cp, opcodePc, pending, handlerPc))
+                {
+                    sp = 0;
+                    pushRef(pending);
+                    pc = handlerPc;
+                    break;
+                }
+                if (pending)
+                    pendingException_ = pending; // toujours pas rattrapée : continue de remonter
+                if (getenv("JME_DEBUG"))
+                    fprintf(stderr, "invokeEchec %s.%s%s (caller=%s.%s pc=%d)\n",
+                            tc ? tc->name.c_str() : "?", mname.c_str(), mdesc.c_str(),
+                            cls->name.c_str(), m->name.c_str(), pc);
+                okResult = false; done = true;
+            }
             break;
         }
 
@@ -1049,10 +1211,10 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             std::string classRef = cp.getClassName(idx);
             ClassInfo *tc = rt_->classInfoOfName(classRef);
             if (!tc && rt_->jar()) tc = rt_->loadFromJar(classRef);
-            if (!tc) { okResult = false; done = true; break; }
-            if (!ensureInit(tc)) { okResult = false; done = true; break; }
+            if (!tc) { if (getenv("JME_DEBUG")) fprintf(stderr, "new: class %s introuvable\n", classRef.c_str()); okResult = false; done = true; break; }
+            if (!ensureInit(tc)) { if (getenv("JME_DEBUG")) fprintf(stderr, "new: ensureInit echec pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
             Obj *o = rt_->heap().newInstance(tc);
-            if (!o) { rt_->reportOom(); okResult = false; done = true; break; }
+            if (!o) { rt_->reportOom(); if (getenv("JME_DEBUG")) fprintf(stderr, "new: OOM pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
             pushRef(o);
             break;
         }
@@ -1098,11 +1260,14 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             bool is = false;
             if (o && !classRef.empty() && classRef[0] == '[')
             {
-                // Cast/instanceof vers un type tableau (ex. "[I", "[Ljava/lang/String;") :
-                // pas de ClassInfo pour ces descripteurs, on compare directement le ObjKind.
+                // Cast/instanceof vers un type tableau (ex. "[I", "[[B") :
+                // pas de ClassInfo pour ces descripteurs, on compare le ObjKind.
                 size_t p = classRef.find_first_not_of('[');
                 char base = (p != std::string::npos) ? classRef[p] : 'I';
-                is = (o->kind == leafArrayKind(base));
+                if (p >= 2)
+                    is = (o->kind == ObjKind::ObjArray);
+                else
+                    is = (o->kind == leafArrayKind(base));
             }
             else
             {
@@ -1117,7 +1282,13 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 st[sp - 1].i = is ? 1 : 0;
             else if (o && !is)
             {
-                fprintf(stderr, "JVM: checkcast fail vers %s\n", classRef.c_str());
+                if (getenv("JME_DEBUG"))
+                {
+                    fprintf(stderr, "JVM: checkcast fail vers %s (objet kind=%d cls=%s len=%d ref=%p) in %s.%s pc=%d sp=%d\n",
+                            classRef.c_str(), (int)o->kind,
+                            o->cls ? o->cls->name.c_str() : "-",
+                            o->arrayLen, (void *)o, cls->name.c_str(), m->name.c_str(), pc, sp);
+                }
                 okResult = false; done = true;
             }
             break;
@@ -1125,18 +1296,46 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0xbe:
         {
             Obj *a = popRef();
-            if (!a) { okResult = false; done = true; break; }
-            pushInt(a->arrayLen);
+            if (!a)
+            {
+                if (raiseJava(rt_->classInfoOfName("java/lang/NullPointerException"), pc - 1))
+                    break;
+                okResult = false; done = true;
+            }
+            else pushInt(a->arrayLen);
             break;
         }
         case 0xbf:
         {
+            int opcodePc = pc - 1;
             Obj *ex = popRef();
-            fprintf(stderr, "JVM: exception non gérée (athrow), ex=%p\n", (void *)ex);
+            int handlerPc;
+            if (ex && findExceptionHandler(code, cp, opcodePc, ex, handlerPc))
+            {
+                sp = 0;
+                pushRef(ex);
+                pc = handlerPc;
+                break;
+            }
+            if (getenv("JME_DEBUG"))
+                fprintf(stderr, "JVM: exception non rattrapée (athrow) ex=%s dans %s.%s pc=%d\n",
+                        ex && ex->cls ? ex->cls->name.c_str() : "?", cls->name.c_str(), m->name.c_str(), opcodePc);
+            pendingException_ = ex;
             okResult = false; done = true;
             break;
         }
-        case 0xc2: case 0xc3: break;
+        case 0xc2: case 0xc3:
+        {
+            // monitorenter/monitorexit : pas de moniteur réel, mais JVMS les
+            // fait POINTER l'objectref de la pile d'opérandes. Un no-op sans
+            // pop laissait une référence fantôme sur la pile, qui pouvait
+            // pousser sp au-delà de maxStack dans les méthodes au budget de
+            // pile exact (ex. GameThread.run avec stack=3 et un wait(long) :
+            // le garde-fou d'overflow fixes then pc = codeLen, le run() était
+            // tué silencieusement).
+            if (sp >= 1) st[--sp].o = nullptr;
+            break;
+        }
 
         case 0xc4: // wide
         {
@@ -1181,6 +1380,23 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
 
     if (done && okResult)
         result = resultVal;
+    if (!okResult && getenv("JME_DEBUG"))
+    {
+        fprintf(stderr, "FRMFALSE %s.%s pc=%d codeLen=%d\n",
+                cls->name.c_str(), m->name.c_str(), pc, codeLen);
+        int fp = pc - 1;
+        if (fp >= 0 && fp < codeLen)
+        {
+            fprintf(stderr, "  FAILBYTE[%d]=%02X next=[", fp, c[fp]);
+            for (int i = fp + 1; i < fp + 6 && i < codeLen; i++)
+                fprintf(stderr, " %02X", c[i]);
+            fprintf(stderr, " ]\n");
+        }
+    }
+    if (getenv("JME_WAITDBG"))
+        fprintf(stderr, "EXIT %s.%s done=%d ok=%d pc=%d codeLen=%d budget=%lld\n",
+                cls->name.c_str(), m->name.c_str(), done ? 1 : 0, okResult ? 1 : 0, pc,
+                codeLen, (long long)(instrBudget_ >= 0 ? instrBudget_ : -1));
     frameFree(mark);
     return okResult;
 }

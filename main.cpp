@@ -122,7 +122,7 @@ int main(int argc, char **argv)
         jme::JarReader *jar = rt.jar();
         if (jar)
         {
-            const char *testNames[] = { "3", "14", "dataIGP", nullptr };
+            const char *testNames[] = {"3", "14", "dataIGP", nullptr};
             for (int t = 0; testNames[t]; t++)
             {
                 jme::JarEntry e;
@@ -164,29 +164,97 @@ int main(int argc, char **argv)
     if (const char *ak = getenv("JME_AUTOKEY"))
     {
         std::string s(ak);
-        if (s == "5") autoKey = hal::KEY_5;
-        else if (s == "0") autoKey = hal::KEY_0;
-        else if (s == "*") autoKey = hal::KEY_STAR;
-        else if (s == "#") autoKey = hal::KEY_HASH;
-        else if (s == "FIRE") autoKey = hal::KEY_FIRE;
-        else if (s == "SOFT1") autoKey = hal::KEY_SOFT1;
-        else if (s == "SOFT2") autoKey = hal::KEY_SOFT2;
-        else if (s == "LEFT") autoKey = hal::KEY_LEFT;
-        else if (s == "RIGHT") autoKey = hal::KEY_RIGHT;
-        else if (s == "UP") autoKey = hal::KEY_UP;
-        else if (s == "DOWN") autoKey = hal::KEY_DOWN;
+        if (s == "5")
+            autoKey = hal::KEY_5;
+        else if (s == "0")
+            autoKey = hal::KEY_0;
+        else if (s == "*")
+            autoKey = hal::KEY_STAR;
+        else if (s == "#")
+            autoKey = hal::KEY_HASH;
+        else if (s == "FIRE")
+            autoKey = hal::KEY_FIRE;
+        else if (s == "SOFT1")
+            autoKey = hal::KEY_SOFT1;
+        else if (s == "SOFT2")
+            autoKey = hal::KEY_SOFT2;
+        else if (s == "LEFT")
+            autoKey = hal::KEY_LEFT;
+        else if (s == "RIGHT")
+            autoKey = hal::KEY_RIGHT;
+        else if (s == "UP")
+            autoKey = hal::KEY_UP;
+        else if (s == "DOWN")
+            autoKey = hal::KEY_DOWN;
     }
     if (const char *akf = getenv("JME_AUTOKEYFRAME"))
         autoKeyFrame = atoi(akf);
+
+    struct Tap
+    {
+        int fr;
+        uint32_t bits;
+    };
+    std::vector<Tap> autoTaps;
+    if (const char *ats = getenv("JME_AUTOTAPS"))
+    {
+        std::string seq(ats);
+        size_t pos = 0;
+        while (pos < seq.size())
+        {
+            size_t sep = seq.find(',', pos);
+            std::string item = seq.substr(pos, sep == std::string::npos ? std::string::npos : sep - pos);
+            pos = (sep == std::string::npos) ? seq.size() : sep + 1;
+            size_t colon = item.find(':');
+            if (colon == std::string::npos)
+                continue;
+            int fr = atoi(item.substr(0, colon).c_str());
+            std::string k = item.substr(colon + 1);
+            uint32_t bits = 0;
+            if (k == "5")
+                bits = hal::KEY_5;
+            else if (k == "0")
+                bits = hal::KEY_0;
+            else if (k == "*")
+                bits = hal::KEY_STAR;
+            else if (k == "#")
+                bits = hal::KEY_HASH;
+            else if (k == "FIRE")
+                bits = hal::KEY_FIRE;
+            else if (k == "SOFT1")
+                bits = hal::KEY_SOFT1;
+            else if (k == "SOFT2")
+                bits = hal::KEY_SOFT2;
+            else if (k == "LEFT")
+                bits = hal::KEY_LEFT;
+            else if (k == "RIGHT")
+                bits = hal::KEY_RIGHT;
+            else if (k == "UP")
+                bits = hal::KEY_UP;
+            else if (k == "DOWN")
+                bits = hal::KEY_DOWN;
+            autoTaps.push_back({fr, bits});
+        }
+    }
+
+    uint32_t autoBits = autoKey;
+    for (const Tap &t : autoTaps)
+        autoBits |= t.bits;
 
     int autoTouchX = -1, autoTouchY = -1, autoTouchFrame = -1;
     if (const char *at = getenv("JME_AUTOTOUCH"))
     {
         if (std::sscanf(at, "%d,%d", &autoTouchX, &autoTouchY) != 2)
-            { autoTouchX = -1; autoTouchY = -1; }
+        {
+            autoTouchX = -1;
+            autoTouchY = -1;
+        }
         if (const char *atf = getenv("JME_AUTOTOUCHFRAME"))
             autoTouchFrame = atoi(atf);
     }
+
+    const uint32_t kFrameBudgetMs = 33; // ~30 fps cible
+    uint32_t frameStart = SDL_GetTicks();
 
     while (running)
     {
@@ -196,12 +264,21 @@ int main(int argc, char **argv)
         {
             bool hold = (autoKeyFrame < 0);
             input.pressed |= autoKey;
-            if (hold ? (frame < 1) : (frame == autoKeyFrame)) input.justPressed |= autoKey;
-            if (!hold && frame == autoKeyFrame) input.pressed &= ~autoKey;
+            if (hold ? (frame < 1) : (frame == autoKeyFrame))
+                input.justPressed |= autoKey;
+            if (!hold && frame == autoKeyFrame)
+                input.pressed &= ~autoKey;
         }
 
-        if ((input.justPressed & (hal::KEY_SOFT2 | hal::KEY_SOFT1)) && !(autoKey & (hal::KEY_SOFT2 | hal::KEY_SOFT1)))
+        if ((input.justPressed & (hal::KEY_SOFT2 | hal::KEY_SOFT1)) && !(autoBits & (hal::KEY_SOFT2 | hal::KEY_SOFT1)))
             break;
+
+        for (const Tap &t : autoTaps)
+            if (t.fr == frame)
+            {
+                input.pressed |= t.bits;
+                input.justPressed |= t.bits;
+            }
 
         if (autoTouchX >= 0 && autoTouchY >= 0 &&
             (autoTouchFrame < 0 || frame == autoTouchFrame))
@@ -217,7 +294,20 @@ int main(int argc, char **argv)
             break;
 
         hal::display_present(hal::display_get_framebuffer());
-        SDL_Delay(16);
+
+        // Rythme de trame adaptatif : on ne dort que le temps restant du
+        // budget de trame (au lieu d'un SDL_Delay(16) fixe qui s'ajoutait
+        // systématiquement au temps de traitement, quelle que soit sa durée
+        // -- garantissant un plafond ~62 fps même quand le traitement est
+        // rapide, et surtout transformant toute variation du temps
+        // d'interprétation bytecode/rendu en saccades visibles puisque la
+        // trame totale = temps_variable + 16ms_fixe). Si le traitement a
+        // déjà dépassé le budget, on ne dort pas du tout (rattrapage) plutôt
+        // que d'accumuler du retard trame après trame.
+        uint32_t elapsed = SDL_GetTicks() - frameStart;
+        if (elapsed < kFrameBudgetMs)
+            SDL_Delay(kFrameBudgetMs - elapsed);
+        frameStart = SDL_GetTicks();
     }
 
     if (const char *dump = getenv("JME_DUMP"))
@@ -237,7 +327,9 @@ int main(int argc, char **argv)
                     uint8_t r = (uint8_t)((p >> 11) << 3);
                     uint8_t g = (uint8_t)(((p >> 5) & 0x3F) << 2);
                     uint8_t b = (uint8_t)((p & 0x1F) << 3);
-                    fputc(r, f); fputc(g, f); fputc(b, f);
+                    fputc(r, f);
+                    fputc(g, f);
+                    fputc(b, f);
                 }
             }
             fclose(f);
@@ -247,5 +339,10 @@ int main(int argc, char **argv)
     hal::input_shutdown();
     hal::display_shutdown();
     printf("Emulation terminee apres %d frames\n", frame);
+    if (getenv("JME_DEBUG"))
+        printf("[dbg] ecritures framebuffer: %d\n", jvm::midp::jme_screenWrites());
+        printf("[dbg] dessins ciblant ecran: %d\n", jvm::midp::jme_screenPix());
+        printf("[dbg] dessins ciblant canvas565: %d\n", jvm::midp::jme_canvasPix());
+        printf("[dbg] flushGraphics: %d\n", jvm::midp::jme_flushCalls());
     return 0;
 }

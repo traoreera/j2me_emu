@@ -102,7 +102,7 @@ namespace jme
 
             std::string name(fnLen, '\0');
             hal::file_seek(&file_, entryStart + 46, SEEK_SET);
-            hal::file_read(&file_, reinterpret_cast<uint8_t*>(name.data()), fnLen);
+            hal::file_read(&file_, reinterpret_cast<uint8_t *>(name.data()), fnLen);
             e.name = std::move(name);
 
             index_.push_back(std::move(e));
@@ -161,12 +161,26 @@ namespace jme
 
     bool JarReader::findEntry(const std::string &entryPath, JarEntry &out)
     {
+        auto ciEq = [](const std::string &a, const std::string &b) {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); i++)
+            {
+                char x = a[i], y = b[i];
+                if (x >= 'A' && x <= 'Z') x = static_cast<char>(x - 'A' + 'a');
+                if (y >= 'A' && y <= 'Z') y = static_cast<char>(y - 'A' + 'a');
+                if (x != y)
+                    return false;
+            }
+            return true;
+        };
 #ifdef JAR_READER_INDEX_IN_RAM
         for (const auto &e : index_)
         {
-            if (e.name == entryPath)
+            if (e.name == entryPath || ciEq(e.name, entryPath))
             {
                 out = e;
+                out.name = entryPath;
                 return true;
             }
         }
@@ -195,10 +209,10 @@ namespace jme
 
             hal::file_seek(&file_, entryStart + 46, SEEK_SET);
             size_t toRead = std::min<size_t>(fnLen, sizeof(nameBuf) - 1);
-            hal::file_read(&file_, reinterpret_cast<uint8_t*>(nameBuf), toRead);
+            hal::file_read(&file_, reinterpret_cast<uint8_t *>(nameBuf), toRead);
             nameBuf[toRead] = '\0';
 
-            if (entryPath.size() == fnLen && entryPath.compare(0, entryPath.size(), nameBuf, toRead) == 0)
+            if (ciEq(entryPath, std::string(nameBuf, toRead)))
             {
                 out.name = entryPath;
                 out.compression = compression;

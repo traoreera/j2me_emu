@@ -158,6 +158,8 @@ bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
 {
     if (!r) return true;
     JmeFiber *&f = fiberMap()[r];
+    if (getenv("JME_DEBUG"))
+        fprintf(stderr, "jme_threadResume r=%p %s fiber\n", (void*)r, f ? "resuming existing" : "CREATING NEW");
     if (!f)
     {
         f = new JmeFiber();
@@ -244,6 +246,56 @@ void n_Object_toString(NativeContext *ctx)
     snprintf(buf, sizeof(buf), "%s@%p", o && o->cls ? o->cls->name.c_str() : "null", (void *)o);
     setRefResult(ctx, ctx->rt->heap().newString(buf));
 }
+// Object.wait()/wait(long)/notify()/notifyAll() : l'émulateur n'a pas de
+// moniteur réel. Pacing de boucle de jeu = reposer la fibre jusqu'à la
+// prochaine trame (cf. Thread.sleep), notify/notifyAll = no-op. Sans ces
+// registrations, wait() était une méthode introuvable → Erreur non capturable
+// par les handlers `catch (Exception)` (NoSuchMethodError est un Error), ce
+// qui tuait silencieusement les fibres des jeux dont le thread principal
+// rythme sa boucle à l'aide de wait(long) (ex. games/jump.jar : scène figée).
+void n_Object_wait(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
+void n_Object_notify(NativeContext *ctx) { (void)ctx; }
+void n_Object_notifyAll(NativeContext *ctx) { (void)ctx; }
+
+// java.lang.Throwable : seule la racine déclare ses natives/son champ
+// message (cells[0]) -- Exception/RuntimeException et toutes les
+// sous-classes concrètes (NullPointerException, IOException, ...) se
+// contentent d'étendre Throwable sans rien redéclarer, et héritent donc
+// <init>/getMessage/toString/printStackTrace via la même résolution
+// virtuelle que n'importe quelle méthode Java normale -- inutile de
+// dupliquer ces natives sur chaque sous-classe.
+void n_Throwable_init(NativeContext *ctx)
+{
+    if (ctx->thisObj) ctx->thisObj->cells[0] = Value::fromRef(nullptr);
+}
+void n_Throwable_initMsg(NativeContext *ctx)
+{
+    if (ctx->thisObj) ctx->thisObj->cells[0] = Value::fromRef(argRef(ctx, 1));
+}
+void n_Throwable_getMessage(NativeContext *ctx)
+{
+    setRefResult(ctx, ctx->thisObj ? ctx->thisObj->cells[0].o : nullptr);
+}
+void n_Throwable_toString(NativeContext *ctx)
+{
+    Obj *self = ctx->thisObj;
+    std::string cn = self && self->cls ? self->cls->name : "java/lang/Throwable";
+    for (auto &ch : cn) if (ch == '/') ch = '.';
+    Obj *msg = self ? self->cells[0].o : nullptr;
+    std::string s = cn;
+    if (msg && msg->kind == ObjKind::String) { s += ": "; s += msg->str; }
+    setRefResult(ctx, ctx->rt->heap().newString(s));
+}
+void n_Throwable_printStackTrace(NativeContext *ctx)
+{
+    Obj *self = ctx->thisObj;
+    std::string cn = self && self->cls ? self->cls->name : "?";
+    Obj *msg = self ? self->cells[0].o : nullptr;
+    if (msg && msg->kind == ObjKind::String)
+        fprintf(stderr, "%s: %s\n", cn.c_str(), msg->str.c_str());
+    else
+        fprintf(stderr, "%s\n", cn.c_str());
+}
 
 void n_String_initBytes(NativeContext *ctx)
 {
@@ -264,6 +316,23 @@ void n_String_initBytesRange(NativeContext *ctx)
     int off = argInt(ctx, 2);
     int len = argInt(ctx, 3);
     if (!self || !data || data->kind != ObjKind::ByteArray) return;
+    if (off < 0) off = 0;
+    if (len < 0) len = 0;
+    if (off + len > data->arrayLen) len = data->arrayLen - off > 0 ? data->arrayLen - off : 0;
+    self->kind = ObjKind::String;
+    self->str.clear();
+    self->str.reserve(static_cast<size_t>(len));
+    for (int i = 0; i < len; i++)
+        self->str += static_cast<char>(data->cells[off + i].u & 0xFF);
+}
+
+void n_String_initCharsRange(NativeContext *ctx)
+{
+    Obj *self = argRef(ctx, 0);
+    Obj *data = argRef(ctx, 1);
+    int off = argInt(ctx, 2);
+    int len = argInt(ctx, 3);
+    if (!self || !data || data->kind != ObjKind::CharArray) return;
     if (off < 0) off = 0;
     if (len < 0) len = 0;
     if (off + len > data->arrayLen) len = data->arrayLen - off > 0 ? data->arrayLen - off : 0;
@@ -671,14 +740,44 @@ void n_Thread_init(NativeContext *ctx)
 }
 void n_Thread_start(NativeContext *ctx)
 {
+    // Un Thread amorcé avec un Runnable le stocke dans cells[0]. Mais le
+    // pattern "sous-classe de Thread qui override run()" (très courant,
+    // ex. net/frog_parrot/jump/GameThread) ne passe AUCUN Runnable :
+    // cells[0] reste nul. Dans ce cas le "runnable" à lancer est le Thread
+    // lui-même (sa run() redéfini est résolu par invocation virtuelle dans
+    // la fibre). Sans ce fallback, ces jeux lancent un thread fantôme qui
+    // n'exécute jamais rien (écran à noir).
     Obj *r = ctx->thisObj ? ctx->thisObj->cells[0].o : nullptr;
+    if (!r)
+        r = ctx->thisObj;
     if (getenv("JME_DEBUG"))
         fprintf(stderr, "Thread.start(runnable=%p cls=%s)\n", (void *)r,
                 r && r->cls ? r->cls->name.c_str() : "-");
     jme_threadStart(r);
 }
 void n_Thread_sleep(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
-void n_Thread_yield(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
+// Contrairement à sleep(), yield() n'est qu'une suggestion à l'ordonnanceur
+// -- rien ne garantit, sur un vrai appareil, qu'un cycle de repaint complet
+// s'intercale avant que le thread ne reprenne. Le traiter comme sleep()
+// (suspension réelle jusqu'à la trame suivante) est trop fort : un yield()
+// en tout début de run(), avant que le thread n'ait fini sa propre
+// initialisation, laisse alors paint() s'exécuter entre les deux -- avec
+// un état parfois incohérent si le bytecode du jeu suppose (comme sur un
+// vrai device) que son préambule s'exécute d'un bloc avant tout repaint.
+// Observé sur games/mortal_combat_new_b_240x320_173007.jar : run()
+// réinitialise un champ d'état juste après son tout premier yield(),
+// écrasant la transition que paint() venait de faire entre-temps --
+// boucle infinie de réinitialisation de l'écran d'intro, jamais de
+// progression vers le menu/gameplay. On ne suspend donc réellement que si
+// le budget d'instructions de la trame est presque épuisé (même garde-fou
+// anti-boucle-infinie que l'épuisement de budget silencieux dans
+// l'interpréteur) ; sinon on continue immédiatement dans la même fibre.
+void n_Thread_yield(NativeContext *ctx)
+{
+    int64_t left = ctx->interp->instrBudgetLeft();
+    if (left >= 0 && left <= 100)
+        jme_yieldNow();
+}
 void n_Thread_setPriority(NativeContext *ctx) { (void)ctx; }
 void n_Thread_interrupt(NativeContext *ctx) { (void)ctx; }
 void n_Thread_join(NativeContext *ctx) { (void)ctx; }
@@ -775,6 +874,48 @@ void n_RS_deleteStore(NativeContext *ctx)
     std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
     rsRegistry().erase(name);
 }
+// getRecord:(I)[B -- variante qui retourne le record sous forme de tableau.
+void n_RS_getRecordBytes(NativeContext *ctx)
+{
+    auto &recs = rsRegistry()[rsName(ctx)];
+    int id = argInt(ctx, 1);
+    if (id < 1 || (size_t)id > recs.size()) { setRefResult(ctx, nullptr); return; }
+    const auto &rec = recs[id - 1];
+    Obj *b = ctx->rt ? ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int>(rec.size())) : nullptr;
+    if (b)
+        for (size_t i = 0; i < rec.size(); i++)
+            b->cells[i].u = rec[i];
+    setRefResult(ctx, b);
+}
+// enumerateRecords: énumération vide (comportement "aucune sauvegarde") : on ne
+// stocke pas la liste dans le wrapper, hasNextElement() renvoie toujours faux.
+void n_RS_enumerate(NativeContext *ctx)
+{
+    ClassInfo *c = clsOf(ctx, "javax/microedition/rms/RecordEnumerationImpl");
+    Obj *e = c ? ctx->rt->heap().newInstance(c) : nullptr;
+    setRefResult(ctx, e);
+}
+void n_RE_hasNext(NativeContext *ctx) { (void)ctx; setIntResult(ctx, 0); }
+void n_RE_hasPrev(NativeContext *ctx) { (void)ctx; setIntResult(ctx, 0); }
+void n_RE_nextId(NativeContext *ctx)
+{
+    if (!ctx->thisObj) return;
+    setIntResult(ctx, -1);
+}
+void n_RE_prevId(NativeContext *ctx)
+{
+    if (!ctx->thisObj) return;
+    setIntResult(ctx, -1);
+}
+void n_RE_next(NativeContext *ctx) { (void)ctx; setRefResult(ctx, nullptr); }
+void n_RE_prev(NativeContext *ctx) { (void)ctx; setRefResult(ctx, nullptr); }
+void n_RE_numRecords(NativeContext *ctx)
+{
+    (void)ctx;
+    setIntResult(ctx, 0);
+}
+void n_RE_destroy(NativeContext *) { }
+void n_RE_reset(NativeContext *) { }
 
 // --- java.util.Hashtable ---
 int htFieldOff(NativeContext *ctx, const char *cls, const char *fld)
@@ -1162,6 +1303,28 @@ void n_System_identityHashCode(NativeContext *ctx)
 {
     setIntResult(ctx, static_cast<int32_t>(reinterpret_cast<uintptr_t>(argRef(ctx, 0))));
 }
+// --- java.lang.Runtime (utilisé par ex. games/prince_of_persia_th pour le suivi mémoire) ---
+void n_Runtime_getRuntime(NativeContext *ctx)
+{
+    ClassInfo *c = clsOf(ctx, "java/lang/Runtime");
+    setRefResult(ctx, c ? ctx->rt->heap().newInstance(c) : nullptr);
+}
+void n_Runtime_totalMemory(NativeContext *ctx)
+{
+    (void)ctx;
+    setLongResult(ctx, static_cast<int64_t>(ctx->rt->heap().capacity()));
+}
+void n_Runtime_freeMemory(NativeContext *ctx)
+{
+    (void)ctx;
+    size_t cap = ctx->rt->heap().capacity(), used = ctx->rt->heap().used();
+    setLongResult(ctx, static_cast<int64_t>(cap > used ? cap - used : 0));
+}
+void n_Runtime_maxMemory(NativeContext *ctx)
+{
+    (void)ctx;
+    setLongResult(ctx, static_cast<int64_t>(ctx->rt->heap().capacity()));
+}
 void n_PrintStream_println(NativeContext *ctx)
 {
     Obj *s = argRef(ctx, 1);
@@ -1227,12 +1390,25 @@ void initNatives()
     registerNative("java/lang/Object.equals:(Ljava/lang/Object;)Z", n_Object_equals);
     registerNative("java/lang/Object.hashCode:()I", n_Object_hashCode);
     registerNative("java/lang/Object.toString:()Ljava/lang/String;", n_Object_toString);
+    registerNative("java/lang/Object.wait:()V", n_Object_wait);
+    registerNative("java/lang/Object.wait:(I)V", n_Object_wait);
+    registerNative("java/lang/Object.wait:(J)V", n_Object_wait);
+    registerNative("java/lang/Object.notify:()V", n_Object_notify);
+    registerNative("java/lang/Object.notifyAll:()V", n_Object_notifyAll);
+
+    // java.lang.Throwable (racine de toute la hiérarchie Exception/Error)
+    registerNative("java/lang/Throwable.<init>:()V", n_Throwable_init);
+    registerNative("java/lang/Throwable.<init>:(Ljava/lang/String;)V", n_Throwable_initMsg);
+    registerNative("java/lang/Throwable.getMessage:()Ljava/lang/String;", n_Throwable_getMessage);
+    registerNative("java/lang/Throwable.toString:()Ljava/lang/String;", n_Throwable_toString);
+    registerNative("java/lang/Throwable.printStackTrace:()V", n_Throwable_printStackTrace);
 
     // java.lang.String
     registerNative("java/lang/String.<init>:()V", n_Object_init);
     registerNative("java/lang/String.<init>:([BLjava/lang/String;)V", n_String_initBytes);
     registerNative("java/lang/String.<init>:([B)V", n_String_initBytes);
     registerNative("java/lang/String.<init>:([BII)V", n_String_initBytesRange);
+    registerNative("java/lang/String.<init>:([CII)V", n_String_initCharsRange);
     registerNative("java/lang/String.length:()I", n_String_length);
     registerNative("java/lang/String.charAt:(I)C", n_String_charAt);
     registerNative("java/lang/String.toCharArray:()[C", n_String_toCharArray);
@@ -1321,6 +1497,17 @@ void initNatives()
     registerNative("javax/microedition/rms/RecordStore.addRecord:([BII)I", n_RS_addRecord);
     registerNative("javax/microedition/rms/RecordStore.closeRecordStore:()V", n_RS_close);
     registerNative("javax/microedition/rms/RecordStore.deleteRecordStore:(Ljava/lang/String;)V", n_RS_deleteStore);
+    registerNative("javax/microedition/rms/RecordStore.enumerateRecords:(Ljavax/microedition/rms/RecordFilter;Ljavax/microedition/rms/RecordComparator;Z)Ljavax/microedition/rms/RecordEnumeration;", n_RS_enumerate);
+    registerNative("javax/microedition/rms/RecordStore.getRecord:(I)[B", n_RS_getRecordBytes);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.hasNextElement:()Z", n_RE_hasNext);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.hasPreviousElement:()Z", n_RE_hasPrev);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.nextRecordId:()I", n_RE_nextId);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.previousRecordId:()I", n_RE_prevId);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.nextRecord:()[B", n_RE_next);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.previousRecord:()[B", n_RE_prev);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.numRecords:()I", n_RE_numRecords);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.destroy:()V", n_RE_destroy);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.reset:()V", n_RE_reset);
 
     // java.util.Hashtable
     registerNative("java/util/Hashtable.<init>:()V", n_HT_init);
@@ -1366,6 +1553,11 @@ void initNatives()
     registerNative("java/lang/System.gc:()V", n_System_gc);
     registerNative("java/lang/System.getProperty:(Ljava/lang/String;)Ljava/lang/String;", n_System_getProperty);
     registerNative("java/lang/System.identityHashCode:(Ljava/lang/Object;)I", n_System_identityHashCode);
+    registerNative("java/lang/Runtime.getRuntime:()Ljava/lang/Runtime;", n_Runtime_getRuntime);
+    registerNative("java/lang/Runtime.totalMemory:()J", n_Runtime_totalMemory);
+    registerNative("java/lang/Runtime.freeMemory:()J", n_Runtime_freeMemory);
+    registerNative("java/lang/Runtime.maxMemory:()J", n_Runtime_maxMemory);
+    registerNative("java/lang/Runtime.gc:()V", n_System_gc);
 
     // java.io.PrintStream
     registerNative("java/io/PrintStream.println:(Ljava/lang/String;)V", n_PrintStream_println);

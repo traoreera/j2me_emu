@@ -51,7 +51,7 @@ Useful env vars (read in `main.cpp`):
 - `JME_AUTOKEY=5|0|*|#|FIRE|SOFT1|SOFT2|LEFT|RIGHT|UP|DOWN` — hold a key from frame 0 (for scripted smoke tests)
 - `JME_AUTOKEYFRAME=n` — with `JME_AUTOKEY`: send a one-frame tap of that key on frame n instead of holding from 0 (to interact once the game has reached a given state).
 - `JME_DUMP=path.ppm` — dump the final framebuffer as a PPM image on exit
-- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing.
+- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`.
 - `JME_HEAP=n` — override the JVM heap size in KB (default 512, i.e. `Heap::kDefaultPoolSize`). The heap is a bump allocator with no GC (see below); asset-heavy MIDlets can exhaust it during resource loading.
 - `SDL_VIDEODRIVER=dummy` — run headless (no window), combine with the above for CI/agent sanity checks, e.g.:
   ```bash
@@ -83,7 +83,14 @@ bytecode interpreter → native API bridge → HAL (display/input)**.
   canonical Huffman decode), written from scratch instead of depending on
   zlib/miniz. Decompresses directly into the caller's destination buffer
   (which doubles as the sliding window — no separate 32 KB window buffer).
-- `png.*` — minimal PNG decoder for MIDlet image resources.
+- `png.*` — minimal PNG decoder for MIDlet image resources. 8-bit depth
+  only; color types 0/2/3/4/6; both non-interlaced and Adam7-interlaced
+  (`hdr.interlace`). Adam7 decodes each of the 7 passes as an independent
+  sub-image (own per-scanline filtering, restarting from no previous row at
+  the top of each pass) and scatters its pixels into the final buffer at
+  `(sx + col*dx, sy + row*dy)` per pass — see `kAdam7` in `png.cpp`. Passes
+  with zero columns/rows for a given image size (common for small icons)
+  are skipped entirely, contributing no bytes to the decompressed stream.
 - `display.*` — SDL2-backed RGB565 framebuffer (240x320) + a 5x7 bitmap font
   renderer (`display_draw_text`). On RP2040 this becomes the real screen driver.
 - `input.*` — SDL2 key mapping to a J2ME key bitmask (D-pad, two softkeys, 0-9, `*`, `#`).
@@ -214,6 +221,26 @@ tests miss. Found and fixed while bringing up new test JARs:
   own address, not to the (post-padding) start of the offset table.** Using
   the wrong base landed execution 2-3 bytes into the jump table itself,
   interpreting its bytes as bytecode.
+- **`lookupswitch`'s pair table starts at `base + 8`, not `base + 12`.**
+  `tableswitch`'s header is 3 fields (`default`/`lo`/`hi`, 4 bytes each =
+  12) before its offset table, but `lookupswitch`'s header is only 2 fields
+  (`default`/`npairs` = 8 bytes) before its `(match, offset)` pairs — the
+  `+12` was copy-pasted from `tableswitch` without adjusting for the
+  different header size. This misaligned every pair by 4 bytes: entry `i`'s
+  *offset* field was read as if it were entry `i`'s *match value*, and entry
+  `i+1`'s real match value was read as entry `i`'s offset. The real match
+  value was therefore (almost) never compared against, so `key` essentially
+  never matched anything and the `default` branch fired unconditionally —
+  no error, no crash, just every `lookupswitch` silently behaving as if it
+  had zero cases. Games whose `paint()`/state-machine dispatch is driven by
+  a `switch` on a state field compiled to `lookupswitch` (multi-case,
+  non-contiguous values — very common for obfuscated state machines) got
+  stuck permanently on their initial state, painting nothing, with the
+  emulator otherwise running cleanly to completion (found on
+  `games/mortal_combat_new_b_240x320_173007.jar`: a 23-pair state dispatch
+  in `paint()` never advanced past its initial "not yet started" state,
+  producing a persistent black screen with zero errors in 800+ frames).
+  `tableswitch` was never affected — its header genuinely is 12 bytes.
 - **`Object.getClass()` must not dereference `o->cls` unconditionally** —
   it's only populated for `ObjKind::Instance`; `String`/array objects have
   it null by construction (`Heap::newString`/`newArray`). Mirror
@@ -266,6 +293,83 @@ tests miss. Found and fixed while bringing up new test JARs:
   (the real 4-arg MIDP signature, with anchor — the 3-arg version some code
   here registered isn't a real MIDP overload) were both missing from their
   class's declared method list even though natives existed for them.
+- **Real `try`/`catch` (exception unwinding) is now implemented — don't
+  reintroduce the old "any failure aborts the whole call chain" behavior.**
+  `athrow` (0xbf) used to unconditionally abort the current method; the
+  per-method exception table (`CodeAttribute::handlers`, already fully
+  parsed by `class_file.cpp` but never consulted) was dead data. Real J2ME
+  bytecode routinely does `throw new Exception(msg)` for expected,
+  recoverable conditions (unsupported screen size, missing optional
+  resource, ...) with a `catch` block one or more frames up that falls
+  back gracefully — without real unwinding, any such throw silently killed
+  the whole call chain (commonly the MIDlet's own `<init>`), even though
+  the game's own code had a perfectly good fallback path. Implemented in
+  `vm/interpreter.cpp`: `findExceptionHandler()` searches a method's
+  handler table for a range covering the current pc whose `catchType`
+  matches the exception's runtime type (walking its superclass chain;
+  `catchType==0` = catch-all). `athrow` calls it directly; the shared
+  invoke dispatch (0xb6–0xb9) calls it again after any failed call using
+  `Interpreter::pendingException_` (a single in-flight-exception slot) to
+  thread the exception object up through nested `execBytecode` frames —
+  mirroring real JVM stack unwinding one C++/Java frame at a time. Found
+  and fixed while getting `games/jump.jar` running: `JumpCanvas.<init>`
+  throws `Exception` when the device profile looks unsupported, caught by
+  `Jump.<init>`, which falls back to an error `Alert` — previously this
+  just meant "class `java/lang/Exception` introuvable" and a hard
+  MIDlet-instantiation failure.
+- `java.lang.Throwable` and its whole hierarchy
+  (`Exception`/`RuntimeException`/`NullPointerException`/
+  `ArrayIndexOutOfBoundsException`/`ClassCastException`/
+  `IllegalArgumentException`/`NumberFormatException`/etc., plus
+  `java/io/IOException`) are registered as native classes, but **only
+  `Throwable` itself declares `<init>`/`getMessage`/`toString`/
+  `printStackTrace` and the `message` field** — subclasses declare
+  nothing and inherit everything through ordinary virtual/`invokespecial`
+  resolution (which already walks the superclass chain). Don't redeclare
+  these per-subclass "to be safe" — it's unnecessary and, per the
+  Canvas/GameCanvas pitfall above, redeclaring the field on a subclass
+  would misalign the hidden-state cell index.
+- **Some `static final` fields are real object constants, not `int`s —
+  javac does NOT inline them, so they need genuine static storage and a
+  bootstrap value**, same as `System.out`. `javax.microedition.lcdui.
+  AlertType.ALARM/CONFIRMATION/ERROR/INFO/WARNING` are `static final
+  AlertType`, not `int`; leaving them as an empty field list meant
+  `getstatic AlertType.ERROR` failed outright. Fixed the same way as
+  `System.out`: declare the 5 fields on `AlertType`, then after
+  `registerNativeClass` runs, allocate one instance per constant and
+  write it directly into `atCls->statics[slot]` (`midp_natives.cpp`,
+  right after the `System.out` bootstrap). Any other `static final
+  <SomeType>` (not `int`/`String` literal) encountered later needs the
+  same treatment — check whether it's javac-inlined (primitive/String
+  constant, safe to leave as `none`) before assuming an empty field list
+  is fine.
+
+## Performance pitfalls
+
+- **`ConstantPool::getUtf8` must return `const std::string&`, not
+  `std::string` by value.** It only ever returns a reference into an
+  already-stored `CpEntry::utf8`, so a by-value signature forces a full
+  string copy on every call — and `getfield`/`putfield`/`invoke*` call it
+  (directly or via `getFieldRef`/`getMethodRef`/`getClassName`) on *every
+  single bytecode execution*, with no per-call-site caching. Profiled on
+  `games/assasin.jar` (gprof, 200 frames, dummy video driver): this one
+  signature fixed 15.8M copies and cut raw interpreter CPU time from ~65
+  ms/frame to ~14 ms/frame (3.6x) — the difference between ~15 fps
+  (visibly juddering, unplayable) and a comfortable 30 fps headroom. If
+  profiling ever again shows heavy time in `ConstantPool::get*`/
+  `_M_construct`, check this hasn't regressed back to a by-value return.
+- **The per-frame loop must not add a fixed `SDL_Delay` on top of
+  variable processing time.** `main.cpp`'s loop used to do
+  `SDL_Delay(16)` unconditionally after every frame, regardless of how
+  long `midp::tick()` took — guaranteeing a ~62 fps ceiling even when
+  processing was instant, and turning any frame-to-frame variance in
+  bytecode interpretation time directly into visible stutter (frame time
+  = variable processing + fixed 16 ms, so a slow frame plus the extra
+  16 ms tax compounds unevenly rather than the engine catching up). Fixed
+  with adaptive pacing: measure elapsed time since the frame started,
+  sleep only the remainder of a fixed frame budget (`kFrameBudgetMs`,
+  currently 33 ms ≈ 30 fps), and skip the sleep entirely if a frame is
+  already over budget instead of accumulating lag.
 
 ## Porting to RP2040
 

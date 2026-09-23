@@ -88,7 +88,7 @@ struct ConstantPool
     std::vector<CpEntry> entries; // 1-based indexing (entries[0] unused)
 
     const CpEntry *get(uint16_t index) const;
-    std::string getUtf8(uint16_t index) const;
+    const std::string &getUtf8(uint16_t index) const;
     int32_t getInt(uint16_t index) const;
     int64_t getLong(uint16_t index) const;
     std::string getClassName(uint16_t index) const;        // CONSTANT_Class -> UTF8

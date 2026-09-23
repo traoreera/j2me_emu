@@ -1,7 +1,7 @@
 // png.h
 // Décodeur PNG minimal pour l'émulateur J2ME : RGB565/ARGB pour Image MIDP.
-// Supporte PNG 8 bits, non entrelacé, les color types 0/gris, 2/RGB,
-// 3/palette, 4/gris+alpha, 6/RGBA (le standard des jeux J2ME).
+// Supporte PNG 8 bits, entrelacé (Adam7) ou non, les color types 0/gris,
+// 2/RGB, 3/palette, 4/gris+alpha, 6/RGBA (le standard des jeux J2ME).
 //
 // Pas d'allocation dynamique : l'appelant fournit un buffer de travail
 // (taille = idatLen + rawLen, cf. pngHeader) et la zone pixels [w*h].
@@ -19,9 +19,11 @@ namespace jme
     {
         int w = 0;
         int h = 0;
-        uint8_t color = 0; // color type IHDR (0,2,3,4,6)
-        size_t bpl = 0;    // octets par ligne (sans filtre)
-        size_t rawLen = 0; // (1 + bpl) * h  -> scanlines non filtrées
+        uint8_t color = 0;     // color type IHDR (0,2,3,4,6)
+        uint8_t bitDepth = 8;  // profondeur de bits (palette : 1,2,4 ou 8)
+        uint8_t interlace = 0; // 0 = non entrelacé, 1 = Adam7
+        size_t bpl = 0;    // octets par ligne (sans filtre) -- non entrelacé uniquement
+        size_t rawLen = 0; // total des scanlines non filtrées (somme des 7 passes si Adam7)
         size_t idatLen = 0; // taille cumulée des chunks IDAT
     };
 

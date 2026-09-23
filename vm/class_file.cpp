@@ -25,11 +25,12 @@ const CpEntry *ConstantPool::get(uint16_t index) const
     return &entries[index];
 }
 
-std::string ConstantPool::getUtf8(uint16_t index) const
+const std::string &ConstantPool::getUtf8(uint16_t index) const
 {
+    static const std::string kEmpty;
     const CpEntry *e = get(index);
     if (!e || e->tag != CONSTANT_UTF8)
-        return {};
+        return kEmpty;
     return e->utf8;
 }
 
