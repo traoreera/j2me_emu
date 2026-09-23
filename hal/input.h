@@ -36,11 +36,18 @@ namespace hal
         KeyMask pressed = 0;      // currently held
         KeyMask justPressed = 0;  // pressed this frame
         KeyMask justReleased = 0; // released this frame
+        bool quit = false;        // quitter demandé (F12 / Ctrl+Q / fermeture fenêtre)
     };
 
     bool input_init();
     void input_shutdown();
     void input_poll(InputState *out);
     const char *key_name(KeyCode kc);
+
+    // Remappe des touches physiques -> KeyCode. spec = liste "NOMSDL=TOKEN" séparée
+    // par des virgules/points-virgules/newlines. TOKEN ∈ {UP,DOWN,LEFT,RIGHT,FIRE,
+    // SOFT1,SOFT2,STAR,HASH,0..9} ou NONE pour délier. Appliqué PAR-DESSUS la table
+    // par défaut. Retourne false si aucune entrée valide n'a été analysée.
+    bool input_applyKeyMap(const char *spec);
 
 } // namespace hal

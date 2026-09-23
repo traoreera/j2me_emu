@@ -20,12 +20,17 @@ add_executable(j2me_emu
     vm/runtime.cpp
     vm/natives.cpp
     vm/midp_natives.cpp
+    kernel/kernel.cpp
+    kernel/drivers/audio/audio.cpp
+    kernel/drivers/audio/stub_audio.cpp
+    kernel/drivers/audio/sdl_audio.cpp
 )
 
 target_include_directories(j2me_emu PRIVATE
     .
     hal
     vm
+    kernel
 )
 
 target_link_libraries(j2me_emu PRIVATE ${SDL2_LIBRARIES})
@@ -40,6 +45,8 @@ target_compile_definitions(j2me_emu PRIVATE JAR_READER_INDEX_IN_RAM)
 #     hal/display.cpp hal/input.cpp hal/png.cpp \
 #     vm/class_file.cpp vm/interpreter.cpp vm/runtime.cpp \
 #     vm/natives.cpp vm/midp_natives.cpp \
+#     kernel/kernel.cpp kernel/drivers/audio/audio.cpp \
+#     kernel/drivers/audio/sdl_audio.cpp kernel/drivers/audio/stub_audio.cpp \
 #     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 
 

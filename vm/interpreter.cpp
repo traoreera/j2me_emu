@@ -1063,9 +1063,10 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                      fn == "eF" || fn == "eB" || fn == "eC" || fn == "c" || fn == "bZ" ||
                      fn == "al" || fn == "ek" || fn == "ac" || fn == "bX" || fn == "bH" ||
                      fn == "aU" || fn == "aS" || fn == "C" || fn == "k" || fn == "ah" ||
-                     fn == "U" || fn == "X" || fn == "cd" || fn == "bd" || fn == "A"))
-                    fprintf(stderr, "PS %s.%s=%d t=%lld\n", owner->name.c_str(), fn.c_str(), v.i,
-                            (long long)virtualMillis());
+                     fn == "U" || fn == "X" || fn == "cd" || fn == "bd" || fn == "A" || fn == "cr" || fn == "cq" ||
+                     fn == "av" || fn == "aw" || fn == "F" || fn == "K" || fn == "O"))
+fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str(), fn.c_str(), v.i,
+                             (long long)virtualMillis(), cls->name.c_str(), m->name.c_str(), m->desc.c_str(), pc);
                 if (getenv("JME_DEBUG") && owner->name == "e" && fn == "j")
                     fprintf(stderr, "PUTSTATIC e.j = %d (caller=%s.%s pc=%d)\n", v.i, cls->name.c_str(), m->name.c_str(), pc);
                 owner->statics[f->slot] = v;
@@ -1130,6 +1131,11 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             size_t colon = mr.second.find(':');
             std::string mname = mr.second.substr(0, colon);
             std::string mdesc = mr.second.substr(colon + 1);
+            if (getenv("JME_QRACE") && op == 0xb8 && classRef == "a" &&
+                    ((mname == "a" && (mdesc == "(I)V" || mdesc == "(I[I)V")) || (mname == "b" && mdesc == "()Z")))
+                fprintf(stderr, "QRACE a.%s%s arg0=%d caller=%s.%s pc=%d t=%lld\n", mname.c_str(), mdesc.c_str(),
+                        st[sp - argSlots(mdesc)].i, cls->name.c_str(), m->name.c_str(), pc,
+                        (long long)virtualMillis());
             int nslots = argSlots(mdesc);
             bool rv = returnIsVoid(mdesc);
             Value mres;

@@ -9,6 +9,8 @@ g++ -std=c++17 -O2 -I. -Ihal -Ivm -DJAR_READER_INDEX_IN_RAM \
     hal/display.cpp hal/input.cpp hal/png.cpp \
     vm/class_file.cpp vm/interpreter.cpp vm/runtime.cpp \
     vm/natives.cpp vm/midp_natives.cpp \
+    kernel/kernel.cpp kernel/drivers/audio/audio.cpp \
+    kernel/drivers/audio/sdl_audio.cpp kernel/drivers/audio/stub_audio.cpp \
     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 ```
 
@@ -31,10 +33,16 @@ All three `-I.` `-Ihal` `-Ivm` flags must be present together.
 - `JME_MAXFRAMES=n` — auto-quit after n frames (headless/CI)
 - `JME_AUTOKEY=5|0|*|#|FIRE|SOFT1|SOFT2|LEFT|RIGHT|UP|DOWN` — hold a key from frame 0
 - `JME_AUTOKEYFRAME=n` — with `JME_AUTOKEY`: send a one-frame tap of that key at frame n (e.g. `JME_AUTOKEY=FIRE JME_AUTOKEYFRAME=285`)
+- `JME_AUTOTAPS="f1:KEY,f2:KEY,..."` — list of one-frame taps at given frames (frame first, `:`, then key name)
+- `JME_KEYMAP="sdlkey=TOKEN,..."` — remap physical keys on top of the default table; `TOKEN ∈ UP|DOWN|LEFT|RIGHT|FIRE|SOFT1|SOFT2|STAR|HASH|0..9|NONE` (`NONE` unbinds, e.g. `JME_KEYMAP=escape=SOFT2,f2=SOFT1`). Falls back to a per-game file `<jar-without-extension>.keys` next to the `.jar` (one `sdlkey=TOKEN` per line) when the env var is unset.
 - `JME_DUMP=path.ppm` — dump final framebuffer as PPM on exit
 - `JME_WIDTH=n` / `JME_HEIGHT=n` — override emulated resolution (default 240x320)
 - `JME_HEAP=n` — heap size in KB (default 512); Assassin's Creed 2 needs `JME_HEAP=4096`
+- `JME_AUDIO=sdl|stub|off` — audio backend; default: `stub` when `SDL_VIDEODRIVER=dummy`, else `sdl`
+- `JME_WAVDUMP=path` — debug: dump each Player InputStream raw bytes to `<path>_<slot>.wav`
 - `SDL_VIDEODRIVER=dummy` — headless mode; combine with `JME_MAXFRAMES` for CI
+
+**Keyboard (physical, `hal/input.cpp`):** arrows = D-pad, Enter/Space = FIRE, F1 = SOFT1 (left softkey), F2 **and** Escape = SOFT2 (right softkey), 0-9 = digits, Shift+8 = `*`, `#` = `#`. **Quit = F12 or Ctrl+Q or window close — NOT the softkeys** (F1/F2/Esc are game keys; a GAMELOFT regression saw SOFT1/SOFT2 presses used as the quit shortcut, silently swallowing next/back for games like mission.jar which maps them to its menu).
 
 Note: Assassin's Creed 2 requires **landscape** (`JME_WIDTH=800 JME_HEIGHT=480`); in portrait it refuses with its own message. `System.currentTimeMillis()` uses a **simulated clock** (vm/natives.cpp `virtualMillis`, +16 ms/frame from `midp::tick`), so the intro's ~4.5 s timer fires at ~frame 280 — the game then shows its loading dialog and stalls (loader never completes).
 
@@ -48,6 +56,8 @@ Key sub-systems (see `CLAUDE.md` for detail):
 - `hal/inflate.cpp` — bit-at-a-time DEFLATE decoder, no separate 32 KB window buffer
 - `vm/interpreter.cpp` — cooperative instruction budget (`setInstrBudget`), yield callback for fiber suspension
 - `vm/natives.cpp` / `vm/midp_natives.cpp` — fiber-based threading (256 KB stack + `ucontext_t` per `Thread.start()`ed `Runnable`)
+- `kernel/kernel.cpp` — MCU-portable core: driver registry (`driverRegister`/`kernelBoot`) + monotonic clock (`setMillisProvider`/`millis`); no STL/libc
+- `kernel/drivers/audio/` — kernel audio (mono 16-bit, 22050 Hz, fixed 8 voices, no alloc): `audio.cpp` mixer (PCM + sine tone + tone-seq voices, `playSample`/`playTone`/`playToneSeq`), `sdl_audio.cpp` PC backend (guarded by `__has_include(<SDL2/SDL.h>)`), `stub_audio.cpp` MCU/headless refactor. The VM (`vm/midp_natives.cpp`) drains the game's InputStream, parses RIFF/WAV (8/16-bit, mono/stereo, resample→22050) or `audio/x-tone-seq` (ToneControl subset), and drives a kernel voice; `advanceSilent` keeps FIFO timing in headless/stub mode.
 
 ## Critical constraints
 

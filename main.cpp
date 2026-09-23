@@ -12,8 +12,11 @@
 #include "vm/interpreter.h"
 #include "vm/native.h"
 #include "vm/midp.h"
+#include "kernel/kernel.h"
+#include "kernel/drivers/audio/audio.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <SDL2/SDL.h>
 
@@ -24,6 +27,22 @@ static std::string toInternal(const std::string &name)
         if (c == '.')
             c = '/';
     return s;
+}
+
+// JME_AUDIO=sdl|stub|off ; défaut : stub si CI headless, sinon sdl.
+static const kernel::audio::Device *pickAudioDevice()
+{
+    const char *a = getenv("JME_AUDIO");
+    if (a)
+    {
+        if (strcmp(a, "sdl") == 0)
+            return &kernel::audio::kSdlDevice;
+        return &kernel::audio::kStubDevice;
+    }
+    const char *vd = getenv("SDL_VIDEODRIVER");
+    if (vd && strcmp(vd, "dummy") == 0)
+        return &kernel::audio::kStubDevice;
+    return &kernel::audio::kSdlDevice;
 }
 
 int main(int argc, char **argv)
@@ -60,6 +79,27 @@ int main(int argc, char **argv)
         return 1;
     }
     hal::input_init();
+
+    // ---- Boot du noyau : horloge + pilote audio ----
+    kernel::setMillisProvider([]() -> kernel::Ms { return (kernel::Ms)SDL_GetTicks(); });
+    const kernel::audio::Device *adev = pickAudioDevice();
+    kernel::audio::useDevice(adev);
+    kernel::Driver audioDrv{};
+    audioDrv.name = "audio";
+    audioDrv.backend = adev->name;
+    audioDrv.init = [](kernel::Driver *d) -> int {
+        (void)d;
+        const kernel::audio::Device *dev = kernel::audio::activeDevice();
+        return (dev && dev->open) ? dev->open(dev) : -1;
+    };
+    audioDrv.shutdown = [](kernel::Driver *d) {
+        (void)d;
+        const kernel::audio::Device *dev = kernel::audio::activeDevice();
+        if (dev && dev->close)
+            dev->close(dev);
+    };
+    kernel::driverRegister(&audioDrv);
+    kernel::kernelBoot(0);
 
     size_t heapSize = jvm::Heap::kDefaultPoolSize;
     if (const char *hs = getenv("JME_HEAP"))
@@ -237,9 +277,34 @@ int main(int argc, char **argv)
         }
     }
 
-    uint32_t autoBits = autoKey;
-    for (const Tap &t : autoTaps)
-        autoBits |= t.bits;
+    // Mapping clavier remplaçable : JME_KEYMAP (liste "touche=TOKEN,...") prime sur
+    // un éventuel fichier "<jeu>.keys" placé à côté du .jar (une ligne par entrée).
+    {
+        std::string mapSpec;
+        if (const char *envMap = getenv("JME_KEYMAP"))
+        {
+            mapSpec = envMap;
+        }
+        else
+        {
+            std::string keysPath(jarPath);
+            if (keysPath.size() > 4 && keysPath.compare(keysPath.size() - 4, 4, ".jar") == 0)
+                keysPath.replace(keysPath.size() - 4, 4, ".keys");
+            FILE *kf = fopen(keysPath.c_str(), "r");
+            if (kf)
+            {
+                char line[128];
+                while (fgets(line, sizeof(line), kf))
+                {
+                    mapSpec += line;
+                    mapSpec += '\n';
+                }
+                fclose(kf);
+            }
+        }
+        if (!mapSpec.empty())
+            hal::input_applyKeyMap(mapSpec.c_str());
+    }
 
     int autoTouchX = -1, autoTouchY = -1, autoTouchFrame = -1;
     if (const char *at = getenv("JME_AUTOTOUCH"))
@@ -260,6 +325,9 @@ int main(int argc, char **argv)
     {
         hal::input_poll(&input);
 
+        if (input.quit)
+            break;
+
         if (autoKey)
         {
             bool hold = (autoKeyFrame < 0);
@@ -269,9 +337,6 @@ int main(int argc, char **argv)
             if (!hold && frame == autoKeyFrame)
                 input.pressed &= ~autoKey;
         }
-
-        if ((input.justPressed & (hal::KEY_SOFT2 | hal::KEY_SOFT1)) && !(autoBits & (hal::KEY_SOFT2 | hal::KEY_SOFT1)))
-            break;
 
         for (const Tap &t : autoTaps)
             if (t.fr == frame)
@@ -336,13 +401,16 @@ int main(int argc, char **argv)
         }
     }
 
+    kernel::kernelShutdown(0);
     hal::input_shutdown();
     hal::display_shutdown();
     printf("Emulation terminee apres %d frames\n", frame);
     if (getenv("JME_DEBUG"))
+    {
         printf("[dbg] ecritures framebuffer: %d\n", jvm::midp::jme_screenWrites());
         printf("[dbg] dessins ciblant ecran: %d\n", jvm::midp::jme_screenPix());
         printf("[dbg] dessins ciblant canvas565: %d\n", jvm::midp::jme_canvasPix());
         printf("[dbg] flushGraphics: %d\n", jvm::midp::jme_flushCalls());
+    }
     return 0;
 }
