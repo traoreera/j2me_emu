@@ -40,6 +40,11 @@ namespace jvm
         // Ne fait rien si l'affichable courant n'est pas un Canvas.
         void simulatePointer(int x, int y);
 
+        // Évènement stylet/souris réel : kind 0 = pressed, 1 = released, 2 = dragged
+        // (cf. hal::PointerEvent). Ne fait rien si l'affichable courant n'est
+        // pas un Canvas.
+        void pointerEvent(int kind, int x, int y);
+
         // Debug : nombre d'écritures de pixels dans le framebuffer écran.
         int jme_screenWrites();
         int jme_screenPix();

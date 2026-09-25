@@ -109,6 +109,25 @@ int main(int argc, char **argv)
     rt.setJar(&jar);
 
     jvm::initNatives();
+    // RecordStore persistant : "<jeu>.rms/" à côté du .jar (ou JME_RMSDIR=chemin ;
+    // JME_RMS=0 pour rester purement en mémoire, ex. tests reproductibles).
+    {
+        const char *off = getenv("JME_RMS");
+        if (!(off && strcmp(off, "0") == 0))
+        {
+            std::string dir;
+            if (const char *d = getenv("JME_RMSDIR"))
+                dir = d;
+            else
+            {
+                dir = jarPath;
+                if (dir.size() > 4 && dir.compare(dir.size() - 4, 4, ".jar") == 0)
+                    dir.resize(dir.size() - 4);
+                dir += ".rms";
+            }
+            jvm::setRmsDir(dir);
+        }
+    }
     jvm::midp::init(&rt, &interp);
     jvm::midp::setAppProperty("MIDlet-Name", manifest.midletName);
     jvm::midp::setAppProperty("MIDlet-Version", manifest.midletVersion);
@@ -230,6 +249,37 @@ int main(int argc, char **argv)
     if (const char *akf = getenv("JME_AUTOKEYFRAME"))
         autoKeyFrame = atoi(akf);
 
+    uint32_t holdKey = 0;
+    int holdKeyFrame = -1;
+    if (const char *hk = getenv("JME_AUTOHOLD"))
+    {
+        std::string s(hk);
+        if (s == "5")
+            holdKey = hal::KEY_5;
+        else if (s == "0")
+            holdKey = hal::KEY_0;
+        else if (s == "*")
+            holdKey = hal::KEY_STAR;
+        else if (s == "#")
+            holdKey = hal::KEY_HASH;
+        else if (s == "FIRE")
+            holdKey = hal::KEY_FIRE;
+        else if (s == "SOFT1")
+            holdKey = hal::KEY_SOFT1;
+        else if (s == "SOFT2")
+            holdKey = hal::KEY_SOFT2;
+        else if (s == "LEFT")
+            holdKey = hal::KEY_LEFT;
+        else if (s == "RIGHT")
+            holdKey = hal::KEY_RIGHT;
+        else if (s == "UP")
+            holdKey = hal::KEY_UP;
+        else if (s == "DOWN")
+            holdKey = hal::KEY_DOWN;
+    }
+    if (const char *hkf = getenv("JME_AUTOHOLDFRAME"))
+        holdKeyFrame = atoi(hkf);
+
     struct Tap
     {
         int fr;
@@ -326,7 +376,11 @@ int main(int argc, char **argv)
         hal::input_poll(&input);
 
         if (input.quit)
+        {
+            if (getenv("JME_DEBUG"))
+                fprintf(stderr, "BREAK: input.quit a la frame %d\n", frame);
             break;
+        }
 
         if (autoKey)
         {
@@ -338,16 +392,46 @@ int main(int argc, char **argv)
                 input.pressed &= ~autoKey;
         }
 
+        if (holdKey && holdKeyFrame >= 0 && frame >= holdKeyFrame)
+        {
+            if (frame == holdKeyFrame)
+                input.justPressed |= holdKey;
+            input.pressed |= holdKey;
+        }
+
         for (const Tap &t : autoTaps)
+        {
             if (t.fr == frame)
             {
                 input.pressed |= t.bits;
                 input.justPressed |= t.bits;
             }
+            // La touche ne reste "pressed" qu'une trame (input_poll() la
+            // remet à zéro dès la trame suivante en l'absence d'un vrai
+            // évènement clavier, cf. hal/input.cpp) mais ça ne génère PAS de
+            // justReleased -- un jeu dont keyPressed/keyReleased s'équilibrent
+            // (ex. des compteurs incrémentés/décrémentés en paire) ne voit
+            // donc jamais le relâchement d'un tap simulé. On le simule
+            // explicitement une trame après le tap.
+            if (t.fr + 1 == frame)
+                input.justReleased |= t.bits;
+        }
 
-        if (autoTouchX >= 0 && autoTouchY >= 0 &&
-            (autoTouchFrame < 0 || frame == autoTouchFrame))
-            jvm::midp::simulatePointer(autoTouchX, autoTouchY);
+        // Tap simulé : appui à la trame N, relâchement 3 trames plus tard --
+        // comme un vrai clic. Presser et relâcher dans la MÊME trame ne suffit
+        // pas pour les jeux qui mémorisent l'état du pointeur et le lisent
+        // depuis leur propre thread (ils ne voient jamais l'appui).
+        if (autoTouchX >= 0 && autoTouchY >= 0)
+        {
+            int f0 = autoTouchFrame < 0 ? 0 : autoTouchFrame;
+            if (frame == f0)
+                jvm::midp::pointerEvent(0, autoTouchX, autoTouchY);
+            else if (frame == f0 + 3)
+                jvm::midp::pointerEvent(1, autoTouchX, autoTouchY);
+        }
+
+        for (int i = 0; i < input.pointerCount; i++)
+            jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 

@@ -21,11 +21,13 @@ identifiers are in English.
 
 Preferred (single command, matches CI expectations):
 ```bash
-g++ -std=c++17 -O2 -I. -Ihal -Ivm -DJAR_READER_INDEX_IN_RAM \
+g++ -std=c++17 -O2 -I. -Ihal -Ivm -Ikernel -DJAR_READER_INDEX_IN_RAM \
     main.cpp hal/jar_reader.cpp hal/inflate.cpp hal/file.cpp \
     hal/display.cpp hal/input.cpp hal/png.cpp \
     vm/class_file.cpp vm/interpreter.cpp vm/runtime.cpp \
-    vm/natives.cpp vm/midp_natives.cpp \
+    vm/natives.cpp vm/midp_*.cpp \
+    kernel/kernel.cpp kernel/drivers/audio/audio.cpp \
+    kernel/drivers/audio/sdl_audio.cpp kernel/drivers/audio/stub_audio.cpp \
     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 ```
 Note the three include roots: `-I.` is required because `hal/file.cpp`,
@@ -36,8 +38,19 @@ inconsistent across files, so all three `-I` flags are needed together.
 
 Or via CMake (`CMakeLists.txt`, needs the `sdl2` dev package via pkg-config):
 ```bash
-mkdir -p build && cd build && cmake .. && make
+mkdir -p build && cmake -S . -B build && cmake --build build
 ```
+Use the explicit `-S`/`-B` form, not `cd build && cmake ..` — in at least one
+sandboxed shell environment the plain positional form reliably misresolved
+its binary directory and silently regenerated build files in the *source*
+root instead of `build/` (reproduced repeatedly, even from a from-scratch
+`build/`), which then makes `build/`'s own Makefile look permanently stale
+(e.g. missing a target that was just added to `CMakeLists.txt`) even though
+CMake reports success. `-S`/`-B` sidesteps whatever that resolution issue
+is. If you ever see `cmake ..` claim "Build files have been written to:
+<source dir>" instead of `<source dir>/build`, that's this happening —
+delete any stray `Makefile`/`CMakeCache.txt`/`CMakeFiles/` that ended up in
+the source root and reconfigure with `-S`/`-B`.
 
 ## Running
 
@@ -51,7 +64,11 @@ Useful env vars (read in `main.cpp`):
 - `JME_AUTOKEY=5|0|*|#|FIRE|SOFT1|SOFT2|LEFT|RIGHT|UP|DOWN` — hold a key from frame 0 (for scripted smoke tests)
 - `JME_AUTOKEYFRAME=n` — with `JME_AUTOKEY`: send a one-frame tap of that key on frame n instead of holding from 0 (to interact once the game has reached a given state).
 - `JME_DUMP=path.ppm` — dump the final framebuffer as a PPM image on exit
-- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`.
+- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`. Some Gameloft titles instead require **landscape** (`width > height`) and print a static, non-interactive "please switch to landscape mode" screen at the default portrait 240x320 — not a bug, no key does anything on that screen because it isn't a menu. Example: `games/assasin.jar` (Assassin's Creed 2) needs `JME_WIDTH=800 JME_HEIGHT=480` to reach real, navigable UI. `games/gangstar_rio_city_o_260851.jar` is a **480x800 portrait** build (`JME_WIDTH=480 JME_HEIGHT=800`): at other sizes it still runs but lays its Gameloft splash out for a 480-wide screen (three image tiles at absolute coordinates, so the logo appears cropped in a corner at 240x320). It starts (splash shown after ~2 s CPU of loading) but its second loading phase (after the logo, state 3: big multi-resource decode) was still running after >24 s of CPU / 900 frames — unresolved, see the gangstar_rio notes in git history/this file's summary.
+- `JME_RMS=0` / `JME_RMSDIR=path` — `RecordStore` est **persistant** par défaut : un fichier par magasin dans `<jeu>.rms/` à côté du `.jar` (format : `u32 nbRecords`, puis `u32 taille + octets` par enregistrement, little-endian ; réécrit à chaque `addRecord`/`setRecord`, supprimé par `deleteRecordStore`). `JME_RMS=0` reste purement en mémoire (runs reproductibles) ; `JME_RMSDIR` change le dossier. Un fichier corrompu/tronqué est ignoré (magasin vide), jamais fatal.
+- `JME_FRAME_TIME=ms` — durée **virtuelle** d'une trame en millisecondes (défaut 16), pas de temps réel. Une valeur ≥ 1000 est convertie de µs en ms avec un avertissement : `JME_FRAME_TIME=33333` avait pour effet de faire avancer l'horloge du jeu de 33 *secondes* par trame, ce qui figeait le dialogue "Sound Set" d'Assassin's Creed 2 (touches et clics ignorés — les minuteries du jeu débordaient).
+- `JME_TRACEM=Classe.methode` (ou `*`) — trace générique des appels d'une méthode bytecode : arguments (8 premiers) et valeur retournée. `JME_AUTOTOUCH=x,y` + `JME_AUTOTOUCHFRAME=n` — clic simulé (appui à n, relâchement à n+3).
+- `JME_INSTR_BUDGET=n` — budget d'instructions FIXE par thread et par trame (défaut : **adaptatif**, cf. « Thread budget » dans les pièges de performance). À fixer (ex. 200000) pour des runs déterministes / comparaisons pixel-à-pixel entre deux builds.
 - `JME_HEAP=n` — override the JVM heap size in KB (default 512, i.e. `Heap::kDefaultPoolSize`). The heap is a bump allocator with no GC (see below); asset-heavy MIDlets can exhaust it during resource loading.
 - `SDL_VIDEODRIVER=dummy` — run headless (no window), combine with the above for CI/agent sanity checks, e.g.:
   ```bash
@@ -60,7 +77,51 @@ Useful env vars (read in `main.cpp`):
 
 ## Testing
 
-No automated test suite exists. Verification is manual: build, then run
+### Unit tests (`tests/`)
+
+A header-only micro test framework (`tests/framework.h` — `TEST(name)` /
+`ASSERT_EQ`/`ASSERT_TRUE`/`ASSERT_FALSE`/`ASSERT_NE`, no gtest/catch2
+dependency, in keeping with the rest of the project's "no heavy deps"
+stance) covers the pure/logic layers: `hal/inflate.*` (DEFLATE, all 3 block
+types), `hal/png.*` (non-interlaced + Adam7, against fixture PNGs with known
+pixel values), `hal/jar_reader.*` (`parseManifestText` plus a full on-disk
+ZIP round-trip built by hand — stored and deflate entries), `vm/class_file.*`
+(descriptor parsing, `ConstantPool` accessors, a full `ClassFile::parse()`
+round-trip on a hand-built minimal `.class`), `vm/runtime.*` (`Heap`
+alloc/reset/auto-grow, `ClassInfo::findField` descriptor disambiguation,
+`findMethodVirtual` superclass-chain walk), and `vm/interpreter.*` (basic
+arithmetic, plus regression tests reproducing the exact `tableswitch`/
+`lookupswitch` offset bug and the `athrow`/try-catch stack-unwinding bug
+documented below, by hand-assembling the bytecode and exception tables).
+Deliberately **not** linked against SDL2/`kernel/` — it only needs the
+logic-layer `.cpp` files, so it builds even without the `sdl2` dev package.
+
+Build and run:
+```bash
+mkdir -p build && cmake -S . -B build && cmake --build build --target j2me_tests && (cd build && ctest --output-on-failure)
+```
+(see the note under Build above on why `-S`/`-B` is used instead of
+`cd build && cmake ..`), or directly with g++ (no SDL2 needed):
+```bash
+g++ -std=c++17 -O0 -g -I. -Ihal -Ivm \
+    tests/test_main.cpp tests/test_inflate.cpp tests/test_png.cpp \
+    tests/test_class_file.cpp tests/test_runtime.cpp tests/test_interpreter.cpp \
+    tests/test_jar_reader.cpp \
+    hal/inflate.cpp hal/jar_reader.cpp hal/file.cpp hal/png.cpp \
+    vm/class_file.cpp vm/runtime.cpp vm/interpreter.cpp vm/natives.cpp \
+    -o j2me_tests && ./j2me_tests
+```
+The binary prints `[PASS]`/`[FAIL]` per test and exits non-zero on any
+failure (CI-friendly). Not covered: `vm/midp_natives.cpp` (the MIDP API
+surface — its natives live in an anonymous namespace, and exercising it
+meaningfully needs a wired-up `Runtime`/`Display`/HAL, closer to an
+integration test than a unit test) and the fiber-based thread scheduler in
+`vm/natives.cpp` (`ucontext.h`-based, stateful and timing-sensitive).
+
+### Manual / integration verification
+
+For anything touching `vm/midp_natives.cpp`, the fiber scheduler, rendering,
+or overall game compatibility, verification is still manual: build, then run
 against `games/assasin.jar` / `games/mission.jar` headless as above and check
 stdout for `MIDlet: ... classe principale: ...` and a clean `Emulation
 terminee apres N frames`, or use `JME_DUMP` to inspect a rendered frame.
@@ -134,16 +195,32 @@ bytecode interpreter → native API bridge → HAL (display/input)**.
   progressing past whatever it was doing when the budget first ran out.
   `jme_threadStart`/`jme_threads`/`jme_threadForget` still track which
   Runnables are pending; `jme_threadForget` also frees the fiber.
-- `midp.h` / `midp_natives.cpp` — the MIDP/CLDC API surface: MIDlet
-  lifecycle, `javax.microedition.lcdui` (`Display`, `Canvas`, `GameCanvas`,
-  `Graphics`, `Font`, `Image`). `midp::init()` registers these as native
-  classes on a `Runtime`; `midp::tick()` (driven from `main.cpp`'s loop) is
-  the per-frame pump: dispatches real key events, advances scheduled
-  threads, repaints if requested, and presents the frame. `Graphics` draws
-  either into an off-heap ARGB `Image` buffer or into the shared RGB565
-  `GameCanvas` buffer (`g_canvas565`, dynamically sized to the configured
-  resolution — see `JME_WIDTH`/`JME_HEIGHT` above — allocated once in
-  `midp::init()`) that `flushGraphics()` presents to the HAL.
+- `midp.h` / `midp_*.cpp` — the MIDP/CLDC API surface, split by domain
+  (was a single 5 500-line `midp_natives.cpp`): `midp_natives.cpp` (public
+  API: `init()` registering the native *classes*, `tick()`, key mapping),
+  `midp_core.cpp` (shared globals + `argInt`/`setRef`… helpers,
+  `regClass`/`regN`), `midp_graphics.cpp` (`Graphics`/`Font`/`Image`/
+  `Canvas`/`GameCanvas`/DirectGraphics, RGB565 rendering), `midp_game.cpp`
+  (`Layer`/`Sprite`/`TiledLayer`/`LayerManager`), `midp_ui.cpp` (`Display`/
+  `MIDlet`/`Canvas` key natives, `List`/`Form`/`Command`), `midp_io.cpp`
+  (`java.io` streams, JAR resources, `java.util.Timer`), `midp_media.cpp`
+  (MMAPI: WAV/MIDI/ToneSeq engine). Shared state and the cross-module
+  function/type declarations live in `midp_internal.h` (namespace
+  `jvm::midp::detail`); everything not used across modules is `static` in
+  its own file. Each module exposes `register<Module>Natives()` holding its
+  own `regN(...)` lines, called from the start of `init()`; `regClass(...)`
+  (class + method-signature declarations) stays centralised in `init()`.
+  When adding a native: put the function in the matching module, add its
+  `regN` to that module's registrar, and its signature to the class's
+  `regClass` list in `init()` — a function used from another module must
+  also be declared in `midp_internal.h`. `midp::init()` registers these as
+  native classes on a `Runtime`; `midp::tick()` (driven from `main.cpp`'s
+  loop) is the per-frame pump: dispatches real key events, advances
+  scheduled threads, repaints if requested, and presents the frame.
+  `Graphics` draws either into an off-heap ARGB `Image` buffer or into the
+  shared RGB565 `GameCanvas` buffer (`g_canvas565`, dynamically sized to the
+  configured resolution — see `JME_WIDTH`/`JME_HEIGHT` above — allocated
+  once in `midp::init()`) that `flushGraphics()` presents to the HAL.
   `GameCanvas` is registered under its real MIDP 2.0 package,
   `javax/microedition/lcdui/game/GameCanvas` (**not**
   `javax/microedition/lcdui/GameCanvas` — a real J2ME MIDlet's bytecode
@@ -155,9 +232,13 @@ bytecode interpreter → native API bridge → HAL (display/input)**.
   subclass's own first two fields (observed: a cached `Graphics` object got
   overwritten by an unrelated app field, so a later `Graphics.getFont()`
   call resolved against the wrong runtime type). The rest of the MIDP 2.0
-  Game API (`Sprite`, `TiledLayer`, `LayerManager`, `Layer`) is **not**
-  implemented — MIDlets that use them (common for `GameCanvas`-based games)
-  will fail to resolve those classes.
+  Game API (`Sprite`, `TiledLayer`, `LayerManager`, `Layer`) **is now
+  implemented** (`midp_game.cpp`, `spr_*`/`tl_*`/`lm_*`/`lay_*`
+  functions) — sprite frame/transform/collision, tiled-layer cells +
+  animated tiles, and the full `LayerManager` (`append`/`insert`/`remove`/
+  `getSize`/`getLayerAt`/`setViewWindow`/`paint`). Index 0 is the **top**
+  layer (MIDP): `lm_paint` draws from the last index down to 0 — it used to
+  draw 0..n, i.e. an inverted z-order.
 
 ### `main.cpp` — orchestration
 Opens the JAR → reads `META-INF/MANIFEST.MF` → inits `hal::display`/`hal::input`
@@ -276,6 +357,69 @@ tests miss. Found and fixed while bringing up new test JARs:
   accessor is `regN`'d for, via `registerNativeClass`'s field list on their
   nearest common ancestor — not just on whichever one happens to be
   imagined as "the real owner".
+- **`GameCanvas` subclasses can still legally override `paint()`, and the
+  AMS must still call it via the normal `repaint()`/`paint()` mechanism —
+  `getKeyStates()`/`flushGraphics()` are *additional* APIs GameCanvas
+  offers, not a mandatory replacement for the standard Canvas event/paint
+  model.** `midp::tick()` used to unconditionally skip both the
+  `keyPressed`/`keyReleased` dispatch AND the `paint()` callback whenever
+  the current Displayable was a `GameCanvas` subclass (`&& !isGameCanvas`
+  on both blocks), on the assumption that every GameCanvas game exclusively
+  polls `getKeyStates()` and draws via `getGraphics()`/`flushGraphics()`.
+  That assumption breaks for any GameCanvas game that still overrides
+  `paint()` (a valid, fairly common pattern — e.g. simpler ports that only
+  adopted GameCanvas for its extra API surface but kept a Canvas-style
+  render flow) — `paint()` would then just never fire, producing a
+  perpetually black screen with a render thread ticking every frame and
+  zero errors (found on `games/mortalkomb_9moadjwj.jar`: its `cnv extends
+  GameCanvas` overrides `paint(Graphics)` — confirmed via `javap` — and its
+  render thread calls `repaint()` every loop iteration when its internal
+  `sc_repaint` flag is set, but the callback was categorically suppressed).
+  Fixed by dropping `!isGameCanvas` from both conditions in `tick()`
+  (`vm/midp_natives.cpp`) — GameCanvas no longer opts out of either path.
+- **The `Graphics` object passed to `paint()` must have its translation and
+  clip reset to defaults (origin, full-canvas) before *every* call — this
+  is a hard MIDP guarantee, not implementation-defined.** `screenGraphics()`
+  (`vm/midp_natives.cpp`) returns a singleton, persistent `Obj*`
+  (`g_screenGfx`) reused across every `paint()` invocation; it only refreshed
+  `CLIPW`/`CLIPH` on each call, leaving `TX`/`TY` (translate) and
+  `CLIPX`/`CLIPY` (clip origin) to silently carry over from whatever the
+  *previous* `paint()` call left them at. A game that calls
+  `g.translate(dx, 0)` mid-frame and doesn't perfectly symmetric-untranslate
+  on every code path (e.g. an early `return` on some state branch) sees its
+  camera/scroll offset drift further with every single `paint()` call
+  instead of resetting to (0,0) each frame — visually: the same background
+  sprite redrawn dozens of times at accumulating offsets, plus stale content
+  from an earlier screen staying visible wherever the (also drifting) clip
+  rect no longer covers. This bug is old but was invisible until the
+  `GameCanvas`-`paint()` fix above gave it a MIDlet exercising it for the
+  first time. Fixed by having `screenGraphics()` reset `TX`/`TY`/`CLIPX`/
+  `CLIPY`/`CLIPW`/`CLIPH` to `(0, 0, 0, 0, screenW(), screenH())` on every
+  call, not just clip width/height. Color/font are deliberately left alone
+  — MIDP does not guarantee those are reset between `paint()` calls.
+- **`Graphics.drawImage`'s BOTTOM anchor (`0x20`) was checked against the
+  wrong bit** — `g_drawImage` (`vm/midp_natives.cpp`) computed the vertical
+  anchor offset (`oy`) with `else if (anchor & 0x08) oy = ih;`, but `0x08`
+  is `RIGHT` (a *horizontal* flag) — `BOTTOM` is `0x20`. Any
+  `drawImage(img, x, y, HCENTER|BOTTOM)` call — the standard idiom for a
+  full-screen background image anchored so its bottom edge sits at `y`
+  (`anchor=33=0x21=HCENTER|BOTTOM`) — silently fell through with `oy=0`
+  (TOP behavior instead), drawing the image's top-left corner at `y`
+  instead of its bottom-left. For a background image roughly
+  screen-sized drawn at `y=screenHeight`, that puts the *entire image*
+  below the visible screen — no error, no crash, just an apparently
+  missing background behind whatever else got drawn on top. Found on
+  `games/mortalkomb_9moadjwj.jar`: its menu/battle screens looked
+  completely black behind the menu text and HUD despite `createImage`
+  succeeding, until the missing bottom-anchored background was traced
+  down to this one wrong bit. `g_drawRegion` (the very next function in
+  the same file) already had the correct `& 0x20` check — this was an
+  isolated copy-paste slip in `g_drawImage` specifically, not a systemic
+  misunderstanding of the anchor bits. Also fixed while here: both
+  `g_drawImage` and `g_drawRegion` clamped their target coordinates to a
+  hardcoded `800x480` "so the image stays at least partially visible" —
+  wrong for any other configured resolution (the project's default is
+  240x320); now clamped against the actual `screenW()`/`screenH()`.
 - `com.nokia.mid.ui.FullCanvas` (Nokia UI API extension, not standard MIDP)
   shows up in real Nokia-targeted games in place of `Canvas`/`GameCanvas`.
   Registered as a native class extending `Canvas` (same API surface); its
@@ -343,6 +487,53 @@ tests miss. Found and fixed while bringing up new test JARs:
   same treatment — check whether it's javac-inlined (primitive/String
   constant, safe to leave as `none`) before assuming an empty field list
   is fine.
+- **`Heap::allocObj`'s auto-grow could allocate a new segment SMALLER than
+  the object it was growing to fit, corrupting the heap.** The new
+  segment's size was computed as `growTo - capTotal_`, where `growTo` is a
+  target for the *total* capacity across all segments (`usedTotal_ + need`,
+  itself bounded below by doubling). Because `capTotal_` already includes
+  space permanently wasted at the tail of earlier segments (a segment is
+  never revisited once abandoned), subtracting it does not guarantee the
+  *new* segment alone is `>= need` — a single large-enough allocation right
+  after a grow (e.g. `sizeof(Obj)` plus a handful of cells on a small heap)
+  landed in an undersized segment and wrote past its end, silently
+  corrupting glibc's malloc bookkeeping. No crash at the write site; the
+  first symptom was an unrelated `malloc`/`sysmalloc` abort much later
+  (caught by `tests/test_runtime.cpp`'s `heap_auto_grows_beyond_initial_segment`,
+  which allocates repeatedly from a tiny `Heap(64)`). Fixed in
+  `vm/runtime.cpp` by clamping `segSize` to be at least `need` after the
+  capacity-doubling computation, not just relying on the total-capacity
+  target to imply it.
+- **`java.lang.String` was missing `valueOf(int)`, and there was no output
+  side of `java.io` at all** (`ByteArrayOutputStream`/`DataOutputStream`/
+  `OutputStream` — only the input side existed). Found bringing up
+  `games/tigametkch_AXdOxivU.jar` ("Đột Kích", a Vietnamese MIDP-1.0
+  MIDlet): it does `String.valueOf(score)` for on-screen text (extremely
+  common — missing outright, not just unregistered) and serializes save
+  data via the textbook `new DataOutputStream(new
+  ByteArrayOutputStream())` idiom before handing the bytes to
+  `RecordStore`. `String.valueOf(I)` is now `regN`'d onto
+  `java/lang/String` reusing `n_Integer_toStringS` (same static
+  `args[0]`-is-the-int convention, same result). The new
+  `ByteArrayOutputStream`/`DataOutputStream` natives (`vm/midp_natives.cpp`,
+  `baos_*`/`dos_*` functions) deliberately mirror the *existing* input-side
+  shortcut convention instead of real OOP dispatch: `streamByte`/`streamFill`
+  (input) already read `cells[0..2]` of whatever `Obj*` they're given
+  assuming an `InputStream`-shaped layout, rather than calling `read()`
+  virtually; `dosWriteByte`/`baosStr` do the same thing in reverse
+  (`DataOutputStream` pokes its wrapped stream's `cells[0]` directly rather
+  than dispatching `write()`). This only works because every `OutputStream`
+  in this codebase so far *is* a `ByteArrayOutputStream` — if a future JAR
+  wraps something else (unlikely for J2ME, but possible), this would need
+  real virtual dispatch instead. `ByteArrayOutputStream`'s accumulated
+  bytes are stored the same way `StringBuffer` stores its content: as a
+  `String`-kind `Obj` reference in `cells[0]`, replaced wholesale (not
+  mutated in place) on every `write()` — reuses `newString()`'s bump
+  allocation instead of a separate growable-array scheme, embedded NUL
+  bytes included (a `std::string` doesn't care). Also added
+  `ByteArrayInputStream.<init>([BII)V` (offset+length constructor) — only
+  the full-array `<init>([B)V` existed; this same JAR's `RecordStore`
+  read-back path uses the ranged constructor.
 
 ## Performance pitfalls
 
@@ -370,6 +561,85 @@ tests miss. Found and fixed while bringing up new test JARs:
   sleep only the remainder of a fixed frame budget (`kFrameBudgetMs`,
   currently 33 ms ≈ 30 fps), and skip the sleep entirely if a frame is
   already over budget instead of accumulating lag.
+- **`getfield`/`putfield`/`getstatic`/`putstatic` need a resolved-field
+  cache keyed by constant-pool index, or field-heavy bytecode is
+  unplayable.** Every one of these opcodes used to re-parse the Fieldref's
+  `"name:desc"` string (an allocation-heavy `find`+2×`substr`) AND redo a
+  linear scan through `ClassInfo::fields`/`findFieldRecursive` (walking the
+  superclass chain) on *every single execution* — no different from the
+  `getUtf8`-by-value pitfall above, just one level higher. Profiled on
+  `games/gangstar_2_kings_of_260766.jar` (gprof, 40 frames, dummy video
+  driver — the one MIDlet in `games/` that reads/writes an enormous number
+  of instance fields per frame): `ClassInfo::findField` alone was **~50%**
+  of total CPU time (4.7M calls in 40 frames), driving the game down to
+  ~500 ms/frame (well under 2 fps, and it would time out a 20s headless
+  smoke test at only 30 frames in). Fixed by adding
+  `ClassInfo::fieldRefCache` (`vm/runtime.h`) — a `vector<FieldCacheEntry>`
+  indexed by constant-pool index, lazily populated by the interpreter (not
+  the class loader) on first resolution, storing the resolved
+  `MethodRecord*` (and, for `getstatic`/`putstatic` only, the referenced
+  class `tc` needed for `ensureInit()`). Cut CPU time on that same
+  40-frame run from ~20.6s to ~0.82s (≈25x) — ~20 ms/frame, comfortably
+  inside the 33 ms/frame (30 fps) budget. Correctness note: the cache is
+  keyed on `(cls, idx)` — the *executing* class and its own constant-pool
+  index — not on the receiver's runtime type; this is safe because a
+  resolved instance field's slot is a fixed absolute offset shared by every
+  subclass that doesn't itself redeclare that field, which is the only
+  access pattern this interpreter (and every MIDlet exercised so far)
+  relies on. If a future obfuscated JAR is found to *shadow* a field (same
+  name+desc redeclared in a subclass) and get miscached results, the cache
+  would need to be keyed on the receiver's `ClassInfo*` too, not just `idx`.
+
+- **`getenv()` must never sit in a hot path.** It is a linear scan of
+  `environ`. `interpreter.cpp` evaluated ~36 of them, several per `invoke*`
+  and per `putstatic`, and `midp` did one per `drawImage`/`Pix` construction.
+  Debug flags are now read once (`vm/debug.h`: `jvm::jmeDebug()`,
+  `drawDbg()`, `pixDbg()`; `interpreter.cpp`: `envDebug()`/`envTrace()`).
+  The old per-game trace hooks (`JME_QRACE`/`JME_ATRACE`/`JME_FLAGTRACE`/
+  `JME_RB`/`JME_WAITDBG`, keyed on the obfuscated class names of specific
+  games like `"h"` or `com/nokia/mid/appl/boun/f`) were deleted from the
+  interpreter — a game-specific check has no place in the bytecode loop.
+- **`Thread.yield()` in a spin-wait burned the whole frame budget.** The
+  native only suspended the fiber when the 200k-instruction budget was
+  nearly gone, so `while (!cond) Thread.yield();` (a wait for the virtual
+  clock or another thread — which can only change *between* frames) ran
+  ~30 000 yields and ~34 ms of CPU per frame doing nothing (measured on
+  `prince_of_persia_th`). `n_Thread_yield` now detects the pattern: 64
+  consecutive `yield()`s separated by < 64 instructions each → suspend for
+  the frame. A yield in the middle of real work (loading, decoding) leaves
+  far more instructions between calls and is never throttled. Verified
+  pixel-identical output at frame 300 on 6 games; CPU/frame dropped
+  33.8→21.7 ms (`prince_of_persia_th`), 7.7→2.8 (`gangstar_2`), 5.5→0.5
+  (`mission`), 8.7→0.9 (`mortal_combat`).
+
+- **`invoke*` needs the same per-call-site cache as fields.** Every
+  `invokestatic/special/virtual/interface` re-parsed `"classe/nom:desc"`
+  (`getMethodRef` + `substr`s), looked the class up by name (string hash),
+  recomputed `argSlots`/`returnIsVoid`, then resolved the method with
+  `ClassInfo::findMethod` — a linear scan comparing name+descriptor strings,
+  walking the super chain. Profiled on `games/gangstar_rio` while it
+  decodes its level packs (5.2 M invokes): `findMethod` alone was 26 % of CPU.
+  `ClassInfo::methodRefCache` (`runtime.h`, indexed by the Methodref's
+  constant-pool index, sized once so entry references stay valid across
+  nested calls) stores class, name, desc, arg slots, return type; static /
+  special targets are resolved once (`staticM`), virtual ones use a
+  monomorphic cache (`lastRecv` → `lastM`). Field cache entries also carry
+  the slot width (`w`) so `getstatic`/`getfield` no longer rescan the
+  descriptor, and `getstatic` skips `ensureInit` once `clinitDone`.
+  Pixel-identical output on all 17 games.
+- **Thread budget must be adaptive, not 200 000 instructions/frame.**
+  `midp::tick()` gave each game thread a fixed 200 000-instruction budget
+  (~1–2 ms of CPU) out of a 33 ms frame; a MIDlet that loads/decodes its
+  levels in its own thread (Gangstar Rio: LZMA-style range decoding of
+  ~370 KB of packed levels, hundreds of millions of instructions) needed
+  150+ frames — several seconds of black screen — while 90 % of every frame
+  was idle. The budget now adapts: after a frame where the thread consumed
+  its whole budget (pure compute), the measured interpreter speed
+  (instr/ms, exponential moving average) sets the next budget so threads get
+  ~16 ms of CPU per frame (shared among threads; clamp 200 k – 40 M).
+  Threads that sleep/yield return long before the budget, so ordinary games
+  are unaffected. `JME_INSTR_BUDGET` forces a fixed value for deterministic
+  comparisons. Note: results then depend on machine speed by design.
 
 ## Porting to RP2040
 

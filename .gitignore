@@ -1,2 +1,18 @@
 games/
 build/
+CMakeFiles/
+Testing/
+
+*.cmake
+CMakeCache.*
+*.ppm
+*.out
+# Makefile genere par un `cmake .` in-source accidentel a la racine (piege :
+# ecrase ensuite silencieusement les build files d'un futur `cmake ..` lance
+# depuis build/, cf. incident du 2026-09-24). Un vrai Makefile du projet
+# n'existe qu'a la racine et est toujours genere par CMake -- jamais ecrit
+# a la main.
+/Makefile
+
+j2me_emu*.rms/
+j2me_emu

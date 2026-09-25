@@ -1,3 +1,4 @@
+#include "debug.h"
 #include "runtime.h"
 #include "../hal/jar_reader.h"
 
@@ -49,9 +50,23 @@ namespace jvm
         if (need > freeInCur)
         {
             // Auto-grow : nouveau segment assez grand (double au moins).
+            // `growTo - capTotal_` peut rester < need : growTo est borne par
+            // usedTotal_+need (un total incluant l'espace deja perdu en fin
+            // des anciens segments), donc le soustraire de capTotal_ (qui
+            // inclut ce meme espace perdu) ne garantit PAS que le nouveau
+            // segment a lui seul fasse >= need. Un objet plus gros que le
+            // segment ainsi sous-dimensionne ecrit alors au-dela du buffer
+            // fraichement alloue -- corruption du tas silencieuse, qui ne se
+            // manifeste que beaucoup plus tard sur une allocation malloc()
+            // sans rapport (observe via un test unitaire : Heap(64) suivi
+            // d'allocations de 8 cellules fait exploser un segment cense
+            // faire 72 octets alors que need=136). Il faut borner segSize
+            // par need lui-meme, pas seulement par la capacite totale visee.
             size_t growTo = std::max(capTotal_ * 2, initCap_);
             growTo = std::max(growTo, usedTotal_ + need);
             size_t segSize = growTo - capTotal_;
+            if (segSize < need)
+                segSize = need;
             uint8_t *seg = nullptr;
             try
             {
@@ -63,7 +78,7 @@ namespace jvm
             }
             if (!seg)
             {
-                if (getenv("JME_DEBUG"))
+                if (jvm::jmeDebug())
                     fprintf(stderr, "allocObj OOM: kind=%d cells=%d need=%zu used=%zu cap=%zu\n",
                             (int)kind, cells, need, usedTotal_, capTotal_);
                 oom_ = true;
@@ -338,7 +353,7 @@ namespace jvm
         size_t n = jar_->extractClass(internalName, buf, sizeof(buf));
         if (n == 0)
         {
-            if (getenv("JME_DEBUG"))
+            if (jvm::jmeDebug())
                 fprintf(stderr, "loadFromJar: extractClass a echoue pour '%s'\n", internalName.c_str());
             return nullptr;
         }

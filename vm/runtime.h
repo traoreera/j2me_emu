@@ -110,6 +110,57 @@ struct ClassInfo
     int findStaticIndex(const std::string &nm) const;
     const MethodRecord *findClinit() const;
     bool clinitDone = false;
+
+    // Cache de résolution "index du pool de constantes -> champ résolu",
+    // pour getfield/putfield/getstatic/putstatic (interpreter.cpp). Rempli
+    // paresseusement, jamais par le class loader -- l'index est toujours
+    // relatif à cf->constantPool, LE POOL DE CETTE CLASSE (celle qui
+    // contient le bytecode exécuté), donc valide pour toute la durée de vie
+    // du programme une fois résolu une première fois. Sans ce cache,
+    // chaque exécution du même getfield/putfield reparse la chaîne
+    // "nom:desc" du Fieldref ET refait une recherche linéaire dans
+    // ClassInfo::fields/statics -- mesuré (gprof) comme le point chaud
+    // dominant du VM : ~50% du temps CPU total sur games/gangstar_2 (~4.7M
+    // appels de ClassInfo::findField en 40 frames), le genre de jeu dont le
+    // bytecode par-instance/par-frame fait énormément de lectures/écritures
+    // de champs. `tc` (classe référencée par le Fieldref, nécessaire pour
+    // ensureInit() sur getstatic/putstatic) n'est renseigné que pour ces
+    // deux opcodes ; `field->owner` donne la classe qui déclare réellement
+    // le champ (peut différer de `tc` pour un champ static hérité). Pour
+    // getfield/putfield (champs d'instance, sans ensureInit), `tc` reste
+    // nullptr et n'est pas utilisé.
+    struct FieldCacheEntry
+    {
+        ClassInfo *tc = nullptr;
+        const MethodRecord *field = nullptr;
+        int w = 1; // slots du champ (2 pour long/double), pré-calculé : évite de rescanner le descripteur
+    };
+    std::vector<FieldCacheEntry> fieldRefCache;
+
+    // Cache de résolution des invoke* (même principe que fieldRefCache, indexé
+    // par l'index du Methodref dans le pool de cette classe) : évite, à CHAQUE
+    // appel, de reparser "classe/nom:desc", de rechercher la classe par son nom
+    // (table de hachage de chaînes) et de rechercher la méthode par
+    // (nom, descripteur) -- comparaison de chaînes dans un scan linéaire de
+    // ClassInfo::methods, remontant la chaîne de super. Mesuré (gprof) sur
+    // games/gangstar_rio : ClassInfo::findMethod 26 % du CPU + getMethodRef/
+    // classInfoOfName/hash ~8 %, 5,2 M appels pendant le chargement. Pour
+    // invokestatic/invokespecial la cible est fixe (`staticM`) ; pour
+    // invokevirtual/interface elle dépend de la classe réelle du récepteur :
+    // cache monomorphe (dernier récepteur -> dernière méthode).
+    struct MethodCacheEntry
+    {
+        bool valid = false;
+        ClassInfo *tc = nullptr;          // classe référencée par le Methodref
+        std::string name, desc;
+        int nslots = 0;                   // slots d'arguments (hors récepteur)
+        bool rv = true;                   // retour void ?
+        char retType = 'V';
+        const MethodRecord *staticM = nullptr; // invokestatic/special : méthode résolue
+        ClassInfo *lastRecv = nullptr;         // invokevirtual : dernier type de récepteur
+        const MethodRecord *lastM = nullptr;   //                 et méthode correspondante
+    };
+    std::vector<MethodCacheEntry> methodRefCache;
 };
 
 class Heap

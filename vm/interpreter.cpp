@@ -11,6 +11,13 @@ namespace jvm
 
 namespace
 {
+// Flags de debug lus UNE fois (getenv() = scan linéaire de environ ; ces tests
+// sont dans le chemin chaud d'invoke/dispatch/new, évalués des millions de
+// fois par seconde).
+inline bool envDebug() { static const bool v = getenv("JME_DEBUG") != nullptr; return v; }
+inline bool envTrace() { static const bool v = getenv("JME_TRACE") != nullptr; return v; }
+inline bool envTraceAll() { static const bool v = getenv("JME_TRACEALL") != nullptr; return v; }
+
 inline uint8_t rb(const uint8_t *c, int &pc) { return c[pc++]; }
 inline int16_t rb16(const uint8_t *c, int &pc) { int v = (c[pc] << 8) | c[pc + 1]; pc += 2; return static_cast<int16_t>(v); }
 inline uint16_t rbu16(const uint8_t *c, int &pc) { int v = (c[pc] << 8) | c[pc + 1]; pc += 2; return static_cast<uint16_t>(v); }
@@ -212,6 +219,22 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
 {
     if (m->mi)
     {
+        // JME_TRACEM=Classe.methode : trace générique (une seule lecture de
+        // l'environnement) des appels d'UNE méthode bytecode -- premiers
+        // arguments et valeur retournée. Outil de diagnostic, pas de code
+        // spécifique à un jeu.
+        static const char *traceM = getenv("JME_TRACEM");
+        if (traceM && traceM[0] == '*' && !traceM[1])
+            fprintf(stderr, "TRACEALLM %s.%s%s\n", cls->name.c_str(), m->name.c_str(), m->desc.c_str());
+        else if (traceM && (cls->name + "." + m->name) == traceM)
+        {
+            bool r = execBytecode(cls, m, thisObj, args, nargs, result);
+            fprintf(stderr, "TRACEM %s.%s%s args=[", cls->name.c_str(), m->name.c_str(), m->desc.c_str());
+            for (int i = 0; i < nargs && i < 8; i++)
+                fprintf(stderr, "%s%d", i ? "," : "", args[i].i);
+            fprintf(stderr, "] -> ok=%d ret=%d\n", r ? 1 : 0, result.i);
+            return r;
+        }
         return execBytecode(cls, m, thisObj, args, nargs, result);
     }
     else
@@ -230,7 +253,7 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
         ctx.nargs = nargs;
         ctx.thisObj = thisObj;
         ctx.result = &result;
-        if (getenv("JME_TRACE"))
+        if (envTrace())
         {
             const std::string &mn = m->name;
             if (mn.find("reateImage") != std::string::npos || mn.find("etResource") != std::string::npos ||
@@ -238,7 +261,7 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
                 mn.find("drawRGB") != std::string::npos || mn.find("load") != std::string::npos)
                 fprintf(stderr, "NATIVE %s.%s:%s\n", cls->name.c_str(), m->name.c_str(), m->desc.c_str());
         }
-        if (getenv("JME_TRACEALL"))
+        if (envTraceAll())
             fprintf(stderr, "NAT %s.%s:%s%s\n", cls->name.c_str(), m->name.c_str(),
                     m->desc.c_str(), ctx.thisObj && ctx.thisObj->cls ? (std::string(" (caller=") + ctx.thisObj->cls->name + ")").c_str() : "");
         fn(&ctx);
@@ -263,7 +286,7 @@ bool Interpreter::invokeStatic(ClassInfo *declClass, const std::string &name, co
         {
             if (!ensureInit(c))
             {
-                if (getenv("JME_DEBUG"))
+                if (envDebug())
                     fprintf(stderr, "invokeStatic: ensureInit echec sur %s (appel %s%s)\n",
                             c->name.c_str(), name.c_str(), desc.c_str());
                 return false;
@@ -272,7 +295,7 @@ bool Interpreter::invokeStatic(ClassInfo *declClass, const std::string &name, co
         }
         c = c->super;
     }
-    if (getenv("JME_DEBUG"))
+    if (envDebug())
         fprintf(stderr, "invokeStatic: méthode %s%s introuvable dans %s\n",
                 name.c_str(), desc.c_str(), declClass ? declClass->name.c_str() : "(null)");
     return false;
@@ -311,7 +334,7 @@ bool Interpreter::invokeVirtual(ClassInfo *declClass, const std::string &name, c
 {
     if (!thisObj)
     {
-        if (getenv("JME_DEBUG"))
+        if (envDebug())
             fprintf(stderr, "invokeVirtual: thisObj NULL pour %s%s\n", name.c_str(), desc.c_str());
         return false;
     }
@@ -319,7 +342,7 @@ bool Interpreter::invokeVirtual(ClassInfo *declClass, const std::string &name, c
     ClassInfo *rc = runtimeClassOf(rt_, thisObj);
     if (!rc)
     {
-        if (getenv("JME_DEBUG"))
+        if (envDebug())
             fprintf(stderr, "invokeVirtual: runtimeClass NULL pour %s%s (obj kind=%d cls=%s)\n",
                     name.c_str(), desc.c_str(), (int)thisObj->kind,
                     thisObj->cls ? thisObj->cls->name.c_str() : "?");
@@ -334,18 +357,18 @@ bool Interpreter::invokeVirtual(ClassInfo *declClass, const std::string &name, c
     }
     if (!ensureInit(rc))
     {
-        if (getenv("JME_DEBUG"))
+        if (envDebug())
             fprintf(stderr, "invokeVirtual: ensureInit echec sur %s (appel %s%s)\n",
                     rc->name.c_str(), name.c_str(), desc.c_str());
         return false;
     }
-    if (getenv("JME_DEBUG") && name == "setFullScreenMode")
+    if (envDebug() && name == "setFullScreenMode")
         fprintf(stderr, "invokeVirtual: dispatch %s.%s%s receiver=%s cls=%s mi=%d\n",
                 m->owner->name.c_str(), m->name.c_str(), m->desc.c_str(),
                 thisObj && thisObj->cls ? thisObj->cls->name.c_str() : "?", rc->name.c_str(),
                 m->mi ? 1 : 0);
     bool dr = dispatch(m->owner, m, thisObj, args, nargs, result);
-    if (getenv("JME_DEBUG") && name == "setFullScreenMode")
+    if (envDebug() && name == "setFullScreenMode")
         fprintf(stderr, "invokeVirtual: dispatch-result=%d\n", dr ? 1 : 0);
     return dr;
 }
@@ -380,20 +403,6 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     const uint8_t *c = code->code.data();
     int codeLen = static_cast<int>(code->code.size());
     const ConstantPool &cp = cls->cf->constantPool;
-
-    static long hAcount = 0;
-    if (getenv("JME_ATRACE") && cls->name == "h" && m->name == "a" && m->desc == "()V")
-    {
-        hAcount++;
-        fprintf(stderr, "ATRACE h.a() #%ld t=%lld\n", hAcount, (long long)virtualMillis());
-    }
-    if (getenv("JME_QRACE") && cls->name == "h" &&
-        ((m->name == "e" && m->desc == "(II)Ljava/lang/String;") ||
-         (m->name == "a" && m->desc == "(Lb;ILjava/lang/String;IIIII)I") ||
-         (m->name == "Q" && m->desc == "()V")))
-        fprintf(stderr, "QRACE enter h.%s:%s t=%lld nargs=%d a0=%d a1=%d\n",
-                m->name.c_str(), m->desc.c_str(), (long long)virtualMillis(), nargs,
-                nargs > 0 ? args[0].i : -1, nargs > 1 ? args[1].i : -1);
 
     size_t mark = arenaOff_;
     size_t nLocals = code->maxLocals;
@@ -482,7 +491,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     {
         if (!excls)
         {
-            if (getenv("JME_DEBUG"))
+            if (envDebug())
                 fprintf(stderr, "RAISE excls=NULL (classe exception non enregistrée) throwPc=%d in %s.%s\n",
                         throwPc, cls->name.c_str(), m->name.c_str());
             return false;
@@ -496,7 +505,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         int handlerPc;
         if (findExceptionHandler(code, cp, throwPc, ex, handlerPc))
         {
-            if (getenv("JME_DEBUG"))
+            if (envDebug())
                 fprintf(stderr, "RAISE %s caught->%d in %s.%s throwPc=%d\n",
                         excls->name.c_str(), handlerPc, cls->name.c_str(), m->name.c_str(), throwPc);
             sp = 0;
@@ -504,7 +513,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             pc = handlerPc;
             return true;
         }
-        if (getenv("JME_DEBUG"))
+        if (envDebug())
             fprintf(stderr, "RAISE %s NO-HANDLER in %s.%s throwPc=%d -> pending\n",
                     excls->name.c_str(), cls->name.c_str(), m->name.c_str(), throwPc);
         pendingException_ = ex;
@@ -538,7 +547,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 // sont préservés intacts (swapcontext), on continue juste la
                 // boucle avec un budget neuf pour cette nouvelle trame.
                 yieldFn_();
-                if (getenv("JME_DEBUG"))
+                if (envDebug())
                     fprintf(stderr, "YIELD %s.%s pc=%d op=0x%02x\n", cls->name.c_str(), m->name.c_str(), pc, c[pc]);
                 instrBudget_ = instrBudgetQuota_;
                 continue;
@@ -1001,18 +1010,31 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0xb2: case 0xb3:
         {
             uint16_t idx = rbu16(c, pc);
-            auto fr = cp.getFieldRef(idx);
-            if (fr.first.empty()) { okResult = false; done = true; break; }
-            std::string classRef = fr.first;
-            size_t colon = fr.second.find(':');
-            std::string fn = fr.second.substr(0, colon);
-            std::string fd = fr.second.substr(colon + 1);
-            ClassInfo *tc = rt_->classInfoOfName(classRef);
-            if (!tc) tc = rt_->loadFromJar(classRef);
-            if (!tc)
+            ClassInfo *tc = nullptr;
+            const MethodRecord *f = nullptr;
+            std::string fn, fd; // seulement renseignés si echec (message d'erreur) ou pas encore en cache
+            int cachedW = 1;
+            if (idx < cls->fieldRefCache.size() && cls->fieldRefCache[idx].field)
             {
-                fprintf(stderr, "JVM: get/putstatic: classe %s introuvable (0x%02x)\n", classRef.c_str(), op);
-                okResult = false; done = true; break;
+                tc = cls->fieldRefCache[idx].tc;
+                f = cls->fieldRefCache[idx].field;
+                cachedW = cls->fieldRefCache[idx].w;
+            }
+            else
+            {
+                auto fr = cp.getFieldRef(idx);
+                if (fr.first.empty()) { okResult = false; done = true; break; }
+                std::string classRef = fr.first;
+                size_t colon = fr.second.find(':');
+                fn = fr.second.substr(0, colon);
+                fd = fr.second.substr(colon + 1);
+                tc = rt_->classInfoOfName(classRef);
+                if (!tc) tc = rt_->loadFromJar(classRef);
+                if (!tc)
+                {
+                    fprintf(stderr, "JVM: get/putstatic: classe %s introuvable (0x%02x)\n", classRef.c_str(), op);
+                    okResult = false; done = true; break;
+                }
             }
             // Un accès à un champ static doit initialiser la classe cible
             // (<clinit>) au préalable si ce n'est pas déjà fait -- contexte
@@ -1021,15 +1043,17 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             // accès à une classe (ex. lire un tableau statique alloué dans
             // son <clinit> avant même le premier appel de méthode dessus) :
             // observé sur games/mission.jar, un sastore vers un champ static
-            // jamais alloué faute d'avoir lancé <clinit>.
-            if (!ensureInit(tc))
+            // jamais alloué faute d'avoir lancé <clinit>. ensureInit() est
+            // O(1) après la première fois (juste un bool), donc pas besoin
+            // de la sauter sur un hit de cache.
+            if (!tc->clinitDone && !ensureInit(tc))
             {
                 okResult = false; done = true; break;
             }
-            if (op == 0xb2)
+            if (!f)
             {
                 ClassInfo *owner = tc;
-                const MethodRecord *f = owner->findField(fn, fd);
+                f = owner->findField(fn, fd);
                 while (!f && owner->super) { owner = owner->super; f = owner->findField(fn, fd); }
                 if (!f)
                 {
@@ -1037,38 +1061,21 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                             tc->name.c_str(), fn.c_str(), op);
                     okResult = false; done = true; break;
                 }
-                int w = slotsOfDesc(fd);
-                if (getenv("JME_QRACE") && fn == "bW")
-                    fprintf(stderr, "QRACE get bW=%d t=%lld\n", owner->statics[f->slot].i,
-                            (long long)virtualMillis());
+                if (idx >= cls->fieldRefCache.size())
+                    cls->fieldRefCache.resize(cp.entries.size());
+                cls->fieldRefCache[idx] = {tc, f, slotsOfDesc(f->desc)}; cachedW = cls->fieldRefCache[idx].w;
+            }
+            ClassInfo *owner = f->owner;
+            if (op == 0xb2)
+            {
+                int w = cachedW;
                 if (w == 2) pushLong(owner->statics[f->slot].l);
                 else push(owner->statics[f->slot], 1);
             }
             else
             {
-                int w = slotsOfDesc(fd);
+                int w = cachedW;
                 Value v = (w == 2) ? Value::fromLong(popLong()) : pop();
-                ClassInfo *owner = tc;
-                const MethodRecord *f = owner->findField(fn, fd);
-                while (!f && owner->super) { owner = owner->super; f = owner->findField(fn, fd); }
-                if (!f)
-                {
-                    fprintf(stderr, "JVM: get/putstatic: champ %s.%s introuvable (0x%02x)\n",
-                            tc->name.c_str(), fn.c_str(), op);
-                    okResult = false; done = true; break;
-                }
-                if (getenv("JME_FLAGTRACE") &&
-                    (fn == "bl" || fn == "el" || fn == "bW" || fn == "bm" || fn == "em" ||
-                     fn == "en" || fn == "eo" || fn == "bP" || fn == "G" || fn == "cq" ||
-                     fn == "eF" || fn == "eB" || fn == "eC" || fn == "c" || fn == "bZ" ||
-                     fn == "al" || fn == "ek" || fn == "ac" || fn == "bX" || fn == "bH" ||
-                     fn == "aU" || fn == "aS" || fn == "C" || fn == "k" || fn == "ah" ||
-                     fn == "U" || fn == "X" || fn == "cd" || fn == "bd" || fn == "A" || fn == "cr" || fn == "cq" ||
-                     fn == "av" || fn == "aw" || fn == "F" || fn == "K" || fn == "O"))
-fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str(), fn.c_str(), v.i,
-                             (long long)virtualMillis(), cls->name.c_str(), m->name.c_str(), m->desc.c_str(), pc);
-                if (getenv("JME_DEBUG") && owner->name == "e" && fn == "j")
-                    fprintf(stderr, "PUTSTATIC e.j = %d (caller=%s.%s pc=%d)\n", v.i, cls->name.c_str(), m->name.c_str(), pc);
                 owner->statics[f->slot] = v;
             }
             break;
@@ -1076,23 +1083,46 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
         case 0xb4: case 0xb5:
         {
             uint16_t idx = rbu16(c, pc);
-            auto fr = cp.getFieldRef(idx);
-            if (fr.first.empty()) { okResult = false; done = true; break; }
-            size_t colon = fr.second.find(':');
-            std::string fn = fr.second.substr(0, colon);
-            std::string fd = fr.second.substr(colon + 1);
-            int w = slotsOfDesc(fd);
+            // Cache de résolution (cf. ClassInfo::fieldRefCache) : évite de
+            // reparser "nom:desc" et de refaire findFieldRecursive() --
+            // recherche linéaire -- à chaque exécution du même
+            // getfield/putfield. `tc` reste nullptr ici (pas d'ensureInit
+            // pour un champ d'instance) ; validité expliquée dans runtime.h.
+            const MethodRecord *ff = (idx < cls->fieldRefCache.size()) ? cls->fieldRefCache[idx].field : nullptr;
+            std::string fn, fd;
+            int w;
+            if (ff)
+            {
+                w = cls->fieldRefCache[idx].w;
+            }
+            else
+            {
+                auto fr = cp.getFieldRef(idx);
+                if (fr.first.empty()) { okResult = false; done = true; break; }
+                size_t colon = fr.second.find(':');
+                fn = fr.second.substr(0, colon);
+                fd = fr.second.substr(colon + 1);
+                w = slotsOfDesc(fd);
+            }
             if (op == 0xb5)
             {
                 Value v = (w == 2) ? Value::fromLong(popLong()) : pop();
                 Obj *o = popRef();
                 if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
-                const MethodRecord *ff = o->cls->findFieldRecursive(fn, fd);
                 if (!ff)
                 {
-                    fprintf(stderr, "JVM: putfield: champ %s.%s introuvable (idx=%u owner=%s fd=%s) (0x%02x)\n",
-                            o->cls ? o->cls->name.c_str() : "(null)", fn.c_str(), idx,
-                            fr.first.c_str(), fd.c_str(), op);
+                    ff = o->cls->findFieldRecursive(fn, fd);
+                    if (ff)
+                    {
+                        if (idx >= cls->fieldRefCache.size())
+                            cls->fieldRefCache.resize(cp.entries.size());
+                        cls->fieldRefCache[idx] = {nullptr, ff, w};
+                    }
+                }
+                if (!ff)
+                {
+                    fprintf(stderr, "JVM: putfield: champ %s.%s introuvable (idx=%u) (0x%02x)\n",
+                            o->cls ? o->cls->name.c_str() : "(null)", fn.c_str(), idx, op);
                     okResult = false; done = true; break;
                 }
                 o->cells[ff->slot] = v;
@@ -1100,12 +1130,20 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
             }
             Obj *o = popRef();
             if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
-            const MethodRecord *ff = o->cls->findFieldRecursive(fn, fd);
             if (!ff)
             {
-                fprintf(stderr, "JVM: getfield: champ %s.%s introuvable (idx=%u owner=%s fd=%s) (0x%02x)\n",
-                        o->cls ? o->cls->name.c_str() : "(null)", fn.c_str(), idx,
-                        fr.first.c_str(), fd.c_str(), op);
+                ff = o->cls->findFieldRecursive(fn, fd);
+                if (ff)
+                {
+                    if (idx >= cls->fieldRefCache.size())
+                        cls->fieldRefCache.resize(cp.entries.size());
+                    cls->fieldRefCache[idx] = {nullptr, ff, w};
+                }
+            }
+            if (!ff)
+            {
+                fprintf(stderr, "JVM: getfield: champ %s.%s introuvable (idx=%u fd=%s) (0x%02x)\n",
+                        o->cls ? o->cls->name.c_str() : "(null)", fn.c_str(), idx, fd.c_str(), op);
                 okResult = false; done = true; break;
             }
             if (w == 2) pushLong(o->cells[ff->slot].l);
@@ -1119,33 +1157,67 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
             uint16_t idx = rbu16(c, pc);
             if (op == 0xb9)
             {
-                if (getenv("JME_DEBUG")) fprintf(stderr, "invokeinterface hit, pc before skip=%d\n", pc);
+                if (envDebug()) fprintf(stderr, "invokeinterface hit, pc before skip=%d\n", pc);
                 rb(c, pc); rb(c, pc);
-                if (getenv("JME_DEBUG")) fprintf(stderr, "invokeinterface pc after skip=%d\n", pc);
+                if (envDebug()) fprintf(stderr, "invokeinterface pc after skip=%d\n", pc);
             }
-            auto mr = cp.getMethodRef(idx);
-            if (mr.first.empty()) { okResult = false; done = true; break; }
-            std::string classRef = mr.first;
-            ClassInfo *tc = rt_->classInfoOfName(classRef);
-            if (!tc && rt_->jar()) tc = rt_->loadFromJar(classRef);
-            size_t colon = mr.second.find(':');
-            std::string mname = mr.second.substr(0, colon);
-            std::string mdesc = mr.second.substr(colon + 1);
-            if (getenv("JME_QRACE") && op == 0xb8 && classRef == "a" &&
-                    ((mname == "a" && (mdesc == "(I)V" || mdesc == "(I[I)V")) || (mname == "b" && mdesc == "()Z")))
-                fprintf(stderr, "QRACE a.%s%s arg0=%d caller=%s.%s pc=%d t=%lld\n", mname.c_str(), mdesc.c_str(),
-                        st[sp - argSlots(mdesc)].i, cls->name.c_str(), m->name.c_str(), pc,
-                        (long long)virtualMillis());
-            int nslots = argSlots(mdesc);
-            bool rv = returnIsVoid(mdesc);
+            // Taille fixée une fois pour toutes (jamais de réallocation ensuite : `e`
+            // reste valide pendant les appels imbriqués qui peuplent d'autres entrées).
+            if (cls->methodRefCache.empty())
+                cls->methodRefCache.resize(cp.entries.size());
+            if (idx >= cls->methodRefCache.size()) { okResult = false; done = true; break; }
+            ClassInfo::MethodCacheEntry &e = cls->methodRefCache[idx];
+            if (!e.valid)
+            {
+                auto mr = cp.getMethodRef(idx);
+                if (mr.first.empty()) { okResult = false; done = true; break; }
+                ClassInfo *ctc = rt_->classInfoOfName(mr.first);
+                if (!ctc && rt_->jar()) ctc = rt_->loadFromJar(mr.first);
+                if (!ctc && op == 0xb8)
+                {
+                    if (envDebug())
+                        fprintf(stderr, "invokestatic: tc NULL pour %s.%s (caller=%s.%s pc=%d)\n",
+                                mr.first.c_str(), mr.second.c_str(), cls->name.c_str(), m->name.c_str(), pc);
+                    // non mis en cache : la classe pourra être chargée plus tard
+                    sp -= argSlots(mr.second.substr(mr.second.find(':') + 1));
+                    if (!returnIsVoid(mr.second.substr(mr.second.find(':') + 1))) pushInt(0);
+                    okResult = false; done = true; break;
+                }
+                size_t colon = mr.second.find(':');
+                e.tc = ctc;
+                e.name = mr.second.substr(0, colon);
+                e.desc = mr.second.substr(colon + 1);
+                e.nslots = argSlots(e.desc);
+                e.rv = returnIsVoid(e.desc);
+                size_t rp = e.desc.find(')');
+                e.retType = (rp != std::string::npos && rp + 1 < e.desc.size()) ? e.desc[rp + 1] : 'V';
+                e.valid = true;
+            }
+            ClassInfo *tc = e.tc;
+            const std::string &mname = e.name;
+            const std::string &mdesc = e.desc;
+            int nslots = e.nslots;
+            bool rv = e.rv;
             Value mres;
             bool ok = false;
             if (op == 0xb8)
             {
-                if (tc) ok = invokeStatic(tc, mname, mdesc, nslots, &st[sp - nslots], mres);
-                else if (getenv("JME_DEBUG"))
-                    fprintf(stderr, "invokestatic: tc NULL pour %s.%s%s (caller=%s.%s pc=%d)\n",
-                            classRef.c_str(), mname.c_str(), mdesc.c_str(), cls->name.c_str(), m->name.c_str(), pc);
+                if (!e.staticM)
+                {
+                    // Même résolution qu'invokeStatic : chaîne de super, première correspondance.
+                    ClassInfo *owner = tc;
+                    const MethodRecord *fm = nullptr;
+                    while (owner && !(fm = owner->findMethod(mname, mdesc)))
+                        owner = owner->super;
+                    if (fm) e.staticM = fm;
+                    else if (envDebug())
+                        fprintf(stderr, "invokeStatic: méthode %s%s introuvable dans %s\n", mname.c_str(), mdesc.c_str(), tc->name.c_str());
+                }
+                if (e.staticM)
+                {
+                    ClassInfo *owner = e.staticM->owner;
+                    ok = ensureInit(owner) && dispatch(owner, e.staticM, nullptr, &st[sp - nslots], nslots, mres);
+                }
                 sp -= nslots;
             }
             else
@@ -1153,23 +1225,41 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
                 Obj *receiver = st[sp - nslots - 1].o;
                 Value *argsPtr = st + (sp - nslots - 1);
                 if (op == 0xb7)
-                    ok = invokeSpecial(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres);
+                {
+                    if (!e.staticM && tc)
+                        e.staticM = tc->findMethodVirtual(mname, mdesc);
+                    if (e.staticM)
+                        ok = dispatch(e.staticM->owner, e.staticM, receiver, argsPtr, nslots + 1, mres);
+                    else
+                        ok = invokeSpecial(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres); // message d'erreur habituel
+                }
                 else
-                    ok = invokeVirtual(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres);
-                if (getenv("JME_WAITDBG") && mname == "wait")
-                    fprintf(stderr, "waitdbg tc=%s mname=%s mdesc=%s recv=%s nslots=%d ok=%d\n",
-                            tc ? tc->name.c_str() : "?", mname.c_str(), mdesc.c_str(),
-                            receiver && receiver->cls ? receiver->cls->name.c_str() : "?", nslots, ok ? 1 : 0);
-                if (getenv("JME_WAITDBG"))
-                    fprintf(stderr, "invokefn %s.%s%s op=%02x ok=%d (parent=%s.%s)\n",
-                            mname.c_str(), mdesc.c_str(), tc ? tc->name.c_str() : "?", op, ok ? 1 : 0,
-                            cls->name.c_str(), m->name.c_str());
+                {
+                    ClassInfo *rc = receiver ? runtimeClassOf(rt_, receiver) : nullptr;
+                    if (rc && rc == e.lastRecv)
+                    {
+                        ok = dispatch(e.lastM->owner, e.lastM, receiver, argsPtr, nslots + 1, mres);
+                    }
+                    else if (rc)
+                    {
+                        const MethodRecord *vm_ = rc->findMethodVirtual(mname, mdesc);
+                        if (vm_ && ensureInit(rc))
+                        {
+                            e.lastRecv = rc;
+                            e.lastM = vm_;
+                            ok = dispatch(vm_->owner, vm_, receiver, argsPtr, nslots + 1, mres);
+                        }
+                        else if (!vm_)
+                            ok = invokeVirtual(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres); // message d'erreur habituel
+                    }
+                    else
+                        ok = invokeVirtual(tc, mname, mdesc, receiver, argsPtr, nslots + 1, mres); // récepteur null / classe inconnue
+                }
                 sp -= nslots + 1;
             }
             if (!rv)
             {
-                size_t rp = mdesc.find(')');
-                char rt = (rp != std::string::npos && rp + 1 < mdesc.size()) ? mdesc[rp + 1] : 'V';
+                char rt = e.retType;
                 if (rt == 'J' || rt == 'D') pushLong(mres.l);
                 else push(mres, 1);
             }
@@ -1202,7 +1292,7 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
                 }
                 if (pending)
                     pendingException_ = pending; // toujours pas rattrapée : continue de remonter
-                if (getenv("JME_DEBUG"))
+                if (envDebug())
                     fprintf(stderr, "invokeEchec %s.%s%s (caller=%s.%s pc=%d)\n",
                             tc ? tc->name.c_str() : "?", mname.c_str(), mdesc.c_str(),
                             cls->name.c_str(), m->name.c_str(), pc);
@@ -1217,10 +1307,10 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
             std::string classRef = cp.getClassName(idx);
             ClassInfo *tc = rt_->classInfoOfName(classRef);
             if (!tc && rt_->jar()) tc = rt_->loadFromJar(classRef);
-            if (!tc) { if (getenv("JME_DEBUG")) fprintf(stderr, "new: class %s introuvable\n", classRef.c_str()); okResult = false; done = true; break; }
-            if (!ensureInit(tc)) { if (getenv("JME_DEBUG")) fprintf(stderr, "new: ensureInit echec pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
+            if (!tc) { if (envDebug()) fprintf(stderr, "new: class %s introuvable\n", classRef.c_str()); okResult = false; done = true; break; }
+            if (!ensureInit(tc)) { if (envDebug()) fprintf(stderr, "new: ensureInit echec pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
             Obj *o = rt_->heap().newInstance(tc);
-            if (!o) { rt_->reportOom(); if (getenv("JME_DEBUG")) fprintf(stderr, "new: OOM pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
+            if (!o) { rt_->reportOom(); if (envDebug()) fprintf(stderr, "new: OOM pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
             pushRef(o);
             break;
         }
@@ -1228,7 +1318,7 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
         {
             uint8_t atype = rb(c, pc);
             int count = popInt();
-            if (getenv("JME_DEBUG") && count < 0)
+            if (envDebug() && count < 0)
                 fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
                         count, atype, cls->name.c_str(), m->name.c_str());
             ObjKind k;
@@ -1288,7 +1378,7 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
                 st[sp - 1].i = is ? 1 : 0;
             else if (o && !is)
             {
-                if (getenv("JME_DEBUG"))
+                if (envDebug())
                 {
                     fprintf(stderr, "JVM: checkcast fail vers %s (objet kind=%d cls=%s len=%d ref=%p) in %s.%s pc=%d sp=%d\n",
                             classRef.c_str(), (int)o->kind,
@@ -1323,7 +1413,7 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
                 pc = handlerPc;
                 break;
             }
-            if (getenv("JME_DEBUG"))
+            if (envDebug())
                 fprintf(stderr, "JVM: exception non rattrapée (athrow) ex=%s dans %s.%s pc=%d\n",
                         ex && ex->cls ? ex->cls->name.c_str() : "?", cls->name.c_str(), m->name.c_str(), opcodePc);
             pendingException_ = ex;
@@ -1386,7 +1476,7 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
 
     if (done && okResult)
         result = resultVal;
-    if (!okResult && getenv("JME_DEBUG"))
+    if (!okResult && envDebug())
     {
         fprintf(stderr, "FRMFALSE %s.%s pc=%d codeLen=%d\n",
                 cls->name.c_str(), m->name.c_str(), pc, codeLen);
@@ -1399,10 +1489,6 @@ fprintf(stderr, "PS %s.%s=%d t=%lld caller=%s.%s%s pc=%d\n", owner->name.c_str()
             fprintf(stderr, " ]\n");
         }
     }
-    if (getenv("JME_WAITDBG"))
-        fprintf(stderr, "EXIT %s.%s done=%d ok=%d pc=%d codeLen=%d budget=%lld\n",
-                cls->name.c_str(), m->name.c_str(), done ? 1 : 0, okResult ? 1 : 0, pc,
-                codeLen, (long long)(instrBudget_ >= 0 ? instrBudget_ : -1));
     frameFree(mark);
     return okResult;
 }

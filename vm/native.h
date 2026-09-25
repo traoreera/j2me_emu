@@ -26,6 +26,9 @@ namespace jvm
     NativeFn findNative(const std::string &key);
     void registerNative(const std::string &key, NativeFn fn);
 
+    // Dossier de persistance du RecordStore ("" = en mémoire seulement).
+    void setRmsDir(const std::string &dir);
+
     // Enregistrement de toutes les natives (CLDC + MIDP). À appeler une fois.
     void initNatives();
 

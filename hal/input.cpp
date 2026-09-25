@@ -1,4 +1,5 @@
 #include "hal/input.h"
+#include "hal/display.h"
 #include <SDL2/SDL.h>
 #include <unordered_map>
 #include <string>
@@ -70,11 +71,44 @@ void input_poll(InputState *out)
 {
     g_justPressed = 0;
     g_justReleased = 0;
+    out->pointerCount = 0;
+
+    // Fenêtre -> écran logique (le rendu étire le framebuffer sur toute la
+    // fenêtre : un clic à (wx,wy) vise le pixel wx*fbW/winW).
+    auto toLogical = [](Uint32 windowID, int wx, int wy, int &lx, int &ly)
+    {
+        lx = wx; ly = wy;
+        const Framebuffer *fb = display_get_framebuffer();
+        SDL_Window *win = SDL_GetWindowFromID(windowID);
+        if (!fb || !win) return;
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(win, &ww, &wh);
+        if (ww > 0 && wh > 0)
+        {
+            lx = wx * fb->width / ww;
+            ly = wy * fb->height / wh;
+        }
+    };
+    auto pushPointer = [&](int kind, int x, int y)
+    {
+        if (out->pointerCount < kMaxPointerEvents)
+            out->pointer[out->pointerCount++] = {kind, x, y};
+    };
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) {
             g_quitRequested = true;
+        }
+        if ((e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) && e.button.button == SDL_BUTTON_LEFT) {
+            int lx, ly;
+            toLogical(e.button.windowID, e.button.x, e.button.y, lx, ly);
+            pushPointer(e.type == SDL_MOUSEBUTTONDOWN ? PointerEvent::PRESS : PointerEvent::RELEASE, lx, ly);
+        }
+        if (e.type == SDL_MOUSEMOTION && (e.motion.state & SDL_BUTTON_LMASK)) {
+            int lx, ly;
+            toLogical(e.motion.windowID, e.motion.x, e.motion.y, lx, ly);
+            pushPointer(PointerEvent::DRAG, lx, ly);
         }
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
             bool down = (e.type == SDL_KEYDOWN);

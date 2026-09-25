@@ -31,8 +31,20 @@ namespace hal
 
     using KeyMask = uint32_t;
 
+    // Évènement souris/tactile de la trame, en coordonnées de l'écran LOGIQUE
+    // (déjà ramenées de la taille de la fenêtre à celle du framebuffer).
+    struct PointerEvent
+    {
+        enum Kind : int { PRESS = 0, RELEASE = 1, DRAG = 2 };
+        int kind = PRESS;
+        int x = 0, y = 0;
+    };
+    constexpr int kMaxPointerEvents = 16;
+
     struct InputState
     {
+        PointerEvent pointer[kMaxPointerEvents]; // évènements de la trame (clic gauche)
+        int pointerCount = 0;
         KeyMask pressed = 0;      // currently held
         KeyMask justPressed = 0;  // pressed this frame
         KeyMask justReleased = 0; // released this frame
