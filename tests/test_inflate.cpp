@@ -6,7 +6,7 @@
 // par un round-trip zlib avant d'être figés ici.
 
 #include "framework.h"
-#include "../hal/inflate.h"
+#include "hal/inflate.h"
 
 #include <cstring>
 #include <memory>

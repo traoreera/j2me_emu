@@ -7,7 +7,7 @@
 // "ça ne plante pas".
 
 #include "framework.h"
-#include "../hal/png.h"
+#include "hal/png.h"
 
 #include <cstdint>
 #include <vector>

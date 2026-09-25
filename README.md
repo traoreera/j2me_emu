@@ -61,28 +61,28 @@ Le chemin de données principal est volontairement simple : le JAR reste sur dis
 
 | Chemin | Rôle |
 |---|---|
-| `main.cpp` | Démarrage, configuration, chargement du MIDlet, boucle de trame et dump PPM |
-| `hal/file.*` | Accès fichier abstrait, implémenté par `FILE*` sur PC |
-| `hal/jar_reader.*` | Lecture ZIP/JAR et extraction dans des buffers fournis par l’appelant |
-| `hal/inflate.*` | Décodeur DEFLATE RFC 1951 autonome |
-| `hal/png.*` | Décodeur PNG minimal, dont les passes Adam7 |
-| `hal/display.*` | Fenêtre SDL2, texture RGB565 et framebuffer |
-| `hal/input.*` | Clavier et pointeur SDL2 vers les masques J2ME |
-| `vm/class_file.*` | Lecture du format `.class` et des attributs `Code` |
-| `vm/runtime.*` | Objets, tableaux, classes, champs, méthodes et allocateur bump |
-| `vm/interpreter.*` | Exécution du bytecode, branches, exceptions natives et cache de résolution |
-| `vm/native.*`, `vm/natives.cpp` | Registre natives, classes CLDC, collections, `PrintStream`, RMS et ordonnanceur de fibres |
-| `vm/midp.h`, `vm/midp_internal.h` | API publique et état partagé de la couche MIDP |
-| `vm/midp_natives.cpp` | Enregistrement des classes natives, événements et pompage par trame |
-| `vm/midp_core.cpp` | Utilitaires et état commun MIDP |
-| `vm/midp_graphics.cpp` | Canvas, GameCanvas, Image, Graphics, Font et rendu |
-| `vm/midp_game.cpp` | Layer, Sprite, TiledLayer et LayerManager |
-| `vm/midp_ui.cpp` | Display, MIDlet, Canvas, Form, List et Command |
-| `vm/midp_io.cpp` | Streams, ressources du JAR et Timer |
-| `vm/midp_media.cpp` | Player, WAV, MIDI, ToneSequence et événements audio |
-| `kernel/kernel.*` | Registre de pilotes et horloge monotone |
-| `kernel/drivers/audio/` | Mélangeur audio et implémentations SDL/stub |
-| `kernel/drivers/{display,input,storage,timer}/` | Interfaces de pilotes, pour l’instant uniquement des en-têtes |
+| `src/app/main.cpp` | Démarrage, configuration, chargement du MIDlet, boucle de trame et dump PPM |
+| `src/hal/file.*` | Accès fichier abstrait, implémenté par `FILE*` sur PC |
+| `src/hal/jar_reader.*` | Lecture ZIP/JAR et extraction dans des buffers fournis par l’appelant |
+| `src/hal/inflate.*` | Décodeur DEFLATE RFC 1951 autonome |
+| `src/hal/png.*` | Décodeur PNG minimal, dont les passes Adam7 |
+| `src/hal/display.*` | Fenêtre SDL2, texture RGB565 et framebuffer |
+| `src/hal/input.*` | Clavier et pointeur SDL2 vers les masques J2ME |
+| `src/core/class_file.*` | Lecture du format `.class` et des attributs `Code` |
+| `src/core/runtime.*` | Objets, tableaux, classes, champs, méthodes et allocateur bump |
+| `src/core/interpreter.*` | Exécution du bytecode, branches, exceptions natives et cache de résolution |
+| `src/core/native.*`, `src/cldc/natives.cpp` | Registre natives, classes CLDC, collections, `PrintStream`, RMS et ordonnanceur de fibres |
+| `src/midp/midp.h`, `src/midp/midp_internal.h` | API publique et état partagé de la couche MIDP |
+| `src/midp/midp_natives.cpp` | Enregistrement des classes natives, événements et pompage par trame |
+| `src/midp/midp_core.cpp` | Utilitaires et état commun MIDP |
+| `src/midp/midp_graphics.cpp` | Canvas, GameCanvas, Image, Graphics, Font et rendu |
+| `src/midp/midp_game.cpp` | Layer, Sprite, TiledLayer et LayerManager |
+| `src/midp/midp_ui.cpp` | Display, MIDlet, Canvas, Form, List et Command |
+| `src/midp/midp_io.cpp` | Streams, ressources du JAR et Timer |
+| `src/midp/midp_media.cpp` | Player, WAV, MIDI, ToneSequence et événements audio |
+| `src/kernel/kernel.*` | Registre de pilotes et horloge monotone |
+| `src/kernel/audio/` | Mélangeur audio et implémentations SDL/stub |
+| `src/kernel/drivers/{display,input,storage,timer}/` | Interfaces de pilotes, pour l’instant uniquement des en-têtes |
 | `CMakeLists.txt` | Cibles `j2me_emu` et `j2me_tests` |
 | `tests/` | Micro-framework et tests des couches logiques |
 | `games/` | MIDlets utilisés pour les essais manuels |
@@ -107,17 +107,13 @@ Cette commande produit notamment `build/j2me_emu` et `build/j2me_tests`.
 ### Compilation directe
 
 ```bash
-g++ -std=c++17 -O2 -I. -Ihal -Ivm -DJAR_READER_INDEX_IN_RAM \
-    main.cpp hal/jar_reader.cpp hal/inflate.cpp hal/file.cpp \
-    hal/display.cpp hal/input.cpp hal/png.cpp \
-    vm/class_file.cpp vm/interpreter.cpp vm/runtime.cpp \
-    vm/natives.cpp vm/midp_*.cpp \
-    kernel/kernel.cpp kernel/drivers/audio/audio.cpp \
-    kernel/drivers/audio/sdl_audio.cpp kernel/drivers/audio/stub_audio.cpp \
+g++ -std=c++17 -O2 -Isrc -DJAR_READER_INDEX_IN_RAM \
+    src/app/main.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
+    src/midp/*.cpp src/kernel/kernel.cpp src/kernel/audio/*.cpp \
     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 ```
 
-La commande CMake ajoute `-Ikernel` pour reproduire les inclusions de la cible. Pour la compilation directe, les trois racines `-I.`, `-Ihal` et `-Ivm` suffisent avec les includes actuels ; `-Ikernel` reste utile pour conserver la configuration du projet.
+Une seule racine d’include : `-Isrc` (includes écrits `"hal/file.h"`, `"core/runtime.h"`, `"midp/midp_internal.h"`). `tools/build.sh [sortie]` encapsule cette commande.
 
 ## Exécution et commandes
 
@@ -261,20 +257,20 @@ Une valeur `JME_FRAME_TIME >= 1000` est considérée comme une valeur en microse
 
 ### Lecture JAR et inflation
 
-`hal/jar_reader.*` localise l’EOCD, lit le répertoire central et localise les entrées sans charger le JAR entier en mémoire. Deux modes sont disponibles :
+`src/hal/jar_reader.*` localise l’EOCD, lit le répertoire central et localise les entrées sans charger le JAR entier en mémoire. Deux modes sont disponibles :
 
 - sans `JAR_READER_INDEX_IN_RAM`, le répertoire central est parcouru séquentiellement ;
 - avec `JAR_READER_INDEX_IN_RAM`, un index RAM accélère les recherches répétées sur PC.
 
 L’extraction écrit dans un buffer fourni par l’appelant. Les méthodes ZIP `Stored` et `Deflate` sont gérées. ZIP64, les entrées chiffrées, le repli de lignes du manifeste et la vérification CRC ne sont pas pris en charge.
 
-`hal/inflate.*` décode RFC 1951 bit à bit, sans bibliothèque zlib et sans fenêtre glissante séparée. La sortie déjà décodée sert de fenêtre aux références arrière DEFLATE. Le choix réduit la mémoire et la complexité, mais est plus lent qu’un décodeur avec table de Huffman.
+`src/hal/inflate.*` décode RFC 1951 bit à bit, sans bibliothèque zlib et sans fenêtre glissante séparée. La sortie déjà décodée sert de fenêtre aux références arrière DEFLATE. Le choix réduit la mémoire et la complexité, mais est plus lent qu’un décodeur avec table de Huffman.
 
 ### Format `.class` et classes
 
-`vm/class_file.*` lit le pool de constantes, les interfaces, les champs, les méthodes et l’attribut `Code`. Le parseur accepte les versions jusqu’à Java 8 (`major <= 52`), mais cette limite de version ne signifie pas que tous les opcodes modernes sont exécutés.
+`src/core/class_file.*` lit le pool de constantes, les interfaces, les champs, les méthodes et l’attribut `Code`. Le parseur accepte les versions jusqu’à Java 8 (`major <= 52`), mais cette limite de version ne signifie pas que tous les opcodes modernes sont exécutés.
 
-`vm/runtime.*` :
+`src/core/runtime.*` :
 
 - charge les classes du JAR à la demande ;
 - enregistre les classes natives synthétiques ;
@@ -286,7 +282,7 @@ Le heap est un bump allocator sans GC. Les objets ne sont pas déplacés. Les se
 
 ### Interpréteur
 
-`vm/interpreter.*` exécute les opcodes, les branches, les appels, les champs statiques et d’instance, les tableaux, `new`, les casts, les exceptions et les attributs `LineNumberTable`/`LocalVariableTable` lorsqu’ils sont utiles au diagnostic.
+`src/core/interpreter.*` exécute les opcodes, les branches, les appels, les champs statiques et d’instance, les tableaux, `new`, les casts, les exceptions et les attributs `LineNumberTable`/`LocalVariableTable` lorsqu’ils sont utiles au diagnostic.
 
 Chaque trame d’appel réserve :
 
@@ -320,7 +316,7 @@ Ce mécanisme permet de conserver `pc`, les locales et la pile C++ lors d’un `
 
 ### Rendu
 
-`vm/midp_graphics.cpp` fournit :
+`src/midp/midp_graphics.cpp` fournit :
 
 - `Image` mutable ou immuable ;
 - images RGB, images PNG chargées depuis le JAR ;
@@ -332,7 +328,7 @@ L’implémentation SDL2 transforme le framebuffer RGB565 en texture de flux. La
 
 ### Audio
 
-`kernel/drivers/audio/audio.cpp` mélange huit voix :
+`src/kernel/audio/audio.cpp` mélange huit voix :
 
 - PCM ;
 - tonalité sinusoïdale ;
@@ -340,7 +336,7 @@ L’implémentation SDL2 transforme le framebuffer RGB565 en texture de flux. La
 
 L’implémentation SDL produit du son mono 16 bits à 22 050 Hz. L’implémentation stub conserve les mêmes états d’avancement et permet l’exécution sans fenêtre.
 
-`vm/midp_media.cpp` lit les InputStream des Player, prend en charge les WAV PCM, certains MIDI et `audio/x-tone-seq`, rééchantillonne vers 22 050 Hz puis alimente les voix du noyau. Les données audio volumineuses restent dans des `std::vector` et ne sont pas intégrées au heap JVM.
+`src/midp/midp_media.cpp` lit les InputStream des Player, prend en charge les WAV PCM, certains MIDI et `audio/x-tone-seq`, rééchantillonne vers 22 050 Hz puis alimente les voix du noyau. Les données audio volumineuses restent dans des `std::vector` et ne sont pas intégrées au heap JVM.
 
 ### RecordStore
 
@@ -413,10 +409,10 @@ La configuration CMake principale demande SDL2 avant de définir la cible de tes
 ### Sans SDL2
 
 ```bash
-g++ -std=c++17 -O0 -g -I. -Ihal -Ivm \
+g++ -std=c++17 -O0 -g -Isrc \
     tests/test_*.cpp \
-    hal/inflate.cpp hal/jar_reader.cpp hal/file.cpp hal/png.cpp \
-    vm/class_file.cpp vm/runtime.cpp vm/interpreter.cpp vm/natives.cpp \
+    src/hal/inflate.cpp src/hal/jar_reader.cpp src/hal/file.cpp src/hal/png.cpp \
+    src/core/class_file.cpp src/core/runtime.cpp src/core/interpreter.cpp src/cldc/natives.cpp \
     -o build/j2me_tests
 ./build/j2me_tests
 ```
@@ -425,7 +421,7 @@ g++ -std=c++17 -O0 -g -I. -Ihal -Ivm \
 
 Il n’existe pas encore de tests d’intégration automatisés pour :
 
-- `vm/midp_*.cpp` ;
+- `src/midp/midp_*.cpp` ;
 - le ordonnanceur de fibres ;
 - SDL display/input/audio ;
 - le cycle MIDlet complet ;
@@ -448,12 +444,12 @@ Le résultat attendu contient l’identification du MIDlet, puis `Emulation term
 | Buffers de sortie fournis par l’appelant | Valide pour `JarReader` et `Inflate` |
 | Heap stable, sans déplacement d’objets | Valide, mais le heap peut croître sans plafond |
 | Rendu RGB565 déterministe | Valide sur PC |
-| Noyau MCU portable | Valide pour `kernel/kernel.*` et le mélangeur audio |
+| Noyau MCU portable | Valide pour `src/kernel/kernel.*` et le mélangeur audio |
 | Aucun STL ou `new` dans les chemins chauds | Partiellement vrai, mais faux comme invariant global |
-| `hal/file.cpp` seul dépendant de la libc | Faux : `main.cpp`, le RMS, les médias et les diagnostics utilisent aussi la libc |
+| `src/hal/file.cpp` seul dépendant de la libc | Faux : `src/app/main.cpp`, le RMS, les médias et les diagnostics utilisent aussi la libc |
 | Budget total RP2040 de 264 Ko | Non atteint |
 
-Les commentaires historiques « aucun new dans les chemins chauds » et « seul `hal/file.cpp` dépend de la libc » ne doivent pas être utilisés comme garanties. Plusieurs chemins d’initialisation et certains chemins média utilisent `new`, `std::vector`, `std::string`, `FILE*` ou `system()`.
+Les commentaires historiques « aucun new dans les chemins chauds » et « seul `src/hal/file.cpp` dépend de la libc » ne doivent pas être utilisés comme garanties. Plusieurs chemins d’initialisation et certains chemins média utilisent `new`, `std::vector`, `std::string`, `FILE*` ou `system()`.
 
 ## Points critiques
 
@@ -462,49 +458,49 @@ La priorité **P0** bloque la sécurité d’exécution ou le portage RP2040. **
 ### P0
 
 1. **Le bytecode n’est pas validé avant exécution.**<br>
-   `vm/interpreter.cpp:21-24` lit les opérandes sans vérifier la taille restante, et les cibles de branches ne sont pas bornées. La taille des trames est plafonnée par l’arène de 128 KiB (`vm/interpreter.cpp:195-205`, `frameAlloc()` échoue au-delà), mais cela ne protège ni les lectures de bytecode hors buffer, ni les indices de variables, de tableaux ou du pool de constantes. Un `.class` malveillant peut donc provoquer une lecture ou une écriture hors buffer.
+   `src/core/interpreter.cpp:21-24` lit les opérandes sans vérifier la taille restante, et les cibles de branches ne sont pas bornées. La taille des trames est plafonnée par l’arène de 128 KiB (`src/core/interpreter.cpp:195-205`, `frameAlloc()` échoue au-delà), mais cela ne protège ni les lectures de bytecode hors buffer, ni les indices de variables, de tableaux ou du pool de constantes. Un `.class` malveillant peut donc provoquer une lecture ou une écriture hors buffer.
 
 2. **Les dimensions d’image et d’écran ont des multiplications non contrôlées.**<br>
-   `vm/midp_graphics.cpp:795-823` calcule `w * h` dans un `int32_t` après seulement avoir ramené les dimensions négatives ou nulles à 1, sans plafond supérieur. `hal/display.cpp:35` alloue directement `width * height`. `JME_WIDTH` et `JME_HEIGHT` ne sont pas validés au démarrage. Des dimensions importantes, négatives ou nulles peuvent provoquer un débordement lors du calcul, une allocation invalide ou un framebuffer incohérent.
+   `src/midp/midp_graphics.cpp:795-823` calcule `w * h` dans un `int32_t` après seulement avoir ramené les dimensions négatives ou nulles à 1, sans plafond supérieur. `src/hal/display.cpp:35` alloue directement `width * height`. `JME_WIDTH` et `JME_HEIGHT` ne sont pas validés au démarrage. Des dimensions importantes, négatives ou nulles peuvent provoquer un débordement lors du calcul, une allocation invalide ou un framebuffer incohérent.
 
 3. **`RecordStore` construit une commande shell sans échappement.**<br>
-   `vm/natives.cpp:851-858` construit `mkdir -p '<JME_RMSDIR>'` puis appelle `system()`. Un chemin contenant une apostrophe permet d’injecter des commandes. Le RMS doit passer par une primitive de répertoire du HAL, par exemple `hal_file_mkdir`.
+   `src/cldc/natives.cpp:851-858` construit `mkdir -p '<JME_RMSDIR>'` puis appelle `system()`. Un chemin contenant une apostrophe permet d’injecter des commandes. Le RMS doit passer par une primitive de répertoire du HAL, par exemple `hal_file_mkdir`.
 
 4. **Le portage RP2040 dépasse déjà le budget avant le chargement des ressources.**<br>
-   Le buffer de classe statique vaut 1 MiB (`vm/runtime.cpp:352`), le heap initial vaut 512 KiB, l’arène de trames d’appel vaut 128 KiB et chaque fibre vaut 256 KiB. Ces allocations seules sont incompatibles avec les 264 Ko de RAM du RP2040.
+   Le buffer de classe statique vaut 1 MiB (`src/core/runtime.cpp:352`), le heap initial vaut 512 KiB, l’arène de trames d’appel vaut 128 KiB et chaque fibre vaut 256 KiB. Ces allocations seules sont incompatibles avec les 264 Ko de RAM du RP2040.
 
 5. **Le parseur WAV ne valide pas complètement les chunks.**<br>
-   `vm/midp_media.cpp:209-230` peut lire le header `fmt ` sur `off + 24` alors que le chunk tronqué ne contient que huit octets disponibles. Il accepte également un chunk `data` dont l’offset dépasse la taille du buffer. Ces cas peuvent provoquer une lecture hors buffer ou un calcul de plage invalide.
+   `src/midp/midp_media.cpp:209-230` peut lire le header `fmt ` sur `off + 24` alors que le chunk tronqué ne contient que huit octets disponibles. Il accepte également un chunk `data` dont l’offset dépasse la taille du buffer. Ces cas peuvent provoquer une lecture hors buffer ou un calcul de plage invalide.
 
 ### P1
 
 1. **Le parseur de classes lit certains comptes avant de vérifier leur en-tête.**<br>
-   `vm/class_file.cpp:255`, `vm/class_file.cpp:264`, `vm/class_file.cpp:289` et `vm/class_file.cpp:324` lisent un `uint16_t` sans contrôle préalable de `off + 2 <= len`. Un fichier tronqué peut provoquer un accès hors buffer.
+   `src/core/class_file.cpp:255`, `src/core/class_file.cpp:264`, `src/core/class_file.cpp:289` et `src/core/class_file.cpp:324` lisent un `uint16_t` sans contrôle préalable de `off + 2 <= len`. Un fichier tronqué peut provoquer un accès hors buffer.
 
 2. **Le validateur de bytecode est absent.**<br>
-   Même si tous les accès mémoire de l’interpréteur étaient bornés, le code ne vérifie ni les types, ni les cibles de branches, ni les poignées du pool de constantes, ni les tables d’exceptions. Les classes doivent être validées structurellement puis vérifiées par méthode avant `Runtime::buildFromClassFile()` (`vm/runtime.cpp:246-332`).
+   Même si tous les accès mémoire de l’interpréteur étaient bornés, le code ne vérifie ni les types, ni les cibles de branches, ni les poignées du pool de constantes, ni les tables d’exceptions. Les classes doivent être validées structurellement puis vérifiées par méthode avant `Runtime::buildFromClassFile()` (`src/core/runtime.cpp:246-332`).
 
 3. **DEFLATE n’est pas assez strict pour des données non fiables.**<br>
-   `hal/inflate.cpp:11-23` représente la fin de flux par des octets nuls et `hal/inflate.cpp:91-109` ne teste l’EOF qu’après un décodage réussi. Les tables Huffman ne sont pas validées contre les arbres sur/sous-souscrits. Un flux tronqué peut être accepté ou mal interprété.
+   `src/hal/inflate.cpp:11-23` représente la fin de flux par des octets nuls et `src/hal/inflate.cpp:91-109` ne teste l’EOF qu’après un décodage réussi. Les tables Huffman ne sont pas validées contre les arbres sur/sous-souscrits. Un flux tronqué peut être accepté ou mal interprété.
 
 4. **La pile des fibres n’est pas protégée contre les dépassements.**<br>
-   `vm/natives.cpp:169-178` alloue 256 KiB avec `std::vector<char>` et lance du bytecode sur cette pile sans garde ni détection de dépassement. Une récursion profonde peut corrompre silencieusement la mémoire.
+   `src/cldc/natives.cpp:169-178` alloue 256 KiB avec `std::vector<char>` et lance du bytecode sur cette pile sans garde ni détection de dépassement. Une récursion profonde peut corrompre silencieusement la mémoire.
 
 5. **Le heap n’a pas de plafond strict.**<br>
-   `vm/runtime.cpp:45-90` crée automatiquement de nouveaux segments. `JME_HEAP` ne fixe que la taille initiale. Les structures natives, les images et les caches peuvent donc croître sans limite définie par la plateforme.
+   `src/core/runtime.cpp:45-90` crée automatiquement de nouveaux segments. `JME_HEAP` ne fixe que la taille initiale. Les structures natives, les images et les caches peuvent donc croître sans limite définie par la plateforme.
 
 6. **Un test de ressource PNG de débogage modifie le jeu au démarrage.**<br>
    `main.cpp:178-210` tente de charger `3`, `14` ou `dataIGP`, puis écrit du blanc dans le framebuffer. Le code suppose un framebuffer d’au moins 240×320. Ce test doit être déplacé dans `tests/` ou exécuté uniquement sous un drapeau explicite.
 
 7. **La durée de vie des objets Player audio doit être durcie.**<br>
-   `vm/midp_media.cpp:113-159` associe des `std::vector` à un emplacement fixe et conserve leur adresse dans le noyau. La fermeture arrête la voix, mais aucun `finalize` n’est disponible et les objets Player oubliés conservent leur emplacement. Les buffers audio doivent avoir une durée de vie explicitement garantie et testée.
+   `src/midp/midp_media.cpp:113-159` associe des `std::vector` à un emplacement fixe et conserve leur adresse dans le noyau. La fermeture arrête la voix, mais aucun `finalize` n’est disponible et les objets Player oubliés conservent leur emplacement. Les buffers audio doivent avoir une durée de vie explicitement garantie et testée.
 
 ### P2
 
-- `Font.stringWidth(null)` alloue une chaîne vide avec `new` sans la libérer (`vm/midp_graphics.cpp:730-733`).
-- `DirectGraphics.drawImage` est essentiellement un stub (`vm/midp_graphics.cpp:1194-1210`).
-- Les conversions flottantes de `vm/interpreter.cpp:824-829` ne respectent pas la représentation et la conversion IEEE attendues.
-- `kernelBoot()` ignore les erreurs d’initialisation des pilotes (`kernel/kernel.cpp:54-64`).
+- `Font.stringWidth(null)` alloue une chaîne vide avec `new` sans la libérer (`src/midp/midp_graphics.cpp:730-733`).
+- `DirectGraphics.drawImage` est essentiellement un stub (`src/midp/midp_graphics.cpp:1194-1210`).
+- Les conversions flottantes de `src/core/interpreter.cpp:824-829` ne respectent pas la représentation et la conversion IEEE attendues.
+- `kernelBoot()` ignore les erreurs d’initialisation des pilotes (`src/kernel/kernel.cpp:54-64`).
 - Plusieurs chemins d’échec d’initialisation ne ferment pas tous les sous-systèmes déjà ouverts.
 - Les diagnostics de compteurs d’écriture ne distinguent pas toujours le framebuffer réel du `GameCanvas`.
 - La documentation historique est en retard sur le code actuel, notamment pour les sources MIDP, les variables, les tests et le budget mémoire.
@@ -523,7 +519,7 @@ La priorité **P0** bloque la sécurité d’exécution ou le portage RP2040. **
 ### 2. Remplacer la persistance par le HAL
 
 - ajouter une primitive `hal_file_mkdir` ;
-- supprimer `system()` de `vm/natives.cpp` ;
+- supprimer `system()` de `src/cldc/natives.cpp` ;
 - faire passer la lecture et l’écriture RMS par `hal::file_*` ;
 - tester les chemins RMS contenant espaces, apostrophes, caractères Unicode et profondeur excessive.
 
@@ -553,6 +549,6 @@ La priorité **P0** bloque la sécurité d’exécution ou le portage RP2040. **
 
 ## Documentation complémentaire
 
-- `AGENTS.md` contient les règles de build et d’exécution utilisées par l’outillage.
+- `docs/AGENTS.md` contient les règles de build et d’exécution utilisées par l’outillage.
 - `CLAUDE.md` contient des détails historiques sur l’architecture, mais plusieurs contraintes doivent être mises à jour avec la section « Points critiques ».
-- `INTEGRATION.md` décrit l’intention initiale du portage RP2040 et le mode de lecture JAR sans index RAM.
+- `docs/INTEGRATION.md` décrit l’intention initiale du portage RP2040 et le mode de lecture JAR sans index RAM.

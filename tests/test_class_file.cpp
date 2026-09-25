@@ -6,7 +6,7 @@
 // statique triviale avec un attribut Code).
 
 #include "framework.h"
-#include "../vm/class_file.h"
+#include "core/class_file.h"
 
 #include <cstring>
 #include <vector>

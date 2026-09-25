@@ -8,36 +8,31 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 
 add_executable(j2me_emu
-    main.cpp
-    hal/jar_reader.cpp
-    hal/inflate.cpp
-    hal/file.cpp
-    hal/display.cpp
-    hal/input.cpp
-    hal/png.cpp
-    vm/class_file.cpp
-    vm/interpreter.cpp
-    vm/runtime.cpp
-    vm/natives.cpp
-    vm/midp_natives.cpp
-    vm/midp_core.cpp
-    vm/midp_graphics.cpp
-    vm/midp_game.cpp
-    vm/midp_ui.cpp
-    vm/midp_io.cpp
-    vm/midp_media.cpp
-    kernel/kernel.cpp
-    kernel/drivers/audio/audio.cpp
-    kernel/drivers/audio/stub_audio.cpp
-    kernel/drivers/audio/sdl_audio.cpp
+    src/app/main.cpp
+    src/hal/jar_reader.cpp
+    src/hal/inflate.cpp
+    src/hal/file.cpp
+    src/hal/display.cpp
+    src/hal/input.cpp
+    src/hal/png.cpp
+    src/core/class_file.cpp
+    src/core/interpreter.cpp
+    src/core/runtime.cpp
+    src/cldc/natives.cpp
+    src/midp/midp_natives.cpp
+    src/midp/midp_core.cpp
+    src/midp/midp_graphics.cpp
+    src/midp/midp_game.cpp
+    src/midp/midp_ui.cpp
+    src/midp/midp_io.cpp
+    src/midp/midp_media.cpp
+    src/kernel/kernel.cpp
+    src/kernel/audio/audio.cpp
+    src/kernel/audio/stub_audio.cpp
+    src/kernel/audio/sdl_audio.cpp
 )
 
-target_include_directories(j2me_emu PRIVATE
-    .
-    hal
-    vm
-    kernel
-)
+target_include_directories(j2me_emu PRIVATE src)
 
 target_link_libraries(j2me_emu PRIVATE ${SDL2_LIBRARIES})
 target_compile_options(j2me_emu PRIVATE ${SDL2_CFLAGS_OTHER})
@@ -46,13 +41,9 @@ target_compile_options(j2me_emu PRIVATE ${SDL2_CFLAGS_OTHER})
 target_compile_definitions(j2me_emu PRIVATE JAR_READER_INDEX_IN_RAM)
 
 # NOTE : la commande de compilation équivalente est :
-# g++ -std=c++17 -O2 -I. -Ihal -Ivm -Ikernel -DJAR_READER_INDEX_IN_RAM \
-#     main.cpp hal/jar_reader.cpp hal/inflate.cpp hal/file.cpp \
-#     hal/display.cpp hal/input.cpp hal/png.cpp \
-#     vm/class_file.cpp vm/interpreter.cpp vm/runtime.cpp \
-#     vm/natives.cpp vm/midp_*.cpp \
-#     kernel/kernel.cpp kernel/drivers/audio/audio.cpp \
-#     kernel/drivers/audio/sdl_audio.cpp kernel/drivers/audio/stub_audio.cpp \
+# g++ -std=c++17 -O2 -Isrc -DJAR_READER_INDEX_IN_RAM \
+#     src/app/main.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
+#     src/midp/*.cpp src/kernel/kernel.cpp src/kernel/audio/*.cpp \
 #     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 
 # ---------------------------------------------------------------------
@@ -72,16 +63,16 @@ add_executable(j2me_tests
     tests/test_interpreter.cpp
     tests/test_jar_reader.cpp
     tests/test_recordstore.cpp
-    hal/inflate.cpp
-    hal/jar_reader.cpp
-    hal/file.cpp
-    hal/png.cpp
-    vm/class_file.cpp
-    vm/runtime.cpp
-    vm/interpreter.cpp
-    vm/natives.cpp
+    src/hal/inflate.cpp
+    src/hal/jar_reader.cpp
+    src/hal/file.cpp
+    src/hal/png.cpp
+    src/core/class_file.cpp
+    src/core/runtime.cpp
+    src/core/interpreter.cpp
+    src/cldc/natives.cpp
 )
-target_include_directories(j2me_tests PRIVATE . hal vm)
+target_include_directories(j2me_tests PRIVATE src)
 add_test(NAME j2me_tests COMMAND j2me_tests)
 
 

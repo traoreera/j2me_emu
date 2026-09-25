@@ -7,7 +7,7 @@
 // des deux methodes (0=stored, 8=deflate).
 
 #include "framework.h"
-#include "../hal/jar_reader.h"
+#include "hal/jar_reader.h"
 
 #include <cstdint>
 #include <cstdio>

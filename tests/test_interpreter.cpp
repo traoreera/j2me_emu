@@ -14,9 +14,9 @@
 //     d'exceptions (findExceptionHandler), pas un abandon systematique.
 
 #include "framework.h"
-#include "../vm/interpreter.h"
-#include "../vm/runtime.h"
-#include "../vm/class_file.h"
+#include "core/interpreter.h"
+#include "core/runtime.h"
+#include "core/class_file.h"
 
 #include <memory>
 #include <vector>

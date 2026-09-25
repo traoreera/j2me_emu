@@ -6,7 +6,7 @@
 // plusieurs types sur une meme classe).
 
 #include "framework.h"
-#include "../vm/runtime.h"
+#include "core/runtime.h"
 
 using namespace jvm;
 

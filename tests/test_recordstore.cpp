@@ -5,8 +5,8 @@
 // enregistrée à la main sur le Runtime de test.
 
 #include "framework.h"
-#include "../vm/native.h"
-#include "../vm/runtime.h"
+#include "core/native.h"
+#include "core/runtime.h"
 
 #include <cstdio>
 #include <cstdlib>
