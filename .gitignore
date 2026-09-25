@@ -4,6 +4,7 @@ CMakeFiles/
 Testing/
 
 *.cmake
+!cmake/toolchains/*.cmake
 !cmake/toolchains/
 !cmake/toolchains/aarch64-linux-gnu.cmake
 CMakeCache.*
