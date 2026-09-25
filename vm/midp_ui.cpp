@@ -204,14 +204,21 @@ namespace jvm
             static void mid_getAppProperty(NativeContext *ctx)
             {
                 const std::string &key = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : "";
-                std::string val;
+                // Propriété absente : chaîne VIDE (et non null comme le veut la spec
+                // MIDP). Les jeux Gameloft lisent des attributs du .jad (ex. "HAS-BLOOD")
+                // qu'un .jar seul n'a pas, et enchaînent `.equals("yes")` sans test
+                // de null : renvoyer null les fait planter (NPE dès le démarrage d'AC III),
+                // une chaîne vide les fait simplement prendre la branche "non".
+                // `PROP:Nom=valeur` dans <jeu>.conf permet de fournir la vraie valeur.
                 for (const auto &kv : g_appProps)
                     if (kv.first == key)
                     {
-                        val = kv.second;
-                        break;
+                        setRef(ctx, g_rt->heap().newString(kv.second));
+                        return;
                     }
-                setRef(ctx, g_rt->heap().newString(val));
+                if (jvm::jmeDebug())
+                    fprintf(stderr, "[midp] getAppProperty(\"%s\") absent -> \"\"\n", key.c_str());
+                setRef(ctx, g_rt->heap().newString(""));
             }
             static void mid_notifyDestroyed(NativeContext *ctx)
             {

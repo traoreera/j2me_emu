@@ -77,17 +77,8 @@ void input_poll(InputState *out)
     // fenêtre : un clic à (wx,wy) vise le pixel wx*fbW/winW).
     auto toLogical = [](Uint32 windowID, int wx, int wy, int &lx, int &ly)
     {
-        lx = wx; ly = wy;
-        const Framebuffer *fb = display_get_framebuffer();
-        SDL_Window *win = SDL_GetWindowFromID(windowID);
-        if (!fb || !win) return;
-        int ww = 0, wh = 0;
-        SDL_GetWindowSize(win, &ww, &wh);
-        if (ww > 0 && wh > 0)
-        {
-            lx = wx * fb->width / ww;
-            ly = wy * fb->height / wh;
-        }
+        (void)windowID;
+        display_window_to_logical(wx, wy, lx, ly);
     };
     auto pushPointer = [&](int kind, int x, int y)
     {

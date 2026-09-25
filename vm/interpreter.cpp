@@ -529,6 +529,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
         if (idx < 0 || idx >= arr->arrayLen)
         {
+            if (envDebug())
+                fprintf(stderr, "AIOOBE index=%d longueur=%d dans %s.%s%s pc=%d\n", idx, arr->arrayLen,
+                        cls->name.c_str(), m->name.c_str(), m->desc.c_str(), throwPc);
             bool h = raiseJava(rt_->classInfoOfName("java/lang/ArrayIndexOutOfBoundsException"), throwPc);
             if (!h) { okResult = false; done = true; }
             return true;
@@ -548,7 +551,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 // boucle avec un budget neuf pour cette nouvelle trame.
                 yieldFn_();
                 if (envDebug())
-                    fprintf(stderr, "YIELD %s.%s pc=%d op=0x%02x\n", cls->name.c_str(), m->name.c_str(), pc, c[pc]);
+                    fprintf(stderr, "YIELD %s.%s%s pc=%d op=0x%02x\n", cls->name.c_str(), m->name.c_str(), m->desc.c_str(), pc, c[pc]);
                 instrBudget_ = instrBudgetQuota_;
                 continue;
             }
@@ -593,7 +596,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             switch (e->tag)
             {
             case CONSTANT_STRING:
-                pushRef(rt_->heap().newString(cp.getUtf8(e->nameIndex)));
+                pushRef(rt_->heap().internString(cp.getUtf8(e->nameIndex)));
                 break;
             case CONSTANT_INTEGER:
                 pushInt(e->intVal);

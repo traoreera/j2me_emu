@@ -236,6 +236,31 @@ namespace jvm
             if (!cur || cur->kind != ObjKind::Instance)
                 return;
 
+            // Premier paint() : livré AVANT que les threads du jeu ne progressent,
+            // comme sur un vrai appareil où Display.setCurrent() déclenche un paint
+            // immédiat, bien avant que le thread de chargement ait avancé. On
+            // faisait tourner les fibres d'abord : elles avaient déjà attaqué
+            // leur chargement (~200k instructions, état de jeu déjà passé à
+            // "chargement" mais ses tableaux pas encore alloués) quand ce premier
+            // paint arrivait -> NPE dans paint() de Gangstar Rio. Or ce jeu se
+            // protège avec un drapeau (`cd = true` en entrée de paint, remis à false
+            // en sortie) : l'exception laissait le drapeau bloqué et TOUS les paint()
+            // suivants sortaient immédiatement -- écran figé sur le premier dessin
+            // pour toujours, alors que le jeu chargeait et tournait normalement.
+            static bool initialPaintDone = false;
+            if (!initialPaintDone && g_paintRequested &&
+                isSubclassOf(cur, "javax/microedition/lcdui/Canvas"))
+            {
+                initialPaintDone = true;
+                if (jvm::jmeDebug())
+                    fprintf(stderr, "TICK paint initial sur %s\n", cur->cls ? cur->cls->name.c_str() : "?");
+                Value pargs[2] = {Value::fromRef(cur), Value::fromRef(screenGraphics())};
+                Value pres;
+                g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, pargs, 2, pres);
+                g_paintRequested = false;
+                hal::display_present(hal::display_get_framebuffer());
+            }
+
             // Chaque thread tourne dans sa propre fibre (ucontext, cf. jme_threadResume
             // dans natives.cpp) : Thread.sleep()/yield(), ou l'épuisement du budget
             // d'instructions ci-dessous, suspend RÉELLEMENT son exécution (pc,
@@ -466,7 +491,7 @@ namespace jvm
                      {{"<init>", "()V"}, {"getClass", "()Ljava/lang/Class;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"}, {"wait", "()V"}, {"wait", "(I)V"}, {"wait", "(J)V"}, {"notify", "()V"}, {"notifyAll", "()V"}},
                      none);
             regClass(rt, "java/lang/String", "java/lang/Object",
-                     {{"<init>", "()V"}, {"<init>", "(Ljava/lang/StringBuffer;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "([BLjava/lang/String;)V"}, {"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"<init>", "([CII)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(Ljava/lang/String;I)I"}, {"indexOf", "(I)I"}, {"indexOf", "(II)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"getChars", "(II[CI)V"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}, {"valueOf", "(I)Ljava/lang/String;"}},
+                     {{"<init>", "()V"}, {"<init>", "(Ljava/lang/StringBuffer;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "([BLjava/lang/String;)V"}, {"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"<init>", "([BIILjava/lang/String;)V"}, {"<init>", "([CII)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(Ljava/lang/String;I)I"}, {"indexOf", "(I)I"}, {"indexOf", "(II)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"getChars", "(II[CI)V"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}, {"valueOf", "(I)Ljava/lang/String;"}, {"intern", "()Ljava/lang/String;"}},
                      none);
             regClass(rt, "java/lang/Math", "java/lang/Object",
                      {{"abs", "(I)I"}, {"abs", "(J)J"}, {"min", "(II)I"}, {"min", "(JJ)J"}, {"max", "(II)I"}, {"max", "(JJ)J"}, {"sqrt", "(D)D"}, {"floor", "(D)D"}, {"ceil", "(D)D"}, {"round", "(D)J"}, {"pow", "(DD)D"}, {"random", "()D"}},

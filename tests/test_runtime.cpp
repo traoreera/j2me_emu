@@ -98,6 +98,34 @@ TEST(heap_auto_grows_beyond_initial_segment)
     ASSERT_TRUE(grew);
 }
 
+TEST(heap_max_caps_growth_and_reports_oom)
+{
+    Heap heap(256, 1024);
+    ASSERT_EQ((size_t)1024, heap.maximumCapacity());
+    int ok = 0;
+    Obj *o = nullptr;
+    for (int i = 0; i < 1000; i++)
+    {
+        o = heap.allocObj(ObjKind::Instance, 4);
+        if (!o) break;
+        ok++;
+    }
+    ASSERT_TRUE(o == nullptr);
+    ASSERT_TRUE(heap.outOfMemory());
+    ASSERT_TRUE(ok > 0);
+    ASSERT_TRUE(heap.capacity() <= 1024);
+    heap.reset();
+    ASSERT_EQ((size_t)256, heap.capacity());
+    ASSERT_FALSE(heap.outOfMemory());
+    ASSERT_TRUE(heap.allocObj(ObjKind::Instance, 4) != nullptr);
+}
+
+TEST(heap_max_below_initial_is_raised_to_initial)
+{
+    Heap heap(512, 100);
+    ASSERT_EQ((size_t)512, heap.maximumCapacity());
+}
+
 // ---------------------------------------------------------------------
 // ClassInfo::findField -- desambiguisation par descripteur
 // ---------------------------------------------------------------------

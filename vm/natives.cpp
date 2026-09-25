@@ -343,6 +343,12 @@ void n_String_initCharsRange(NativeContext *ctx)
     self->kind = ObjKind::String;
     self->str.clear();
     self->str.reserve(static_cast<size_t>(len));
+    if (jvm::jmeDebug() && len > 0 && len < 64)
+    {
+        fprintf(stderr, "STRCHARS len=%d:", len);
+        for (int i = 0; i < len; i++) fprintf(stderr, " %x", (unsigned)(data->cells[off + i].u & 0xFFFF));
+        fprintf(stderr, "\n");
+    }
     for (int i = 0; i < len; i++)
         self->str += static_cast<char>(data->cells[off + i].u & 0xFF);
 }
@@ -581,6 +587,11 @@ void n_Integer_hashCode(NativeContext *ctx)
 void n_Integer_toString(NativeContext *ctx)
 {
     setRefResult(ctx, ctx->rt->heap().newString(itos(ctx->thisObj ? ctx->thisObj->cells[0].i : 0)));
+}
+void n_String_intern(NativeContext *ctx)
+{
+    Obj *o = ctx->thisObj;
+    setRefResult(ctx, (o && o->kind == ObjKind::String) ? ctx->rt->heap().internString(o->str) : o);
 }
 void n_Integer_toStringS(NativeContext *ctx)
 {
@@ -1454,6 +1465,8 @@ void n_System_getProperty(NativeContext *ctx)
     else if (key == "microedition.locale") val = "en-US";
     else if (key == "microedition.encoding") val = "ISO-8859-1";
     else val = "";
+    if (jvm::jmeDebug())
+        fprintf(stderr, "[cldc] System.getProperty(\"%s\") -> \"%s\"\n", key.c_str(), val.c_str());
     setRefResult(ctx, ctx->rt->heap().newString(val));
 }
 void n_System_gc(NativeContext *) {}
@@ -1566,6 +1579,7 @@ void initNatives()
     registerNative("java/lang/String.<init>:([BLjava/lang/String;)V", n_String_initBytes);
     registerNative("java/lang/String.<init>:([B)V", n_String_initBytes);
     registerNative("java/lang/String.<init>:([BII)V", n_String_initBytesRange);
+    registerNative("java/lang/String.<init>:([BIILjava/lang/String;)V", n_String_initBytesRange);
     registerNative("java/lang/String.<init>:([CII)V", n_String_initCharsRange);
     registerNative("java/lang/String.length:()I", n_String_length);
     registerNative("java/lang/String.charAt:(I)C", n_String_charAt);
@@ -1590,6 +1604,7 @@ void initNatives()
     // d'argument (args[0] = l'entier) qu'Integer.toString(int) -- même
     // implémentation réutilisée telle quelle.
     registerNative("java/lang/String.valueOf:(I)Ljava/lang/String;", n_Integer_toStringS);
+    registerNative("java/lang/String.intern:()Ljava/lang/String;", n_String_intern);
 
     // java.lang.Math
     registerNative("java/lang/Math.abs:(I)I", n_Math_abs);

@@ -3,6 +3,7 @@
 // et exécute son bytecode via l'interpréteur. Le rendu se fait par le HAL
 // display (SDL2 côté PC, écran RGB565 côté RP2040).
 
+#include <vector>
 #include "hal/jar_reader.h"
 #include "hal/display.h"
 #include "hal/input.h"
@@ -45,9 +46,55 @@ static const kernel::audio::Device *pickAudioDevice()
     return &kernel::audio::kSdlDevice;
 }
 
+static_assert(sizeof(void *) == 8, "build 64 bits requis (Pi Zero 2 W : AArch64)");
+
 int main(int argc, char **argv)
 {
     const char *jarPath = (argc > 1) ? argv[1] : "games/assasin.jar";
+
+    std::vector<std::pair<std::string, std::string>> confProps; // lignes `PROP:Nom=valeur`
+    // Profil par jeu : "<jeu>.conf" à côté du .jar, une variable par ligne au
+    // format des variables d'environnement (`JME_WIDTH=480`, `JME_HEIGHT=800`,
+    // `JME_FRAME_TIME=16`...), `#` = commentaire. Évite de retaper la résolution
+    // exigée par chaque MIDlet à chaque lancement. Une variable DÉJÀ définie dans
+    // l'environnement l'emporte (surcharge ponctuelle en ligne de commande).
+    {
+        std::string confPath(jarPath);
+        if (confPath.size() > 4 && confPath.compare(confPath.size() - 4, 4, ".jar") == 0)
+            confPath.resize(confPath.size() - 4);
+        confPath += ".conf";
+        if (FILE *cf = fopen(confPath.c_str(), "r"))
+        {
+            char line[256];
+            while (fgets(line, sizeof(line), cf))
+            {
+                std::string l(line);
+                while (!l.empty() && (l.back() == '\n' || l.back() == '\r' || l.back() == ' ' || l.back() == '\t'))
+                    l.pop_back();
+                size_t b = l.find_first_not_of(" \t");
+                if (b == std::string::npos || l[b] == '#')
+                    continue;
+                l = l.substr(b);
+                size_t eq = l.find('=');
+                if (eq == std::string::npos || eq == 0)
+                    continue;
+                std::string k = l.substr(0, eq), v = l.substr(eq + 1);
+                while (!k.empty() && (k.back() == ' ' || k.back() == '\t'))
+                    k.pop_back();
+                if (k.compare(0, 5, "PROP:") == 0)
+                {
+                    // attribut de .jad : lisible via MIDlet.getAppProperty(nom)
+                    confProps.emplace_back(k.substr(5), v);
+                    continue;
+                }
+                if (k.compare(0, 4, "JME_") != 0 && k != "SDL_VIDEODRIVER")
+                    continue; // on ne touche qu'aux variables de l'émulateur
+                setenv(k.c_str(), v.c_str(), 0); // 0 = ne pas écraser l'environnement
+            }
+            fclose(cf);
+            fprintf(stderr, "[conf] profil chargé : %s\n", confPath.c_str());
+        }
+    }
 
     jme::JarReader jar;
     if (!jar.open(jarPath))
@@ -104,7 +151,21 @@ int main(int argc, char **argv)
     size_t heapSize = jvm::Heap::kDefaultPoolSize;
     if (const char *hs = getenv("JME_HEAP"))
         heapSize = static_cast<size_t>(atol(hs)) * 1024;
-    jvm::Runtime rt(heapSize);
+    // JME_HEAP_MAX (KiB) : plafond dur de la capacité totale (profil Pi : 131072).
+    size_t heapMax = 0;
+    if (const char *hm = getenv("JME_HEAP_MAX"))
+    {
+        long v = atol(hm);
+        if (v <= 0)
+        {
+            fprintf(stderr, "JME_HEAP_MAX invalide: '%s' (KiB attendus)\n", hm);
+            return 1;
+        }
+        heapMax = static_cast<size_t>(v) * 1024;
+        if (heapMax < heapSize)
+            fprintf(stderr, "[heap] JME_HEAP_MAX < JME_HEAP : plafond releve a %zu KiB\n", heapSize / 1024);
+    }
+    jvm::Runtime rt(heapSize, heapMax);
     jvm::Interpreter interp(&rt);
     rt.setJar(&jar);
 
@@ -132,6 +193,31 @@ int main(int argc, char **argv)
     jvm::midp::setAppProperty("MIDlet-Name", manifest.midletName);
     jvm::midp::setAppProperty("MIDlet-Version", manifest.midletVersion);
     jvm::midp::setAppProperty("MIDlet-Vendor", manifest.midletVendor);
+    // Tous les attributs du manifeste (et du .jad s'il était fourni) sont lisibles
+    // via MIDlet.getAppProperty() -- pas seulement les trois ci-dessus.
+    {
+        static uint8_t mfBuf[16384];
+        size_t n = jar.extractEntry("META-INF/MANIFEST.MF", mfBuf, sizeof(mfBuf));
+        std::string mf(reinterpret_cast<char *>(mfBuf), n);
+        size_t pos = 0;
+        while (pos < mf.size())
+        {
+            size_t eol = mf.find('\n', pos);
+            if (eol == std::string::npos) eol = mf.size();
+            std::string line = mf.substr(pos, eol - pos);
+            pos = eol + 1;
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            size_t colon = line.find(':');
+            if (colon == std::string::npos || colon == 0 || line[0] == ' ') continue;
+            std::string k = line.substr(0, colon), v = line.substr(colon + 1);
+            size_t b = v.find_first_not_of(' ');
+            v = b == std::string::npos ? "" : v.substr(b);
+            if (k == "MIDlet-Name" || k == "MIDlet-Version" || k == "MIDlet-Vendor") continue;
+            jvm::midp::setAppProperty(k, v);
+        }
+        for (const auto &kv : confProps)
+            jvm::midp::setAppProperty(kv.first, kv.second);
+    }
 
     std::string mainInternal = toInternal(manifest.mainClass);
     jvm::ClassInfo *mainCls = rt.loadFromJar(mainInternal);
@@ -368,7 +454,30 @@ int main(int argc, char **argv)
             autoTouchFrame = atoi(atf);
     }
 
-    const uint32_t kFrameBudgetMs = 33; // ~30 fps cible
+    // JME_AUTOTOUCHES="x,y,frame;x,y,frame;..." : plusieurs clics simulés.
+    struct ScriptTouch { int x, y, f; };
+    std::vector<ScriptTouch> scriptTouches;
+    if (const char *ats = getenv("JME_AUTOTOUCHES"))
+    {
+        const char *p = ats;
+        ScriptTouch st;
+        int n = 0;
+        while (std::sscanf(p, "%d,%d,%d%n", &st.x, &st.y, &st.f, &n) == 3)
+        {
+            scriptTouches.push_back(st);
+            p += n;
+            if (*p == ';') p++;
+            else break;
+        }
+    }
+
+    // Budget RÉEL d'une trame (ms). JME_FRAME_BUDGET ; ne pas confondre avec
+    // JME_FRAME_TIME (durée VIRTUELLE vue par l'horloge du jeu).
+    uint32_t kFrameBudgetMs = 33; // ~30 fps cible
+    if (const char *fb = getenv("JME_FRAME_BUDGET"))
+        if (atoi(fb) > 0)
+            kFrameBudgetMs = static_cast<uint32_t>(atoi(fb));
+    uint32_t lateFrames = 0;
     uint32_t frameStart = SDL_GetTicks();
 
     while (running)
@@ -430,6 +539,14 @@ int main(int argc, char **argv)
                 jvm::midp::pointerEvent(1, autoTouchX, autoTouchY);
         }
 
+        for (const ScriptTouch &t : scriptTouches)
+        {
+            if (frame == t.f)
+                jvm::midp::pointerEvent(0, t.x, t.y);
+            else if (frame == t.f + 3)
+                jvm::midp::pointerEvent(1, t.x, t.y);
+        }
+
         for (int i = 0; i < input.pointerCount; i++)
             jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
@@ -456,6 +573,8 @@ int main(int argc, char **argv)
         uint32_t elapsed = SDL_GetTicks() - frameStart;
         if (elapsed < kFrameBudgetMs)
             SDL_Delay(kFrameBudgetMs - elapsed);
+        else
+            lateFrames++;
         frameStart = SDL_GetTicks();
     }
 
@@ -489,6 +608,26 @@ int main(int argc, char **argv)
     hal::input_shutdown();
     hal::display_shutdown();
     printf("Emulation terminee apres %d frames\n", frame);
+    if (const char *rs = getenv("JME_RENDER_STATS"))
+        if (atoi(rs) != 0)
+        {
+            long rssKb = 0, hwmKb = 0;
+            if (FILE *sf = fopen("/proc/self/status", "r"))
+            {
+                char line[256];
+                while (fgets(line, sizeof line, sf))
+                {
+                    sscanf(line, "VmRSS: %ld", &rssKb);
+                    sscanf(line, "VmHWM: %ld", &hwmKb);
+                }
+                fclose(sf);
+            }
+            printf("[stats] frames=%d en_retard=%u (budget %u ms) heap=%zu/%zu KiB RSS=%ld KiB pic=%ld KiB\n",
+                   frame, lateFrames, kFrameBudgetMs, rt.heap().used() / 1024,
+                   rt.heap().capacity() / 1024, rssKb, hwmKb);
+            if (hwmKb > 256 * 1024)
+                printf("[stats] ATTENTION: pic RSS > 256 MiB (seuil d'alerte Pi Zero 2)\n");
+        }
     if (getenv("JME_DEBUG"))
     {
         printf("[dbg] ecritures framebuffer: %d\n", jvm::midp::jme_screenWrites());

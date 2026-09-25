@@ -173,7 +173,9 @@ public:
     // 512 KB pour le dev PC ; repasser à 224 * 1024 (ou moins) lors du
     // portage RP2040 -- même logique que JAR_READER_INDEX_IN_RAM.
     static constexpr size_t kDefaultPoolSize = 512 * 1024;
-    explicit Heap(size_t poolSize = kDefaultPoolSize);
+    // maxSize = plafond de capacité TOTALE (0 = illimité, comportement dev PC).
+    // Un plafond < poolSize est relevé à poolSize. Au-delà : OOM, jamais d'écriture hors segment.
+    explicit Heap(size_t poolSize = kDefaultPoolSize, size_t maxSize = 0);
     ~Heap();
 
     Heap(const Heap &) = delete;
@@ -182,11 +184,16 @@ public:
     Obj *allocObj(ObjKind kind, int32_t cells);
     Obj *newString(const std::string &s);
     Obj *newStringCat(Obj *a, Obj *b);
+    // Chaîne INTERNÉE : le même contenu renvoie toujours le même Obj (littéraux
+    // `ldc`, String.intern()). Indispensable : le bytecode compare couramment des
+    // littéraux par identité (`if_acmpeq`), ce qui suppose l'interning JVM.
+    Obj *internString(const std::string &s);
     Obj *newArray(ObjKind kind, int32_t len);
     Obj *newInstance(ClassInfo *ci);
     Obj *classObjFor(const std::string &name); // cherche dans le cache des Class Obj
     size_t used() const { return usedTotal_; }
     size_t capacity() const { return capTotal_; }
+    size_t maximumCapacity() const { return maxCap_; }
     bool outOfMemory() const { return oom_; }
     void reset();
 
@@ -201,19 +208,21 @@ private:
     std::vector<uint8_t *> segs_;
     std::vector<size_t> segCaps_;
     size_t initCap_ = 0;    // taille du premier segment (JME_HEAP)
+    size_t maxCap_ = 0;     // plafond de capacité totale (JME_HEAP_MAX), 0 = aucun
     size_t capTotal_ = 0;   // capacité totale allouée (init + segments étendus)
     size_t usedTotal_ = 0;  // octets consommés au total
     size_t off_ = 0;        // offset courant dans le dernier segment
     bool oom_ = false;
     std::unordered_map<std::string, Obj *> classCache_;
+    std::unordered_map<std::string, Obj *> internTable_;
     std::vector<Obj *> strings_; // garde les strings (bump allocator, jamais libérés)
 };
 
 class Runtime
 {
 public:
-    Runtime(size_t heapSize = Heap::kDefaultPoolSize)
-        : heap_(heapSize) {}
+    Runtime(size_t heapSize = Heap::kDefaultPoolSize, size_t heapMax = 0)
+        : heap_(heapSize, heapMax) {}
 
     Heap &heap() { return heap_; }
     const Heap &heap() const { return heap_; }

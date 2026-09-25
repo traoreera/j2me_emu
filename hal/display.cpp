@@ -1,3 +1,7 @@
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
 #include "hal/display.h"
 #include <SDL2/SDL.h>
 
@@ -8,20 +12,43 @@ namespace hal
     static SDL_Renderer *g_renderer = nullptr;
     static SDL_Texture *g_texture = nullptr;
     static Framebuffer g_fb = {};
+    static int g_rotation = 0;
+    static bool g_integerScale = false; // JME_SCALE=integer : facteur entier + letterbox
+
+    int display_rotation() { return g_rotation; }
 
     bool display_init(const DisplayConfig *cfg)
     {
         if (SDL_Init(SDL_INIT_VIDEO) != 0)
             return false;
 
+        if (const char *r = getenv("JME_ROTATE"))
+            g_rotation = (atoi(r) == 90) ? 90 : 0;
+        if (const char *s = getenv("JME_SCALE"))
+            g_integerScale = (strcmp(s, "integer") == 0);
+        const int fbW = g_rotation ? cfg->height : cfg->width; // taille affichée (après rotation)
+        const int fbH = g_rotation ? cfg->width : cfg->height;
+        // Fenêtre : JME_WINDOW_WIDTH/HEIGHT sinon taille affichée x2 (x1 si trop grande).
+        int winW = 0, winH = 0;
+        if (const char *v = getenv("JME_WINDOW_WIDTH")) winW = atoi(v);
+        if (const char *v = getenv("JME_WINDOW_HEIGHT")) winH = atoi(v);
+        if (winW <= 0 || winH <= 0)
+        {
+            const int mul = (fbW * 2 > 1200 || fbH * 2 > 1000) ? 1 : 2;
+            winW = fbW * mul;
+            winH = fbH * mul;
+        }
+        Uint32 wflags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+        const char *fs = getenv("JME_FULLSCREEN");
+        if (fs && atoi(fs) != 0)
+            wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
         g_window = SDL_CreateWindow("J2ME Emu",
                                     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                    cfg->width * 2, cfg->height * 2,
-                                    SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                                    winW, winH, wflags);
         if (!g_window)
             return false;
 
-        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | (getenv("JME_VSYNC") && atoi(getenv("JME_VSYNC")) == 0 ? 0 : SDL_RENDERER_PRESENTVSYNC));
         if (!g_renderer)
             return false;
 
@@ -58,11 +85,76 @@ namespace hal
         return &g_fb;
     }
 
+    // Cadrage de l'image dans la fenêtre : facteur (entier si JME_SCALE=integer,
+    // sinon "fit" proportionnel), centré, bandes noires (letterbox) ailleurs.
+    // Pas de filtrage : SDL est en nearest par défaut. Partagé avec le mapping
+    // souris/tactile pour que clic et rendu restent cohérents.
+    struct View { float s; int x0, y0, vw, vh; };
+    static View computeView(int ww, int wh)
+    {
+        const int sw = g_rotation ? g_fb.height : g_fb.width;
+        const int sh = g_rotation ? g_fb.width : g_fb.height;
+        View v{1.f, 0, 0, sw, sh};
+        if (sw <= 0 || sh <= 0 || ww <= 0 || wh <= 0)
+            return v;
+        float s = std::min(ww / (float)sw, wh / (float)sh);
+        if (g_integerScale)
+            s = std::max(1.f, std::floor(s));
+        v.s = s;
+        v.vw = (int)(sw * s);
+        v.vh = (int)(sh * s);
+        v.x0 = (ww - v.vw) / 2;
+        v.y0 = (wh - v.vh) / 2;
+        return v;
+    }
+
+    void display_window_to_logical(int wx, int wy, int &lx, int &ly)
+    {
+        int ww = 0, wh = 0;
+        if (g_window)
+            SDL_GetWindowSize(g_window, &ww, &wh);
+        lx = wx;
+        ly = wy;
+        if (!g_fb.pixels || ww <= 0 || wh <= 0)
+            return;
+        View v = computeView(ww, wh);
+        int px = (int)((wx - v.x0) / v.s);
+        int py = (int)((wy - v.y0) / v.s);
+        const int sw = g_rotation ? g_fb.height : g_fb.width;
+        const int sh = g_rotation ? g_fb.width : g_fb.height;
+        px = std::max(0, std::min(sw - 1, px));
+        py = std::max(0, std::min(sh - 1, py));
+        if (g_rotation == 90) // vue tournée de 90° anti-horaire
+        {
+            lx = sh - 1 - py;
+            ly = px;
+        }
+        else
+        {
+            lx = px;
+            ly = py;
+        }
+    }
+
     void display_present(const Framebuffer *fb)
     {
         SDL_UpdateTexture(g_texture, nullptr, fb->pixels, fb->stride * sizeof(uint16_t));
+        SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
         SDL_RenderClear(g_renderer);
-        SDL_RenderCopy(g_renderer, g_texture, nullptr, nullptr);
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(g_window, &ww, &wh);
+        View v = computeView(ww, wh);
+        if (g_rotation == 90)
+        {
+            const int cx = v.x0 + v.vw / 2, cy = v.y0 + v.vh / 2;
+            SDL_Rect dst = {cx - v.vh / 2, cy - v.vw / 2, v.vh, v.vw};
+            SDL_RenderCopyEx(g_renderer, g_texture, nullptr, &dst, -90.0, nullptr, SDL_FLIP_NONE);
+        }
+        else
+        {
+            SDL_Rect dst = {v.x0, v.y0, v.vw, v.vh};
+            SDL_RenderCopy(g_renderer, g_texture, nullptr, &dst);
+        }
         SDL_RenderPresent(g_renderer);
     }
 

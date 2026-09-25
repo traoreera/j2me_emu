@@ -11,9 +11,10 @@ namespace jvm
     // Heap
     // ---------------------------------------------------------------------
 
-    Heap::Heap(size_t poolSize)
+    Heap::Heap(size_t poolSize, size_t maxSize)
     {
         initCap_ = poolSize ? poolSize : kDefaultPoolSize;
+        maxCap_ = (maxSize && maxSize < initCap_) ? initCap_ : maxSize;
         auto *seg = new uint8_t[initCap_];
         segs_.push_back(seg);
         segCaps_.push_back(initCap_);
@@ -38,6 +39,7 @@ namespace jvm
         segCaps_.resize(1);
         capTotal_ = initCap_;
         classCache_.clear();
+        internTable_.clear();
         strings_.clear();
         oom_ = false;
     }
@@ -67,6 +69,22 @@ namespace jvm
             size_t segSize = growTo - capTotal_;
             if (segSize < need)
                 segSize = need;
+            if (maxCap_)
+            {
+                // Plafond dur : on rogne le segment sur la marge restante ; s'il ne
+                // peut plus contenir l'objet -> OOM (jamais d'écriture hors segment).
+                size_t room = maxCap_ > capTotal_ ? maxCap_ - capTotal_ : 0;
+                if (segSize > room)
+                    segSize = room;
+                if (segSize < need)
+                {
+                    if (jvm::jmeDebug())
+                        fprintf(stderr, "allocObj OOM (JME_HEAP_MAX): need=%zu used=%zu cap=%zu max=%zu\n",
+                                need, usedTotal_, capTotal_, maxCap_);
+                    oom_ = true;
+                    return nullptr;
+                }
+            }
             uint8_t *seg = nullptr;
             try
             {
@@ -114,6 +132,17 @@ namespace jvm
             return nullptr;
         o->str = s;
         strings_.push_back(o);
+        return o;
+    }
+
+    Obj *Heap::internString(const std::string &s)
+    {
+        auto it = internTable_.find(s);
+        if (it != internTable_.end())
+            return it->second;
+        Obj *o = newString(s);
+        if (o)
+            internTable_.emplace(s, o);
         return o;
     }
 

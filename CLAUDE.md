@@ -64,7 +64,7 @@ Useful env vars (read in `main.cpp`):
 - `JME_AUTOKEY=5|0|*|#|FIRE|SOFT1|SOFT2|LEFT|RIGHT|UP|DOWN` — hold a key from frame 0 (for scripted smoke tests)
 - `JME_AUTOKEYFRAME=n` — with `JME_AUTOKEY`: send a one-frame tap of that key on frame n instead of holding from 0 (to interact once the game has reached a given state).
 - `JME_DUMP=path.ppm` — dump the final framebuffer as a PPM image on exit
-- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`. Some Gameloft titles instead require **landscape** (`width > height`) and print a static, non-interactive "please switch to landscape mode" screen at the default portrait 240x320 — not a bug, no key does anything on that screen because it isn't a menu. Example: `games/assasin.jar` (Assassin's Creed 2) needs `JME_WIDTH=800 JME_HEIGHT=480` to reach real, navigable UI. `games/gangstar_rio_city_o_260851.jar` is a **480x800 portrait** build (`JME_WIDTH=480 JME_HEIGHT=800`): at other sizes it still runs but lays its Gameloft splash out for a 480-wide screen (three image tiles at absolute coordinates, so the logo appears cropped in a corner at 240x320). It starts (splash shown after ~2 s CPU of loading) but its second loading phase (after the logo, state 3: big multi-resource decode) was still running after >24 s of CPU / 900 frames — unresolved, see the gangstar_rio notes in git history/this file's summary.
+- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`. Some Gameloft titles instead require **landscape** (`width > height`) and print a static, non-interactive "please switch to landscape mode" screen at the default portrait 240x320 — not a bug, no key does anything on that screen because it isn't a menu. Example: `games/assasin.jar` (Assassin's Creed 2) needs `JME_WIDTH=800 JME_HEIGHT=480` to reach real, navigable UI. `games/gangstar_rio_city_o_260851.jar` is a **480x800 portrait** build (`JME_WIDTH=480 JME_HEIGHT=800`): at other sizes it still runs but lays its Gameloft splash out for a 480-wide screen (three image tiles at absolute coordinates, so the logo appears cropped in a corner at 240x320). It runs its whole loading sequence and shows the Gameloft logo, then loads ~140 resources (`a.c(I)[B` level unpack, ~100 s of CPU at a fixed 100 M-instruction budget) and reaches its main-menu state (state 3: `paint()` -> `s(2)` -> `aA()` touch hit-tests on the menu rects) — but from there `paint()` issues **no draw call at all**, so the screen stays on the last logo frame. Root cause not found (the menu-draw branch of state 3 is gated by game flags we haven't identified; the old `paint() -> NullPointerException` at frame ~5 is a benign first-paint race, not the cause). Not playable yet.
 - `JME_RMS=0` / `JME_RMSDIR=path` — `RecordStore` est **persistant** par défaut : un fichier par magasin dans `<jeu>.rms/` à côté du `.jar` (format : `u32 nbRecords`, puis `u32 taille + octets` par enregistrement, little-endian ; réécrit à chaque `addRecord`/`setRecord`, supprimé par `deleteRecordStore`). `JME_RMS=0` reste purement en mémoire (runs reproductibles) ; `JME_RMSDIR` change le dossier. Un fichier corrompu/tronqué est ignoré (magasin vide), jamais fatal.
 - `JME_FRAME_TIME=ms` — durée **virtuelle** d'une trame en millisecondes (défaut 16), pas de temps réel. Une valeur ≥ 1000 est convertie de µs en ms avec un avertissement : `JME_FRAME_TIME=33333` avait pour effet de faire avancer l'horloge du jeu de 33 *secondes* par trame, ce qui figeait le dialogue "Sound Set" d'Assassin's Creed 2 (touches et clics ignorés — les minuteries du jeu débordaient).
 - `JME_TRACEM=Classe.methode` (ou `*`) — trace générique des appels d'une méthode bytecode : arguments (8 premiers) et valeur retournée. `JME_AUTOTOUCH=x,y` + `JME_AUTOTOUCHFRAME=n` — clic simulé (appui à n, relâchement à n+3).
@@ -641,9 +641,39 @@ tests miss. Found and fixed while bringing up new test JARs:
   are unaffected. `JME_INSTR_BUDGET` forces a fixed value for deterministic
   comparisons. Note: results then depend on machine speed by design.
 
+- **First `paint()` is delivered before the game threads run.** On a real
+  device `Display.setCurrent()` schedules an immediate paint, long before a
+  background loader thread has done anything. `midp::tick()` used to run the
+  fibers first, so the first `paint()` arrived after ~200 k instructions of
+  loading and could observe half-initialised game state (Gangstar Rio: NPE in
+  `paint()` on a not-yet-allocated script array). It now paints first on the
+  very first tick (pixel-identical on the other 16 games).
+
 ## Porting to RP2040
 
 Only `hal/file.cpp` depends on `FILE*`/libc; every other HAL/VM file is
 hardware-agnostic. Replace it with `hal_file_*` flash/SD primitives, drop
 `JAR_READER_INDEX_IN_RAM`, and add `JAR_READER_NO_COMMENT_SCAN` (see
 `INTEGRATION.md`, in French, for the target `CMakeLists.txt` shape).
+
+## Profils par jeu (`<jeu>.conf`) et divers
+
+- `games/<jeu>.conf` (à côté du `.jar`, lu au démarrage par `main.cpp`) : lignes `CLE=VALEUR`, `#` commentaires. Seules les clés `JME_*` / `SDL_VIDEODRIVER` sont acceptées (`setenv(...,0)` : l'environnement réel gagne). `PROP:Nom=valeur` définit une propriété d'application (`MIDlet.getAppProperty`). Ex. : `assassins_creed_iii_260938.conf` = 480x800 + `PROP:HAS-BLOOD=yes`.
+- `getAppProperty` renvoie `""` (pas `null`) pour une clé absente : `null` fait planter AC3 (`"HAS-BLOOD".equals(...)` NPE).
+- Les littéraux `ldc` String sont **internés** (`Heap::internString`, aussi `String.intern()`) : les jeux comparent des littéraux avec `if_acmpeq/ne`.
+- Souris → `pointerPressed/Released/Dragged` (`hal/input`, `midp::pointerEvent`) ; `JME_AUTOTOUCH=x,y` + `JME_AUTOTOUCHFRAME=n`.
+- AC III (`assassins_creed_iii_260938.jar`) est un build **thaï uniquement** (`t.eh=15` codé en dur, seule ressource `TH`) : le menu s'affiche mais le texte thaï est illisible (police 5x7 sans glyphes thaï + `String.<init>([CII)V` tronque les chars à 8 bits). Ce n'est pas un bug de sélection de langue.
+- `JME_AUTOTOUCHES="x,y,frame;x,y,frame;..."` — plusieurs clics simulés scriptés (appui à `frame`, relâchement à +3), pour traverser les menus tactiles en headless.
+- `String.<init>([BIILjava/lang/String;)V` (octets + encodage) manquait : bloquait Assassin's Creed Revelations juste après le splash.
+- AC Revelations (`assassins_creed_rev_259065.jar`, 480x800 via `.conf`) est jouable jusqu'à l'intro : "Do you want sound?" → écran titre → menu (Quick Play/New Game/Select Level/High Score) → difficulté → texte d'histoire. Séquence de test : `JME_AUTOTOUCHES="230,400,200;240,400,500;235,400,700;235,400,900;275,390,1100" JME_FRAME_TIME=60 JME_MAXFRAMES=1900` (l'écran est dessiné pivoté de 90°). Gameplay non vérifié.
+- `JME_ROTATE=90` — tourne la **vue** (fenêtre) de 90° anti-horaire (`hal/display.cpp`, `SDL_RenderCopyEx`), fenêtre 800x480 pour un framebuffer 480x800 ; les clics souris sont re-mappés (`hal/input.cpp`). Mis dans les `.conf` des jeux Gameloft 480x800 (Gangstar Rio, AC III, AC Revelations) qui dessinent de côté. Le framebuffer/`JME_DUMP` reste non tourné.
+
+## Cible Raspberry Pi Zero 2 W (Pi OS Lite 64 bits) — `PI_ZERO2_CODE_SPEC.md`
+
+Implémenté (phase 1-2, sans casser le PC ; tests 57/57, 16/17 jeux pixel-identiques, `jump` est non déterministe même contre lui-même) :
+- `JME_HEAP_MAX=KiB` — plafond dur de la capacité TOTALE du heap (`Heap(pool, max)`, `maximumCapacity()`) ; au-delà : `outOfMemory()` et alloc `nullptr`, jamais d'écriture hors segment ; plafond < `JME_HEAP` relevé à `JME_HEAP` ; valeur invalide → refus au démarrage. Absent = comportement dev PC (auto-grow illimité).
+- `JME_FRAME_BUDGET=ms` — budget RÉEL d'une trame (défaut 33). **Le spec disait `JME_FRAME_TIME` mais celui-ci reste la durée VIRTUELLE de l'horloge du jeu** (les confondre a déjà figé AC2).
+- Fenêtre/affichage (`hal/display.cpp`) : `JME_WINDOW_WIDTH/HEIGHT`, `JME_FULLSCREEN=1` (desktop plein écran), `JME_SCALE=integer` (facteur entier ≥1, sinon « fit » proportionnel), letterbox noir centré, `JME_VSYNC=0`. Pas de filtrage. Le mapping souris/tactile passe par `display_window_to_logical()` (rotation + letterbox + échelle).
+- `JME_RENDER_STATS=1` — en fin de run : trames en retard, heap utilisé/capacité, RSS et pic (`/proc/self/status`), alerte si pic > 256 MiB. (Pas encore de compteurs pixels/cache.)
+- `static_assert(sizeof(void*)==8)` dans `main.cpp` ; toolchain `cmake/toolchains/aarch64-linux-gnu.cmake` ; profil `profiles/pi-zero2.env` (`set -a; . profiles/pi-zero2.env; set +a`).
+- Non fait (à mesurer d'abord sur le vrai Pi) : cache d'assets/rendu, pack Python, gamepad SDL GameController, launcher, overlay tactile, LVGL.

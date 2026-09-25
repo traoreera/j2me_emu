@@ -24,6 +24,11 @@ namespace hal
     void display_shutdown();
     Framebuffer *display_get_framebuffer();
     void display_present(const Framebuffer *fb);
+    // Rotation d'affichage (0 ou 90 = vue tournée de 90° anti-horaire), lue de
+    // JME_ROTATE. Pour les jeux 480x800 dessinés de côté (téléphone tenu en paysage).
+    int display_rotation();
+    // Coordonnées fenêtre -> écran logique (rotation, letterbox et échelle inclus).
+    void display_window_to_logical(int wx, int wy, int &lx, int &ly);
     void display_clear(uint16_t color = 0x0000);
 
     // Dessine du texte 5x7 dans le framebuffer courant (clipsé aux bords).
