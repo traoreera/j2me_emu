@@ -35,7 +35,9 @@ namespace hal
         if (const char *v = getenv("JME_WINDOW_HEIGHT")) winH = atoi(v);
         if (winW <= 0 || winH <= 0)
         {
-            const int mul = (fbW * 2 > 1200 || fbH * 2 > 1000) ? 1 : 2;
+            int mul = (fbW * 2 > 1200 || fbH * 2 > 1000) ? 1 : 2;
+            if (fbW < 200) // petits écrans (Nokia 96x65...) : agrandir pour rester lisible
+                mul = std::max(2, std::min(8, std::min(1200 / fbW, 960 / fbH)));
             winW = fbW * mul;
             winH = fbH * mul;
         }
