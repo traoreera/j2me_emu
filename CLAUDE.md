@@ -22,7 +22,7 @@ identifiers are in English.
 Preferred (single command, matches CI expectations):
 ```bash
 g++ -std=c++17 -O2 -Isrc -DJAR_READER_INDEX_IN_RAM \
-    src/app/main.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
+    src/app/*.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
     src/midp/*.cpp src/kernel/kernel.cpp src/kernel/audio/*.cpp \
     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 ```
@@ -47,7 +47,8 @@ the source root and reconfigure with `-S`/`-B`.
 ## Running
 
 ```bash
-./j2me_emu games/assasin.jar   # default if no arg given
+./j2me_emu                     # launcher (menu des jeux de games/)
+./j2me_emu games/assasin.jar   # lance directement un jeu
 ./j2me_emu games/mission.jar
 ```
 
@@ -671,3 +672,9 @@ Implémenté (phase 1-2, sans casser le PC ; tests 57/57, 16/17 jeux pixel-ident
 - `JME_RENDER_STATS=1` — en fin de run : trames en retard, heap utilisé/capacité, RSS et pic (`/proc/self/status`), alerte si pic > 256 MiB. (Pas encore de compteurs pixels/cache.)
 - `static_assert(sizeof(void*)==8)` dans `src/app/main.cpp` ; toolchain `cmake/toolchains/aarch64-linux-gnu.cmake` ; profil `profiles/pi-zero2.env` (`set -a; . profiles/pi-zero2.env; set +a`).
 - Non fait (à mesurer d'abord sur le vrai Pi) : cache d'assets/rendu, pack Python, gamepad SDL GameController, launcher, overlay tactile, LVGL.
+
+## Launcher (`src/app/launcher.cpp`)
+
+- `./j2me_emu` sans argument ouvre le launcher (480x320, font 5x7 x2) : liste des `games/*.jar` triée (nom/éditeur/version du manifeste + `[LxH tourne]` lu dans le `.conf` voisin). Haut/Bas, Gauche/Droite (page), molette, Entrée/F1 = jouer, double-clic sur une ligne = jouer, F12/Ctrl+Q = quitter. `JME_GAMES_DIR=dossier` (défaut `games`), `JME_LAUNCHER=0` = ancien défaut `games/assasin.jar`, `JME_LAUNCHER_AUTO=n` = lance le jeu n° n à la 3e trame (CI).
+- Le jeu est lancé par **re-exec du même binaire** (`/proc/self/exe`, Linux) : chaque jeu démarre dans un processus propre (pas de reset de Runtime/heap/globales MIDP). `JME_FROM_LAUNCHER=1` + `JME_LAUNCHER_LAST` (présélection) sont posés dans l'environnement. En jeu : **F12 = retour au launcher** (`InputState.exitToMenu`), fin du MIDlet (`notifyDestroyed`) aussi ; **Ctrl+Q / fermer la fenêtre = quitter pour de bon**. Les variables posées par le `.conf` du jeu sont retirées de l'environnement avant de relancer le launcher (sinon elles fuiraient sur le jeu suivant). Pas de retour au menu si `JME_MAXFRAMES` est défini.
+- `hal::display_draw_text_scaled/fill_rect/dump_ppm` ajoutés pour le launcher.

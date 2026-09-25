@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -267,6 +268,51 @@ namespace hal
         {0x00, 0x41, 0x36, 0x08, 0x00}, // }
         {0x08, 0x04, 0x08, 0x10, 0x08}, // ~
     };
+
+    bool display_dump_ppm(const char *path)
+    {
+        FILE *f = g_fb.pixels ? fopen(path, "wb") : nullptr;
+        if (!f)
+            return false;
+        fprintf(f, "P6\n%d %d\n255\n", g_fb.width, g_fb.height);
+        for (int y = 0; y < g_fb.height; y++)
+            for (int x = 0; x < g_fb.width; x++)
+            {
+                uint16_t p = g_fb.pixels[y * g_fb.stride + x];
+                fputc((p >> 11) << 3, f);
+                fputc(((p >> 5) & 0x3F) << 2, f);
+                fputc((p & 0x1F) << 3, f);
+            }
+        fclose(f);
+        return true;
+    }
+
+    void display_fill_rect(int x, int y, int w, int h, uint16_t color)
+    {
+        if (!g_fb.pixels)
+            return;
+        int x1 = std::min(x + w, g_fb.width), y1 = std::min(y + h, g_fb.height);
+        for (int yy = std::max(y, 0); yy < y1; yy++)
+            for (int xx = std::max(x, 0); xx < x1; xx++)
+                g_fb.pixels[yy * g_fb.stride + xx] = color;
+    }
+
+    void display_draw_text_scaled(int x, int y, const char *text, uint16_t color, int scale)
+    {
+        if (!g_fb.pixels || !text || scale < 1)
+            return;
+        for (; *text; text++, x += 6 * scale)
+        {
+            unsigned char c = static_cast<unsigned char>(*text);
+            if (c < 0x20 || c > 0x7F)
+                c = '?';
+            const uint8_t *glyph = kFont5x7[c - 0x20];
+            for (int col = 0; col < 5; col++)
+                for (int row = 0; row < 7; row++)
+                    if (glyph[col] & (1 << row))
+                        display_fill_rect(x + col * scale, y + row * scale, scale, scale, color);
+        }
+    }
 
     void display_draw_text(int x, int y, const char *text, uint16_t color)
     {
