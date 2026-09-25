@@ -43,8 +43,7 @@ target_compile_definitions(j2me_emu PRIVATE JAR_READER_INDEX_IN_RAM)
 
 # NOTE : la commande de compilation équivalente est :
 # g++ -std=c++17 -O2 -Isrc -DJAR_READER_INDEX_IN_RAM \
-#     src/app/main.cpp
-    src/app/launcher.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
+#     src/app/*.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
 #     src/midp/*.cpp src/kernel/kernel.cpp src/kernel/audio/*.cpp \
 #     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 
