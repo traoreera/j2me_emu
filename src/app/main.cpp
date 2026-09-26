@@ -657,6 +657,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < input.pointerCount; i++)
             jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
+        jvm::midp::setTextInput(input.text, input.backspaces);
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 
         if (jvm::midp::midletDestroyed())

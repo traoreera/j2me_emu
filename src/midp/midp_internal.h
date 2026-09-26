@@ -148,7 +148,6 @@ namespace jvm
                 F_SIZE = 2
             };
             constexpr int kNumSound = 16;            class Pix;
-            struct JmeUi;
             extern Runtime *g_rt;
             extern Interpreter *g_interp;
             extern Obj *g_midlet;
@@ -186,11 +185,18 @@ namespace jvm
             uint16_t argb565(uint32_t c);
             Obj *screenGraphics();
             void drawRegionRaw(Pix &p, Obj *src, int iw, int xs, int ys, int w, int h, int tfm, int dx, int dy);
-            JmeUi *uiFind(Obj *disp);
-            JmeUi *uiFor(Obj *disp);
-            void uiCmdSetLabel(Obj *cmd, Obj *label);
+            // --- lcdui haut niveau (midp_lcdui.cpp) ---
+            bool lcduiIsScreen(Obj *o);                        // Form / List / Alert / TextBox
+            void lcduiTick(Obj *disp, uint32_t justPressed);   // entrées + rendu de l'écran courant
+            void lcduiPointer(int kind, int x, int y);         // clic souris sur un écran haut niveau
+            uint32_t lcduiCanvasSoftKeys(Obj *cur, uint32_t justPressed); // touches programmables -> Commands d'un Canvas
+            void lcduiCanvasOverlay(Obj *cur);                 // barre de commandes d'un Canvas non plein écran
+            void lcduiSetTextInput(const char *utf8, int backspaces);
+            void lcduiMarkDirty();
+            void lcduiBootstrap(Runtime *rt);                  // constantes List.SELECT_COMMAND / Alert.DISMISS_COMMAND
             void uiDispatchCommand(Obj *cmd, Obj *disp);
-            void uiRenderScreen();
+            void uiCmdSetLabel(Obj *cmd, Obj *label);
+            void registerLcduiNatives();
             int64_t argLongL(NativeContext *ctx, int i);
             int32_t streamFill(Obj *s, Obj *dst, int off, int len);
             void fireTimers();
@@ -317,18 +323,6 @@ namespace jvm
             // car Canvas réserve cells[0]/cells[1] (GC_FULLSCREEN/GC_GFX) sur lui.
             // ---------------------------------------------------------------------
 
-            struct JmeUi
-            {
-                Obj *disp = nullptr;     // Displayable (List ou Form)
-                Obj *title = nullptr;    // String
-                Obj *listener = nullptr; // CommandListener
-                std::vector<Obj *> commands;
-                bool isList = false;
-                std::vector<Obj *> items; // String pour List/Form
-                int sel = 0;
-                Obj *selectCmd = nullptr; // setSelectCommand (défaut = SELECT_COMMAND)
-                int type = 0;
-            };
             void registerCoreNatives();
             void registerGraphicsNatives();
             void registerGameNatives();

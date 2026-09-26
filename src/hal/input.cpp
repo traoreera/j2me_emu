@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <string>
 #include <cctype>
+#include <cstdio>
 
 namespace hal
 {
@@ -59,11 +60,14 @@ static KeyMask g_justReleased = 0;
 static bool g_quitRequested = false;
 static bool g_menuRequested = false;
 static int g_wheel = 0;
+static std::string g_textBuf;
+static int g_backspaceCount = 0;
 static int g_volStep = 0;
 static bool g_muteToggle = false;
 
 bool input_init()
 {
+    SDL_StartTextInput(); // SDL_TEXTINPUT : champs de saisie (TextField/TextBox)
     return true;
 }
 
@@ -77,6 +81,8 @@ void input_poll(InputState *out)
     g_justReleased = 0;
     out->pointerCount = 0;
     g_wheel = 0;
+    g_textBuf.clear();
+    g_backspaceCount = 0;
     g_volStep = 0;
     g_muteToggle = false;
 
@@ -108,6 +114,14 @@ void input_poll(InputState *out)
             toLogical(e.motion.windowID, e.motion.x, e.motion.y, lx, ly);
             pushPointer(PointerEvent::DRAG, lx, ly);
         }
+        if (e.type == SDL_TEXTINPUT)
+        {
+            for (const char *c = e.text.text; *c; c++)
+                if (static_cast<unsigned char>(*c) < 0x80)
+                    g_textBuf += *c;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_BACKSPACE)
+            g_backspaceCount++;
         if (e.type == SDL_MOUSEWHEEL)
             g_wheel += e.wheel.y > 0 ? 1 : (e.wheel.y < 0 ? -1 : 0);
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
@@ -152,6 +166,8 @@ void input_poll(InputState *out)
     out->quit = g_quitRequested;
     out->exitToMenu = g_menuRequested;
     out->wheel = g_wheel;
+    std::snprintf(out->text, sizeof(out->text), "%s", g_textBuf.c_str());
+    out->backspaces = g_backspaceCount;
     out->volumeStep = g_volStep;
     out->muteToggle = g_muteToggle;
 }

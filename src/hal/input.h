@@ -52,6 +52,8 @@ namespace hal
         bool exitToMenu = false;  // F12 : retour au launcher (quit est aussi vrai)
         int volumeStep = 0;       // F9/F10 (ou PgBas/PgHaut) : -1/+1 par trame
         bool muteToggle = false;  // F8
+        char text[64] = {0};      // caractères ASCII tapés pendant la trame (SDL_TEXTINPUT) : champs de saisie lcdui
+        int backspaces = 0;       // retours arrière de la trame
         int wheel = 0;            // molette de la trame (+1 = vers le haut), pour le launcher
     };
 

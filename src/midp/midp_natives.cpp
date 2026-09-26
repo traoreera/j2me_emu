@@ -193,6 +193,11 @@ namespace jvm
             if (!g_interp || !g_current)
                 return;
             Obj *cur = g_current;
+            if (lcduiIsScreen(cur))
+            {
+                lcduiPointer(kind, x, y);
+                return;
+            }
             if (!cur->cls || !isSubclassOf(cur, "javax/microedition/lcdui/Canvas"))
                 return;
             static const char *const names[3] = {"pointerPressed", "pointerReleased", "pointerDragged"};
@@ -204,6 +209,8 @@ namespace jvm
             Value res;
             g_interp->invokeVirtual(cur->cls, names[kind], "(II)V", cur, args, 3, res);
         }
+
+        void setTextInput(const char *ascii, int backspaces) { detail::lcduiSetTextInput(ascii, backspaces); }
 
         void tick(uint32_t pressedMask, uint32_t justPressedMask, uint32_t justReleasedMask)
         {
@@ -361,6 +368,13 @@ namespace jvm
             // qui tournait sans erreur à chaque frame (0 écriture framebuffer,
             // 0 appel flushGraphics -- le jeu n'utilisait PAS le chemin
             // getGraphics()/flushGraphics() du tout, seulement paint()).
+            // Commands d'un Canvas non plein écran : les touches programmables déclenchent commandAction()
+            // (au lieu d'être livrées comme keyPressed) ; barre de commandes dessinée après paint().
+            uint32_t softUsed = (isCanvas || isFullCanvas) ? lcduiCanvasSoftKeys(cur, justPressedMask) : 0;
+            justPressedMask &= ~softUsed;
+            justReleasedMask &= ~softUsed;
+            if (cur != g_current) // une commande a changé l'écran courant
+                return;
             if (isCanvas || isFullCanvas)
             {
                 for (int b = 0; b < 19; b++)
@@ -382,68 +396,13 @@ namespace jvm
                 Value res;
                 g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, args, 2, res);
                 g_paintRequested = false;
+                lcduiCanvasOverlay(cur);
                 hal::display_present(hal::display_get_framebuffer());
             }
 
-            // --- List/Form : navigation + dispatch commandAction -----------------
-            // Bounce (menu List c, sélection niveau List F, Form scores j) n'a pas
-            // de Canvas tant que le jeu n'est pas lancé ; ni keyPressed/paint ne
-            // s'appliquent à un Displayable non-Canvas. On gère ici la boucle de
-            // menu : UP/DOWN changent la sélection, FIRE envoie SELECT_COMMAND (ou
-            // le Command de setSelectCommand), SOFT1/SOFT2 envoient la première /
-            // dernière commande ajoutée (BACK/EXIT de Bounce) -- commandAction
-            // compare par identité d'objet, il faut donc passer l'instance exacte.
-            bool isUiList = isSubclassOf(cur, "javax/microedition/lcdui/List");
-            bool isUiForm = !isUiList && isSubclassOf(cur, "javax/microedition/lcdui/Form");
-            if (isUiList || isUiForm)
-            {
-                JmeUi *u = uiFind(cur);
-                if (!u)
-                    u = uiFor(cur);
-                if (justPressedMask & (hal::KEY_UP))
-                {
-                    if (isUiList && !u->items.empty())
-                    {
-                        u->sel = (u->sel + static_cast<int>(u->items.size()) - 1) % static_cast<int>(u->items.size());
-                        g_paintRequested = true;
-                    }
-                }
-                if (justPressedMask & (hal::KEY_DOWN))
-                {
-                    if (isUiList && !u->items.empty())
-                    {
-                        u->sel = (u->sel + 1) % static_cast<int>(u->items.size());
-                        g_paintRequested = true;
-                    }
-                }
-                if (justPressedMask & (hal::KEY_FIRE))
-                {
-                    if (isUiList)
-                    {
-                        Obj *cmd = u->selectCmd ? u->selectCmd : g_listSelectCommand;
-                        if (cmd)
-                            uiDispatchCommand(cmd, cur);
-                    }
-                }
-                if (justPressedMask & (hal::KEY_SOFT1))
-                {
-                    if (!u->commands.empty())
-                        uiDispatchCommand(u->commands.front(), cur);
-                }
-                if (justPressedMask & (hal::KEY_SOFT2))
-                {
-                    if (!u->commands.empty())
-                        uiDispatchCommand(u->commands.back(), cur);
-                }
-                if (g_paintRequested)
-                {
-                    if (jvm::jmeDebug())
-                        fprintf(stderr, "TICK paint UI sur %s\n", cur->cls ? cur->cls->name.c_str() : "?");
-                    uiRenderScreen();
-                    g_paintRequested = false;
-                    hal::display_present(hal::display_get_framebuffer());
-                }
-            }
+            // --- Écrans lcdui haut niveau (List / Form / Alert / TextBox) : entrées + rendu (midp_lcdui.cpp) ---
+            if (lcduiIsScreen(cur))
+                lcduiTick(cur, justPressedMask);
         }
 
         void n_SB_appendCharArray(NativeContext *ctx)
@@ -484,6 +443,7 @@ namespace jvm
             detail::registerGraphicsNatives();
             detail::registerGameNatives();
             detail::registerUiNatives();
+            detail::registerLcduiNatives();
             detail::registerIoNatives();
             detail::registerMediaNatives();
             g_rt = rt;
@@ -532,8 +492,8 @@ namespace jvm
             regClass(rt, "java/lang/Exception", "java/lang/Throwable", none, none);
             regClass(rt, "java/lang/RuntimeException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/NullPointerException", "java/lang/RuntimeException", none, none);
-            regClass(rt, "java/lang/ArrayIndexOutOfBoundsException", "java/lang/RuntimeException", none, none);
             regClass(rt, "java/lang/IndexOutOfBoundsException", "java/lang/RuntimeException", none, none);
+            regClass(rt, "java/lang/ArrayIndexOutOfBoundsException", "java/lang/IndexOutOfBoundsException", none, none);
             regClass(rt, "java/lang/ArrayStoreException", "java/lang/RuntimeException", none, none);
             regClass(rt, "java/lang/ClassCastException", "java/lang/RuntimeException", none, none);
             regClass(rt, "java/lang/IllegalArgumentException", "java/lang/RuntimeException", none, none);
@@ -543,6 +503,9 @@ namespace jvm
             regClass(rt, "java/lang/InterruptedException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/SecurityException", "java/lang/RuntimeException", none, none);
             regClass(rt, "java/io/IOException", "java/lang/Exception", none, none);
+            regClass(rt, "java/lang/ClassNotFoundException", "java/lang/Exception", none, none);
+            regClass(rt, "java/lang/InstantiationException", "java/lang/Exception", none, none);
+            regClass(rt, "java/lang/IllegalAccessException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/Error", "java/lang/Throwable", none, none);
             regClass(rt, "java/lang/VirtualMachineError", "java/lang/Error", none, none);
             regClass(rt, "java/lang/OutOfMemoryError", "java/lang/VirtualMachineError", none, none);
@@ -648,7 +611,7 @@ regClass(rt, "java/io/DataInputStream", "java/lang/Object",
 
             // --- lcdui ---
             regClass(rt, "javax/microedition/lcdui/Displayable", "java/lang/Object",
-                     {{"setTitle", "(Ljava/lang/String;)V"}, {"getTitle", "()Ljava/lang/String;"}, {"addCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setCommandListener", "(Ljavax/microedition/lcdui/CommandListener;)V"}, {"isShown", "()Z"}, {"getWidth", "()I"}, {"getHeight", "()I"}},
+                     {{"removeCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setTicker", "(Ljavax/microedition/lcdui/Ticker;)V"}, {"getTicker", "()Ljavax/microedition/lcdui/Ticker;"}, {"setTitle", "(Ljava/lang/String;)V"}, {"getTitle", "()Ljava/lang/String;"}, {"addCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setCommandListener", "(Ljavax/microedition/lcdui/CommandListener;)V"}, {"isShown", "()Z"}, {"getWidth", "()I"}, {"getHeight", "()I"}},
                      none);
 
             // GC_FULLSCREEN/GC_GFX (cf. plus bas) indexent cells[0]/cells[1] de
@@ -772,10 +735,10 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                      {{"vibrate", "(I)Z"}, {"getColor", "(I)I"}, {"getBorderStyle", "(Z)I"}, {"getDisplay", "(Ljavax/microedition/midlet/MIDlet;)Ljavax/microedition/lcdui/Display;"}, {"getCurrent", "()Ljavax/microedition/lcdui/Displayable;"}, {"setCurrent", "(Ljavax/microedition/lcdui/Displayable;)V"}, {"setCurrent", "(Ljavax/microedition/lcdui/Alert;Ljavax/microedition/lcdui/Displayable;)V"}, {"setCurrentItem", "(Ljavax/microedition/lcdui/Item;)V"}, {"isColor", "()Z"}, {"numColors", "()I"}, {"numAlphaLevels", "()I"}, {"flashBacklight", "(I)V"}, {"repaint", "()V"}, {"callSerially", "(Ljava/lang/Runnable;)V"}},
                      none);
 
-            // --- Stubs UI (Alert/Form/Command/List/...) ---
+            // --- lcdui haut niveau : Alert / Command / Form / List / Items / TextBox (état dans midp_lcdui.cpp) ---
             regClass(rt, "javax/microedition/lcdui/Alert", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"setTimeout", "(I)V"}, {"setString", "(Ljava/lang/String;)V"}},
-                     none);
+                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"setTimeout", "(I)V"}, {"getTimeout", "()I"}, {"setString", "(Ljava/lang/String;)V"}, {"getString", "()Ljava/lang/String;"}, {"setIndicator", "(Ljavax/microedition/lcdui/Gauge;)V"}, {"getIndicator", "()Ljavax/microedition/lcdui/Gauge;"}, {"setType", "(Ljavax/microedition/lcdui/AlertType;)V"}, {"setImage", "(Ljavax/microedition/lcdui/Image;)V"}},
+                     {{"DISMISS_COMMAND", "Ljavax/microedition/lcdui/Command;"}});
             regClass(rt, "javax/microedition/lcdui/AlertType", "java/lang/Object",
                      {{"<init>", "()V"}},
                      {{"ALARM", "Ljavax/microedition/lcdui/AlertType;"},
@@ -784,34 +747,36 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                       {"INFO", "Ljavax/microedition/lcdui/AlertType;"},
                       {"WARNING", "Ljavax/microedition/lcdui/AlertType;"}});
             regClass(rt, "javax/microedition/lcdui/Command", "java/lang/Object",
-                     {{"<init>", "(Ljava/lang/String;II)V"}, {"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"getLabel", "()Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;II)V"}, {"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"getLabel", "()Ljava/lang/String;"}, {"getLongLabel", "()Ljava/lang/String;"}, {"getCommandType", "()I"}, {"getPriority", "()I"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/Item", "java/lang/Object",
-                     {{"getLabel", "()Ljava/lang/String;"}, {"setLabel", "(Ljava/lang/String;)V"}}, none);
+                     {{"getLabel", "()Ljava/lang/String;"}, {"setLabel", "(Ljava/lang/String;)V"}, {"getLayout", "()I"}, {"setLayout", "(I)V"}, {"addCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"removeCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setDefaultCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"setItemCommandListener", "(Ljavax/microedition/lcdui/ItemCommandListener;)V"}, {"notifyStateChanged", "()V"}, {"setPreferredSize", "(II)V"}}, none);
             regClass(rt, "javax/microedition/lcdui/Form", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Item;)V"}, {"append", "(Ljavax/microedition/lcdui/Item;)I"}, {"append", "(Ljava/lang/String;)I"}, {"append", "(Ljavax/microedition/lcdui/Image;)I"}, {"size", "()I"}, {"set", "(ILjavax/microedition/lcdui/Item;)V"}, {"get", "(I)Ljavax/microedition/lcdui/Item;"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"insert", "(ILjavax/microedition/lcdui/Item;)V"}, {"setItemStateListener", "(Ljavax/microedition/lcdui/ItemStateListener;)V"}},
+                     {{"<init>", "(Ljava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;[Ljavax/microedition/lcdui/Item;)V"}, {"append", "(Ljavax/microedition/lcdui/Item;)I"}, {"append", "(Ljava/lang/String;)I"}, {"append", "(Ljavax/microedition/lcdui/Image;)I"}, {"insert", "(ILjavax/microedition/lcdui/Item;)V"}, {"set", "(ILjavax/microedition/lcdui/Item;)V"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"get", "(I)Ljavax/microedition/lcdui/Item;"}, {"size", "()I"}, {"setItemStateListener", "(Ljavax/microedition/lcdui/ItemStateListener;)V"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/List", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"setSelectedIndex", "(IZ)V"}, {"setSelectCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"setSelectCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"insert", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"set", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}, {"getImage", "(I)Ljavax/microedition/lcdui/Image;"}, {"isSelected", "(I)Z"}, {"getSelectedIndex", "()I"}, {"setSelectedIndex", "(IZ)V"}, {"getSelectedFlags", "([Z)I"}, {"setSelectedFlags", "([Z)V"}, {"setFitPolicy", "(I)V"}, {"getFitPolicy", "()I"}, {"setFont", "(ILjavax/microedition/lcdui/Font;)V"}},
                      {{"SELECT_COMMAND", "Ljavax/microedition/lcdui/Command;"}});
             regClass(rt, "javax/microedition/lcdui/TextBox", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"setString", "(Ljava/lang/String;)V"}, {"getString", "()Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"getString", "()Ljava/lang/String;"}, {"setString", "(Ljava/lang/String;)V"}, {"size", "()I"}, {"getMaxSize", "()I"}, {"setMaxSize", "(I)I"}, {"getConstraints", "()I"}, {"setConstraints", "(I)V"}, {"getCaretPosition", "()I"}, {"insert", "(Ljava/lang/String;I)V"}, {"delete", "(II)V"}, {"getChars", "([C)I"}, {"setChars", "([CII)V"}, {"setInitialInputMode", "(Ljava/lang/String;)V"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/TextField", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"setString", "(Ljava/lang/String;)V"}, {"getString", "()Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"getString", "()Ljava/lang/String;"}, {"setString", "(Ljava/lang/String;)V"}, {"size", "()I"}, {"getMaxSize", "()I"}, {"setMaxSize", "(I)I"}, {"getConstraints", "()I"}, {"setConstraints", "(I)V"}, {"getCaretPosition", "()I"}, {"insert", "(Ljava/lang/String;I)V"}, {"delete", "(II)V"}, {"getChars", "([C)I"}, {"setChars", "([CII)V"}, {"setInitialInputMode", "(Ljava/lang/String;)V"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/StringItem", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;)V"}, {"setText", "(Ljava/lang/String;)V"}, {"getText", "()Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;Ljava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;Ljava/lang/String;I)V"}, {"setText", "(Ljava/lang/String;)V"}, {"getText", "()Ljava/lang/String;"}, {"getAppearanceMode", "()I"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/ImageItem", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;ILjava/lang/String;)V"}}, none);
+                     {{"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;ILjava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;ILjava/lang/String;I)V"}, {"getImage", "()Ljavax/microedition/lcdui/Image;"}, {"setImage", "(Ljavax/microedition/lcdui/Image;)V"}, {"getAltText", "()Ljava/lang/String;"}, {"setAltText", "(Ljava/lang/String;)V"}, {"getAppearanceMode", "()I"}}, none);
             regClass(rt, "javax/microedition/lcdui/Gauge", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;ZII)V"}, {"setValue", "(I)V"}, {"getValue", "()I"}}, none);
+                     {{"<init>", "(Ljava/lang/String;ZII)V"}, {"setValue", "(I)V"}, {"getValue", "()I"}, {"setMaxValue", "(I)V"}, {"getMaxValue", "()I"}, {"isInteractive", "()Z"}}, none);
             regClass(rt, "javax/microedition/lcdui/ChoiceGroup", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}},
+                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"insert", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"set", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}, {"getImage", "(I)Ljavax/microedition/lcdui/Image;"}, {"isSelected", "(I)Z"}, {"getSelectedIndex", "()I"}, {"setSelectedIndex", "(IZ)V"}, {"getSelectedFlags", "([Z)I"}, {"setSelectedFlags", "([Z)V"}, {"setFitPolicy", "(I)V"}, {"getFitPolicy", "()I"}, {"setFont", "(ILjavax/microedition/lcdui/Font;)V"}},
                      none);
-            regClass(rt, "javax/microedition/lcdui/Choice", "java/lang/Object", none, none);
-            regClass(rt, "javax/microedition/lcdui/ItemStateListener", "java/lang/Object", none, none);
+            regClass(rt, "javax/microedition/lcdui/DateField", "javax/microedition/lcdui/Item", {{"<init>", "(Ljava/lang/String;I)V"}}, none);
+            regClass(rt, "javax/microedition/lcdui/Spacer", "javax/microedition/lcdui/Item", {{"<init>", "(II)V"}}, none);
+            regClass(rt, "javax/microedition/lcdui/Choice", "java/lang/Object", {{"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"insert", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"set", "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}, {"getImage", "(I)Ljavax/microedition/lcdui/Image;"}, {"isSelected", "(I)Z"}, {"getSelectedIndex", "()I"}, {"setSelectedIndex", "(IZ)V"}, {"getSelectedFlags", "([Z)I"}, {"setSelectedFlags", "([Z)V"}, {"setFitPolicy", "(I)V"}, {"getFitPolicy", "()I"}, {"setFont", "(ILjavax/microedition/lcdui/Font;)V"}}, none);
+            regClass(rt, "javax/microedition/lcdui/ItemStateListener", "java/lang/Object", {{"itemStateChanged", "(Ljavax/microedition/lcdui/Item;)V"}}, none);
             regClass(rt, "javax/microedition/lcdui/Ticker", "java/lang/Object",
                      {{"<init>", "(Ljava/lang/String;)V"}}, none);
             regClass(rt, "javax/microedition/lcdui/Screen", "javax/microedition/lcdui/Displayable", none, none);
@@ -943,32 +908,8 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                     }
             }
 
-            // javax.microedition.lcdui.List.SELECT_COMMAND : constante objet
-            // (`static final Command`), javac ne l'inline pas dans les
-            // comparaisons d'identité de commandAction où Bounce fait
-            // `if_acmpne List.SELECT_COMMAND`. Bootstrap identique à
-            // AlertType : instancier un Command réel et le poser dans le
-            // slot statique, sinon un `getstatic` renverrait ref null et
-            // le FIRE sur le menu List ne déclencherait jamais la sélection.
-            {
-                ClassInfo *lsCls = rt->classInfoOfName("javax/microedition/lcdui/List");
-                ClassInfo *cmdCls = rt->classInfoOfName("javax/microedition/lcdui/Command");
-                if (lsCls && cmdCls)
-                {
-                    const MethodRecord *f = lsCls->findField("SELECT_COMMAND", "Ljavax/microedition/lcdui/Command;");
-                    if (f)
-                    {
-                        Obj *inst = rt->heap().newInstance(cmdCls);
-                        if (inst)
-                        {
-                            lsCls->statics[f->slot] = Value::fromRef(inst);
-                            Obj *lab = rt->heap().newString("Select");
-                            uiCmdSetLabel(inst, lab);
-                            g_listSelectCommand = inst;
-                        }
-                    }
-                }
-            }
+            // List.SELECT_COMMAND / Alert.DISMISS_COMMAND : constantes objet (non inlinées par javac).
+            lcduiBootstrap(rt);
         }
 
     } // namespace midp

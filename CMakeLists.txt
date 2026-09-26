@@ -25,6 +25,7 @@ add_executable(j2me_emu
     src/midp/midp_graphics.cpp
     src/midp/midp_game.cpp
     src/midp/midp_ui.cpp
+    src/midp/midp_lcdui.cpp
     src/midp/midp_io.cpp
     src/midp/midp_media.cpp
     src/kernel/kernel.cpp
