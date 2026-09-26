@@ -29,6 +29,7 @@ namespace jvm
 
     // Table des natives : clé "nomClasse.nomMethode:desc"
     NativeFn findNative(const std::string &key);
+    const NativeFn *findNativePtr(const std::string &key); // pointeur stable (nœud de la table)
     void registerNative(const std::string &key, NativeFn fn);
 
     // Dossier de persistance du RecordStore ("" = en mémoire seulement).

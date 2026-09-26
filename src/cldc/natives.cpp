@@ -94,6 +94,12 @@ NativeFn findNative(const std::string &key)
     return nullptr;
 }
 
+const NativeFn *findNativePtr(const std::string &key)
+{
+    auto it = registry().find(key);
+    return it != registry().end() ? &it->second : nullptr;
+}
+
 static std::string g_rmsDir;
 void setRmsDir(const std::string &dir) { g_rmsDir = dir; }
 

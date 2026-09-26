@@ -77,6 +77,7 @@ struct MethodRecord
     bool isField = false;
     bool isStatic = false;
     ClassInfo *owner = nullptr;      // classe déclarante (résolution natives virtuelles)
+    mutable const void *nativeFn = nullptr; // cache : fonction native résolue (const NativeFn *), évite clé string + hash à chaque appel
 };
 
 class Runtime;
@@ -161,6 +162,20 @@ struct ClassInfo
         const MethodRecord *lastM = nullptr;   //                 et méthode correspondante
     };
     std::vector<MethodCacheEntry> methodRefCache;
+
+    // Cache des références de CLASSE du pool (new / checkcast / instanceof / ldc String), indexé par l'index du pool :
+    // évite un std::string par valeur + une recherche par nom (hachage) à CHAQUE exécution de ces opcodes.
+    struct ClassRefEntry
+    {
+        bool valid = false;
+        std::string name;                 // nom interne ("java/lang/String", "[I"...)
+        bool isArray = false;
+        ClassInfo *tc = nullptr;          // résolue paresseusement (new)
+        ClassInfo *lastCls = nullptr;     // checkcast/instanceof : dernier type de receveur
+        bool lastIs = false;              //                        et son résultat
+    };
+    std::vector<ClassRefEntry> classRefCache;
+    std::vector<Obj *> ldcCache;          // ldc String : littéral interné (Obj*), indexé par l'index du pool
 };
 
 class Heap
