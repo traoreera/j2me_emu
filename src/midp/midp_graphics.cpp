@@ -2,6 +2,8 @@
 // Découpé de l'ancien midp_natives.cpp ; état partagé : midp_internal.h.
 
 #include "midp/midp_internal.h"
+#include <map>
+#include <tuple>
 #include "hal/font.h"
 
 namespace jvm
@@ -453,15 +455,8 @@ namespace jvm
                 // Clamp aux bornes de l'écran réellement configuré (pas un
                 // 800x480 en dur) pour que l'image reste au moins partiellement
                 // visible même sur un profil de résolution différent.
-                int sw = screenW(), sh = screenH();
-                if (x > sw)
-                    x = sw;
-                if (y > sh)
-                    y = sh;
-                if (x + iw <= 0)
-                    x = 1 - iw;
-                if (y + ih <= 0)
-                    y = 1 - ih;
+                // (plus de « clamp » : Pix::put() rogne au clip et à la cible. L'ancien repositionnement d'une image
+                // entièrement hors écran laissait une colonne d'un pixel visible au bord.)
                 Pix p(ctx->thisObj);
                 for (int yy = 0; yy < ih; yy++)
                     for (int xx = 0; xx < iw; xx++)
@@ -501,17 +496,6 @@ namespace jvm
                     h = ih - ys;
                 // Clamp aux bornes de l'écran réellement configuré (cf. même
                 // correction dans g_drawImage juste au-dessus).
-                {
-                    int sw = screenW(), sh = screenH();
-                    if (x > sw)
-                        x = sw;
-                    if (y > sh)
-                        y = sh;
-                }
-                if (x + w <= 0)
-                    x = 1 - w;
-                if (y + h <= 0)
-                    y = 1 - h;
                 if (w <= 0 || h <= 0)
                     return;
 
@@ -805,10 +789,21 @@ namespace jvm
             }
             // Image.createImage(Image src, int x, int y, int w, int h, int transform) : sous-image transformée
             // (mêmes 8 transformations que drawRegion ; résultat immuable).
+            // Résultats mémorisés : sans GC, un jeu qui recrée la même sous-image à chaque trame (Stalker : police
+            // bitmap découpée à la volée) épuisait le tas et rendait l'émulateur inutilisable. Les images
+            // créées ici sont IMMUABLES : partager l'objet est sans conséquence.
+            static std::map<std::tuple<Obj *, int, int, int, int, int>, Obj *> g_subCache;
             static void img_createSub(NativeContext *ctx)
             {
                 Obj *src = argRef(ctx, 0);
                 int x = argInt(ctx, 1), y = argInt(ctx, 2), w = argInt(ctx, 3), h = argInt(ctx, 4), tfm = argInt(ctx, 5);
+                auto ck = std::make_tuple(src, x, y, w, h, tfm);
+                auto cit = g_subCache.find(ck);
+                if (cit != g_subCache.end())
+                {
+                    setRef(ctx, cit->second);
+                    return;
+                }
                 if (!src || src->kind != ObjKind::Instance || w <= 0 || h <= 0 || x < 0 || y < 0 ||
                     x + w > src->cells[IMG_W].i || y + h > src->cells[IMG_H].i || tfm < 0 || tfm > 7)
                 {
@@ -843,11 +838,23 @@ namespace jvm
                         }
                         buf->cells[dy * Wp + dx].u = sb ? sb->cells[(y + sy) * iw + (x + sx)].u : 0;
                     }
-                setRef(ctx, makeImage(Wp, Hp, false, buf));
+                Obj *made = makeImage(Wp, Hp, false, buf);
+                if (made && src && !src->cells[IMG_MUT].i) // source immuable : le cache reste valide
+                    g_subCache[ck] = made;
+                setRef(ctx, made);
             }
+            static std::map<std::string, Obj *> g_pathCache;
             static void img_createString(NativeContext *ctx)
             {
                 std::string path = (argRef(ctx, 0) && argRef(ctx, 0)->kind == ObjKind::String) ? argRef(ctx, 0)->str : "";
+                {
+                    auto pit = g_pathCache.find(path);
+                    if (pit != g_pathCache.end())
+                    {
+                        setRef(ctx, pit->second); // image immuable déjà décodée : on la réutilise (pas de GC -> pas de re-décodage à chaque appel)
+                        return;
+                    }
+                }
                 while (!path.empty() && path[0] == '/')
                     path.erase(0, 1);
                 jme::JarReader *jar = ctx->rt->jar();
@@ -864,16 +871,16 @@ namespace jvm
                         {
                             if (jvm::jmeDebug())
                                 fprintf(stderr, "[midp] createImage(\"%s\") : decode OK (%zu octets)\n", path.c_str(), n);
+                            g_pathCache[path] = img;
                             setRef(ctx, img);
                             return;
                         }
                     }
                 }
-                fprintf(stderr, "[midp] createImage(\"%s\") : introuvable ou décodage échoué\n", path.c_str());
-                Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, 1);
-                if (buf)
-                    buf->cells[0].u = 0xFFFFFFFF;
-                setRef(ctx, makeImage(1, 1, false, buf));
+                // Spec MIDP : IOException si la ressource est introuvable ou n'est pas une image décodable
+                // (le jeu la rattrape et se replie). Avant : image blanche 1x1 de remplacement.
+                fprintf(stderr, "[midp] createImage(\"%s\") : introuvable ou décodage échoué -> IOException\n", path.c_str());
+                throwJava(ctx, "java/io/IOException");
             }
             static void img_getGraphics(NativeContext *ctx)
             {
@@ -945,6 +952,10 @@ namespace jvm
                         fprintf(stderr, "flushGraphics()\n");
                 std::memcpy(fb->pixels, g_canvas565, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
                 hal::display_present(fb);
+                // Sur un vrai téléphone flushGraphics() est synchronisé sur l'affichage : beaucoup de boucles de jeu
+                // n'ont AUCUN Thread.sleep et comptent sur lui pour se cadencer. Ici on cède la main jusqu'à la trame
+                // suivante (une image par trame et par thread, sans brûler tout le budget de CPU en dessins inutiles).
+                jvm::jme_yieldNow();
             }
             static void gc_flushRegion(NativeContext *ctx)
             {
@@ -1240,14 +1251,14 @@ namespace jvm
                 Obj *src = argRef(ctx, 0);
                 if (!src || src->cellCount < 3 || !src->cells[0].o)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 Obj *data = src->cells[0].o;
                 int pos = src->cells[1].i, lim = src->cells[2].i;
                 if (data->kind != ObjKind::ByteArray || pos < 0 || lim > data->arrayLen || pos >= lim)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 if (jvm::jmeDebug())
@@ -1255,13 +1266,14 @@ namespace jvm
                 uint8_t *buf = static_cast<uint8_t *>(std::malloc(size_t(lim - pos)));
                 if (!buf)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 for (int i = pos; i < lim; i++)
                     buf[i - pos] = static_cast<uint8_t>(data->cells[i].u);
                 Obj *img = decodePng(buf, size_t(lim - pos));
                 std::free(buf);
+                if (!img) { throwJava(ctx, "java/io/IOException"); return; }
                 setRef(ctx, img);
             }
 
@@ -1271,19 +1283,20 @@ namespace jvm
                 int off = argInt(ctx, 1), len = argInt(ctx, 2);
                 if (!data || data->kind != ObjKind::ByteArray || off < 0 || len < 0 || off + len > data->arrayLen)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 uint8_t *buf = static_cast<uint8_t *>(std::malloc(size_t(len ? len : 1)));
                 if (!buf)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 for (int i = 0; i < len; i++)
                     buf[i] = static_cast<uint8_t>(data->cells[off + i].u);
                 Obj *img = decodePng(buf, size_t(len));
                 std::free(buf);
+                if (!img) { throwJava(ctx, "java/lang/IllegalArgumentException"); return; }
                 setRef(ctx, img);
             }
             void registerGraphicsNatives()
@@ -1324,8 +1337,8 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.drawRoundRect:(IIIIII)V", g_drawRoundRect);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
-                regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
-                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
+                regN("javax/microedition/lcdui/Graphics.drawChar:(CIII)V", g_drawChar);
+                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIIII)V", g_drawChars);
                 regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
                 regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
                 regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);
@@ -1340,8 +1353,8 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.drawRGB:([IIIIIIIZ)V", g_drawRGB);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
-                regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
-                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
+                regN("javax/microedition/lcdui/Graphics.drawChar:(CIII)V", g_drawChar);
+                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIIII)V", g_drawChars);
                 regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
                 regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
                 regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);

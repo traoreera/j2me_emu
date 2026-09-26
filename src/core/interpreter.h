@@ -83,6 +83,10 @@ namespace jvm
             std::swap(arenaSize_, size);
             std::swap(arenaOff_, off);
         }
+        // Limite basse de la pile C++ de l'exécution courante : en deçà, execBytecode lève StackOverflowError au
+        // lieu de laisser une récursion Java infinie faire déborder la pile (SEGV, surtout dans une fibre de 512 Ko).
+        void setStackLow(const char *low) { stackLow_ = low; }
+        const char *stackLow() const { return stackLow_; }
 
     private:
         Runtime *rt_;
@@ -90,6 +94,7 @@ namespace jvm
         size_t arenaSize_;
         size_t arenaOff_ = 0;
         size_t arenaBase_ = 0;
+        const char *stackLow_ = nullptr;
         int64_t instrBudget_ = -1;
         int64_t instrBudgetQuota_ = -1;
         YieldFn yieldFn_;

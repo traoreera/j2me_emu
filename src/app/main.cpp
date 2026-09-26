@@ -265,6 +265,10 @@ int main(int argc, char **argv)
     }
     jvm::Runtime rt(heapSize, heapMax);
     jvm::Interpreter interp(&rt);
+    {
+        char stackProbe;
+        interp.setStackLow(&stackProbe - 6 * 1024 * 1024); // pile principale : 8 Mo par défaut, on garde 2 Mo de marge
+    }
     rt.setJar(&jar);
 
     jvm::initNatives();
@@ -695,7 +699,7 @@ int main(int argc, char **argv)
             }
         }
 
-        hal::display_present(hal::display_get_framebuffer());
+        hal::display_flip();
 
         // Rythme de trame adaptatif : on ne dort que le temps restant du
         // budget de trame (au lieu d'un SDL_Delay(16) fixe qui s'ajoutait

@@ -114,6 +114,7 @@ namespace jvm
                 std::vector<Obj *> items;
                 Obj *itemListener = nullptr;
                 int focus = 0, scroll = 0;
+                Obj *enteredItem = nullptr; // CustomItem pour lequel traverse(NONE) a été appelé
                 // List
                 Chc ch;
                 Obj *selectCmd = nullptr;
@@ -839,6 +840,17 @@ namespace jvm
             static void ga_getMax(NativeContext *ctx) { setInt(ctx, itemOf(ctx->thisObj).gaugeMax); }
             static void ga_setMax(NativeContext *ctx) { itemOf(ctx->thisObj).gaugeMax = argInt(ctx, 1); g_uiDirty = true; }
             static void ga_isInteractive(NativeContext *ctx) { setInt(ctx, itemOf(ctx->thisObj).interactive ? 1 : 0); }
+            // CustomItem : le jeu fournit paint()/getPref*/traverse()/keyPressed()... ; ici le socle natif.
+            static void ci_init(NativeContext *ctx)
+            {
+                It &it = itemOf(ctx->thisObj);
+                it.kind = IK_CUSTOM;
+                it.label = sstr(argRef(ctx, 1));
+                it.interactive = true;
+            }
+            // TRAVERSE_HORIZONTAL|VERTICAL (1|2) + KEY_PRESS|RELEASE|REPEAT (4|8|16) + POINTER_PRESS|RELEASE|DRAG (32|64|128)
+            static void ci_interactionModes(NativeContext *ctx) { setInt(ctx, 0xFF); }
+            static void ci_repaint(NativeContext *) { g_uiDirty = true; }
             static void date_init(NativeContext *ctx) { It &it = itemOf(ctx->thisObj); it.kind = IK_DATE; it.label = sstr(argRef(ctx, 1)); }
             static void spacer_init(NativeContext *ctx) { itemOf(ctx->thisObj).kind = IK_SPACER; }
 
@@ -853,7 +865,7 @@ namespace jvm
                                       dim = rgb(110, 116, 140), box = rgb(255, 255, 255), border = rgb(90, 96, 120), alertBg = rgb(255, 250, 220),
                                       shade = rgb(60, 60, 70);
             }
-            enum HitKind { H_LIST_ROW, H_ITEM, H_CHOICE_ROW, H_SOFT_L, H_SOFT_R, H_ALERT, H_MENU_ROW };
+            enum HitKind { H_LIST_ROW, H_ITEM, H_CHOICE_ROW, H_SOFT_L, H_SOFT_R, H_ALERT, H_MENU_ROW, H_CUSTOM };
             struct Hit
             {
                 int x, y, w, h, kind, idx, sub;
@@ -1102,10 +1114,54 @@ namespace jvm
                     scroll = 0;
             }
 
+
+            // ---- CustomItem : appels vers le bytecode du jeu ----
+            static int ciCallInt(Obj *item, const char *name, const char *desc, int arg, bool hasArg)
+            {
+                Value a[2] = {Value::fromRef(item), Value::fromInt(arg)}, r;
+                if (g_interp && g_interp->invokeVirtual(item->cls, name, desc, item, a, hasArg ? 2 : 1, r))
+                    return r.i;
+                return 0;
+            }
+            static void ciCallKey(Obj *item, const char *name, int code)
+            {
+                Value a[2] = {Value::fromRef(item), Value::fromInt(code)}, r;
+                if (g_interp)
+                    g_interp->invokeVirtual(item->cls, name, "(I)V", item, a, 2, r);
+                g_uiDirty = true;
+            }
+            static void ciCallPointer(Obj *item, const char *name, int x, int y)
+            {
+                Value a[3] = {Value::fromRef(item), Value::fromInt(x), Value::fromInt(y)}, r;
+                if (g_interp)
+                    g_interp->invokeVirtual(item->cls, name, "(II)V", item, a, 3, r);
+                g_uiDirty = true;
+            }
+            // traverse(dir, viewportW, viewportH, int[4] visRect) : true = l'item garde le focus et gère lui-même le déplacement.
+            static bool ciTraverse(Obj *item, int dir, int vw, int vh)
+            {
+                Obj *rect = g_rt->heap().newArray(ObjKind::IntArray, 4);
+                if (rect)
+                {
+                    rect->cells[0] = Value::fromInt(0);
+                    rect->cells[1] = Value::fromInt(0);
+                    rect->cells[2] = Value::fromInt(vw);
+                    rect->cells[3] = Value::fromInt(vh);
+                }
+                Value a[5] = {Value::fromRef(item), Value::fromInt(dir), Value::fromInt(vw), Value::fromInt(vh), Value::fromRef(rect)}, r;
+                if (g_interp && g_interp->invokeVirtual(item->cls, "traverse", "(III[I)Z", item, a, 5, r))
+                {
+                    g_uiDirty = true;
+                    return r.i != 0;
+                }
+                return false;
+            }
+            static Obj *g_customPressed = nullptr; // item CustomItem qui a reçu pointerPressed (pour dragged/released)
+            static int g_customX = 0, g_customY = 0;
             static bool itemFocusable(Obj *o)
             {
                 It &it = itemOf(o);
-                if (it.kind == IK_TEXT || it.kind == IK_CHOICE)
+                if (it.kind == IK_TEXT || it.kind == IK_CHOICE || it.kind == IK_CUSTOM)
                     return true;
                 if (it.kind == IK_GAUGE && it.interactive)
                     return true;
@@ -1136,6 +1192,15 @@ namespace jvm
                         h += (it.ch.type == CH_POPUP && !it.ch.popupOpen) ? choiceRowH() : static_cast<int>(it.ch.txt.size()) * choiceRowH();
                         break;
                     case IK_GAUGE: h += lh; break;
+                    case IK_CUSTOM:
+                    {
+                        int pw = ciCallInt(s.items[n], "getPrefContentWidth", "(I)I", -1, true);
+                        int ph = ciCallInt(s.items[n], "getPrefContentHeight", "(I)I", std::min(pw, W), true);
+                        it.gaugeVal = std::max(1, std::min(pw > 0 ? pw : W, W));    // largeur retenue
+                        it.gaugeMax = std::max(1, std::min(ph > 0 ? ph : lh, 4000)); // hauteur retenue
+                        h += it.gaugeMax;
+                        break;
+                    }
                     case IK_DATE: h += lh; break;
                     case IK_SPACER: h += lh / 2; break;
                     default: h += lh; break;
@@ -1254,6 +1319,30 @@ namespace jvm
                                 rect(pad, cy + 2 * g_S, fillw, lh - 4 * g_S, foc ? col::selBg : col::dim);
                             text(pad + bw + g_S, cy, val, col::fg);
                         }
+                        break;
+                    }
+                    case IK_CUSTOM:
+                    {
+                        int cw2 = it.gaugeVal, ch2 = it.gaugeMax;
+                        if (jvm::jmeDebug())
+                            fprintf(stderr, "[lcdui] custom item n=%zu cy=%d iy=%d w=%d h=%d scroll=%d rowY=%d rowH=%d bodyTop=%d bodyBot=%d\n", n, cy, iy, cw2, ch2, s.scroll, rows[n].y, rows[n].h, bodyTop, bodyBot);
+                        int ix = (W - cw2) / 2 < 0 ? 0 : (W - cw2) / 2; // centré
+                        // Graphics « écran » : origine sur l'item, clip = item ∩ corps visible (coordonnées relatives à l'item).
+                        Obj *g = screenGraphics();
+                        int ax0 = std::max(ix, 0), ay0 = std::max(cy, bodyTop), ax1 = std::min(ix + cw2, W), ay1 = std::min(cy + ch2, bodyBot);
+                        if (g && ax1 > ax0 && ay1 > ay0)
+                        {
+                            g->cells[G_TX] = Value::fromInt(ix);
+                            g->cells[G_TY] = Value::fromInt(cy);
+                            g->cells[G_CLIPX] = Value::fromInt(ax0 - ix);
+                            g->cells[G_CLIPY] = Value::fromInt(ay0 - cy);
+                            g->cells[G_CLIPW] = Value::fromInt(ax1 - ax0);
+                            g->cells[G_CLIPH] = Value::fromInt(ay1 - ay0);
+                            Value a[4] = {Value::fromRef(s.items[n]), Value::fromRef(g), Value::fromInt(cw2), Value::fromInt(ch2)}, r;
+                            if (g_interp)
+                                g_interp->invokeVirtual(s.items[n]->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;II)V", s.items[n], a, 4, r);
+                        }
+                        g_hits.push_back({ix, std::max(cy, bodyTop), cw2, std::max(0, ay1 - std::max(cy, bodyTop)), H_CUSTOM, static_cast<int>(n), cy});
                         break;
                     }
                     default:
@@ -1500,8 +1589,18 @@ namespace jvm
             void lcduiPointer(int kind, int x, int y)
             {
                 Obj *disp = g_current;
-                if (kind != 0 || !lcduiIsScreen(disp))
+                if (!lcduiIsScreen(disp))
                     return;
+                if (kind != 0)
+                {
+                    if (g_customPressed)
+                    {
+                        ciCallPointer(g_customPressed, kind == 1 ? "pointerReleased" : "pointerDragged", x - g_customX, y - g_customY);
+                        if (kind == 1)
+                            g_customPressed = nullptr;
+                    }
+                    return;
+                }
                 Scr &s = scrOf(disp);
                 SoftKeys k = softKeysFor(disp, s);
                 for (auto it = g_hits.rbegin(); it != g_hits.rend(); ++it)
@@ -1543,6 +1642,16 @@ namespace jvm
                         g_uiDirty = true;
                         return;
                     }
+                    case H_CUSTOM:
+                    {
+                        Obj *io = s.items[h.idx];
+                        s.focus = h.idx;
+                        g_customPressed = io;
+                        g_customX = h.x;
+                        g_customY = h.sub;
+                        ciCallPointer(io, "pointerPressed", x - h.x, y - h.sub);
+                        return;
+                    }
                     case H_ITEM:
                         if (s.kind == SK_FORM && h.idx < static_cast<int>(s.items.size()))
                         {
@@ -1559,7 +1668,7 @@ namespace jvm
             }
 
             // Un tour d'entrées + rendu pour l'écran haut niveau courant.
-            void lcduiTick(Obj *disp, uint32_t justPressed)
+            void lcduiTick(Obj *disp, uint32_t justPressed, uint32_t justReleased)
             {
                 if (!lcduiIsScreen(disp))
                     return;
@@ -1654,7 +1763,34 @@ namespace jvm
                             if (s.scroll < 0) s.scroll = 0;
                             g_uiDirty = true;
                         };
-                        if (n > 0)
+                        if (n > 0 && fi && fi->kind == IK_CUSTOM)
+                        {
+                            const int vw = screenW(), vh = std::max(1, screenH() - 2 * lineH() - 4 * g_S);
+                            if (s.enteredItem != fo)
+                            {
+                                s.enteredItem = fo;
+                                ciTraverse(fo, 0, vw, vh); // CustomItem.NONE : l'item vient de prendre le focus
+                            }
+                            struct { uint32_t key; int dir; int step; } arrows[4] = {
+                                {hal::KEY_UP, 1, -1}, {hal::KEY_DOWN, 6, 1}, {hal::KEY_LEFT, 2, -1}, {hal::KEY_RIGHT, 5, 1}};
+                            for (auto &a : arrows)
+                                if (justPressed & a.key)
+                                    if (!ciTraverse(fo, a.dir, vw, vh))
+                                        step(a.step); // l'item ne garde pas le focus : on passe à l'item voisin
+                            static const hal::KeyCode others[] = {hal::KEY_FIRE, hal::KEY_0, hal::KEY_1, hal::KEY_2, hal::KEY_3, hal::KEY_4, hal::KEY_5,
+                                                                  hal::KEY_6, hal::KEY_7, hal::KEY_8, hal::KEY_9, hal::KEY_STAR, hal::KEY_HASH};
+                            for (hal::KeyCode kc : others)
+                            {
+                                if (justPressed & kc)
+                                    ciCallKey(fo, "keyPressed", midp::halKeyToMidp(kc));
+                                if (justReleased & kc)
+                                    ciCallKey(fo, "keyReleased", midp::halKeyToMidp(kc));
+                            }
+                            if (s.focus < n && s.items[s.focus] != fo)
+                                s.enteredItem = nullptr;
+                            g_uiDirty = true;
+                        }
+                        else if (n > 0)
                         {
                             if (justPressed & hal::KEY_UP)
                             {
@@ -1891,6 +2027,11 @@ namespace jvm
                 R("javax/microedition/lcdui/Gauge.isInteractive:()Z", ga_isInteractive);
                 R("javax/microedition/lcdui/DateField.<init>:(Ljava/lang/String;I)V", date_init);
                 R("javax/microedition/lcdui/Spacer.<init>:(II)V", spacer_init);
+                R("javax/microedition/lcdui/CustomItem.<init>:(Ljava/lang/String;)V", ci_init);
+                R("javax/microedition/lcdui/CustomItem.getInteractionModes:()I", ci_interactionModes);
+                R("javax/microedition/lcdui/CustomItem.repaint:()V", ci_repaint);
+                R("javax/microedition/lcdui/CustomItem.repaint:(IIII)V", ci_repaint);
+                R("javax/microedition/lcdui/CustomItem.invalidate:()V", ci_repaint);
 #undef R
             }
         } // namespace detail

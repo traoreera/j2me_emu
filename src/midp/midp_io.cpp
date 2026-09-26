@@ -301,6 +301,78 @@ static void native_TimerTask_init(NativeContext *ctx)
                 }
                 return true;
             }
+            // ----- java.io.InputStreamReader : décodage octets -> caractères (Latin-1 ou UTF-8 -> Latin-1) -----
+            // cells[0] = InputStream source, cells[1] = 1 si UTF-8.
+            static int isrReadChar(Obj *self)
+            {
+                Obj *in = self && self->cellCount >= 2 ? self->cells[0].o : nullptr;
+                int b = streamByte(in);
+                if (b < 0 || b < 0x80 || !self->cells[1].i)
+                    return b;
+                int need = (b & 0xE0) == 0xC0 ? 1 : ((b & 0xF0) == 0xE0 ? 2 : ((b & 0xF8) == 0xF0 ? 3 : 0));
+                uint32_t cp = need == 1 ? (b & 0x1Fu) : (need == 2 ? (b & 0x0Fu) : (b & 0x07u));
+                for (int k = 0; k < need; k++)
+                {
+                    int b2 = streamByte(in);
+                    if (b2 < 0)
+                        return '?';
+                    cp = (cp << 6) | (b2 & 0x3Fu);
+                }
+                return cp < 256 ? static_cast<int>(cp) : '?';
+            }
+            static void isr_init(NativeContext *ctx)
+            {
+                Obj *self = ctx->thisObj;
+                if (!self || self->cellCount < 2)
+                    return;
+                self->cells[0] = Value::fromRef(argRef(ctx, 1));
+                Obj *enc = ctx->nargs > 2 ? argRef(ctx, 2) : nullptr;
+                std::string e = (enc && enc->kind == ObjKind::String) ? enc->str : "";
+                for (char &c : e) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+                self->cells[1] = Value::fromInt((e == "UTF-8" || e == "UTF8") ? 1 : 0);
+                if (ctx->nargs > 2 && enc && e != "UTF-8" && e != "UTF8" && e != "ISO-8859-1" && e != "ISO8859_1" && e != "US-ASCII" && e != "ASCII")
+                    throwJava(ctx, "java/io/UnsupportedEncodingException");
+            }
+            static void isr_read(NativeContext *ctx) { setInt(ctx, isrReadChar(ctx->thisObj)); }
+            static void isr_readArr(NativeContext *ctx) // read(char[]) / read(char[],off,len)
+            {
+                Obj *a = argRef(ctx, 1);
+                int off = ctx->nargs > 2 ? argInt(ctx, 2) : 0;
+                int len = ctx->nargs > 3 ? argInt(ctx, 3) : (a ? a->arrayLen : 0);
+                if (!a || off < 0 || len < 0 || off + len > a->arrayLen)
+                {
+                    throwJava(ctx, "java/lang/IndexOutOfBoundsException");
+                    return;
+                }
+                if (len == 0)
+                {
+                    setInt(ctx, 0);
+                    return;
+                }
+                int n = 0;
+                for (; n < len; n++)
+                {
+                    int c = isrReadChar(ctx->thisObj);
+                    if (c < 0)
+                        break;
+                    a->cells[off + n] = Value::fromInt(c);
+                }
+                setInt(ctx, n == 0 ? -1 : n);
+            }
+            static void isr_ready(NativeContext *ctx)
+            {
+                Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 2 ? ctx->thisObj->cells[0].o : nullptr;
+                setInt(ctx, (in && in->cellCount >= 3 && in->cells[2].i > in->cells[1].i) ? 1 : 0);
+            }
+            static void isr_skip(NativeContext *ctx)
+            {
+                int64_t n = argLongL(ctx, 1), k = 0;
+                while (k < n && isrReadChar(ctx->thisObj) >= 0)
+                    k++;
+                setLong(ctx, k);
+            }
+            static void isr_close(NativeContext *ctx) { (void)ctx; }
+
             static void di_read(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj)); }
             static void di_readArr(NativeContext *ctx)
             {
@@ -626,6 +698,14 @@ static void native_TimerTask_init(NativeContext *ctx)
                 regN("java/io/ByteArrayInputStream.mark:(I)V", bais_mark);
                 regN("java/io/ByteArrayInputStream.reset:()V", bais_reset);
                 regN("java/io/DataInputStream.<init>:(Ljava/io/InputStream;)V", dis_init);
+                regN("java/io/InputStreamReader.<init>:(Ljava/io/InputStream;)V", isr_init);
+                regN("java/io/InputStreamReader.<init>:(Ljava/io/InputStream;Ljava/lang/String;)V", isr_init);
+                regN("java/io/InputStreamReader.read:()I", isr_read);
+                regN("java/io/InputStreamReader.read:([C)I", isr_readArr);
+                regN("java/io/InputStreamReader.read:([CII)I", isr_readArr);
+                regN("java/io/InputStreamReader.ready:()Z", isr_ready);
+                regN("java/io/InputStreamReader.skip:(J)J", isr_skip);
+                regN("java/io/InputStreamReader.close:()V", isr_close);
                 regN("java/io/DataInputStream.read:()I", di_read);
                 regN("java/io/DataInputStream.read:([B)I", di_readArr);
                 regN("java/io/DataInputStream.read:([BII)I", di_readArrII);

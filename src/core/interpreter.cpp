@@ -459,6 +459,17 @@ bool Interpreter::ensureInit(ClassInfo *cls)
 bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
                                Value *args, int nargs, Value &result)
 {
+    {
+        char probe;
+        if (stackLow_ && &probe < stackLow_)
+        {
+            if (envDebug())
+                fprintf(stderr, "StackOverflowError dans %s.%s\n", cls->name.c_str(), m->name.c_str());
+            if (ClassInfo *so = rt_->classInfoOfName("java/lang/StackOverflowError"))
+                pendingException_ = rt_->heap().newInstance(so);
+            return false;
+        }
+    }
     const CodeAttribute *code = m->mi->code();
     if (!code)
         return false;

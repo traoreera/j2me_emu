@@ -264,7 +264,9 @@ namespace jvm
                     fprintf(stderr, "TICK paint initial sur %s\n", cur->cls ? cur->cls->name.c_str() : "?");
                 Value pargs[2] = {Value::fromRef(cur), Value::fromRef(screenGraphics())};
                 Value pres;
-                g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, pargs, 2, pres);
+                if (const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V"))
+                    if (pm->mi)
+                        g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, pargs, 2, pres);
                 g_paintRequested = false;
                 hal::display_present(hal::display_get_framebuffer());
             }
@@ -394,7 +396,9 @@ namespace jvm
                 args[0] = Value::fromRef(cur);
                 args[1] = Value::fromRef(screenGraphics());
                 Value res;
-                g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, args, 2, res);
+                if (const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V"))
+                    if (pm->mi) // paint() du jeu (bytecode) ; un GameCanvas peut ne dessiner que via flushGraphics()
+                        g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, args, 2, res);
                 g_paintRequested = false;
                 lcduiCanvasOverlay(cur);
                 hal::display_present(hal::display_get_framebuffer());
@@ -402,7 +406,7 @@ namespace jvm
 
             // --- Écrans lcdui haut niveau (List / Form / Alert / TextBox) : entrées + rendu (midp_lcdui.cpp) ---
             if (lcduiIsScreen(cur))
-                lcduiTick(cur, justPressedMask);
+                lcduiTick(cur, justPressedMask, justReleasedMask);
         }
 
         void n_SB_appendCharArray(NativeContext *ctx)
@@ -474,7 +478,7 @@ namespace jvm
                      {{"println", "(Ljava/lang/Object;)V"}, {"print", "(Ljava/lang/Object;)V"}, {"println", "(C)V"}, {"println", "(J)V"}, {"println", "(Z)V"}, {"print", "(C)V"}, {"print", "(J)V"}, {"print", "(Z)V"}, {"println", "([C)V"}, {"println", "(Ljava/lang/String;)V"}, {"println", "(I)V"}, {"println", "()V"}, {"print", "(Ljava/lang/String;)V"}, {"print", "(I)V"}, {"flush", "()V"}},
                      none);
             regClass(rt, "java/lang/Class", "java/lang/Object",
-                     {{"getName", "()Ljava/lang/String;"}, {"forName", "(Ljava/lang/String;)Ljava/lang/Class;"}, {"getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;"}},
+                     {{"getName", "()Ljava/lang/String;"}, {"newInstance", "()Ljava/lang/Object;"}, {"forName", "(Ljava/lang/String;)Ljava/lang/Class;"}, {"getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;"}},
                      none);
 
             // --- java.lang : hiérarchie Throwable/Exception ---
@@ -503,6 +507,11 @@ namespace jvm
             regClass(rt, "java/lang/InterruptedException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/SecurityException", "java/lang/RuntimeException", none, none);
             regClass(rt, "java/io/IOException", "java/lang/Exception", none, none);
+            regClass(rt, "java/io/Reader", "java/lang/Object",
+                     {{"read", "()I"}, {"read", "([C)I"}, {"read", "([CII)I"}, {"ready", "()Z"}, {"skip", "(J)J"}, {"close", "()V"}}, none);
+            regClass(rt, "java/io/InputStreamReader", "java/io/Reader",
+                     {{"<init>", "(Ljava/io/InputStream;)V"}, {"<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V"}, {"read", "()I"}, {"read", "([C)I"}, {"read", "([CII)I"}, {"ready", "()Z"}, {"skip", "(J)J"}, {"close", "()V"}},
+                     {{"in", "Ljava/io/InputStream;"}, {"utf8", "I"}});
             regClass(rt, "java/lang/ClassNotFoundException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/InstantiationException", "java/lang/Exception", none, none);
             regClass(rt, "java/lang/IllegalAccessException", "java/lang/Exception", none, none);
@@ -578,7 +587,7 @@ namespace jvm
                      {{"<init>", "(J)V"}, {"<init>", "()V"}, {"setSeed", "(J)V"}, {"nextInt", "()I"}, {"nextInt", "(I)I"}, {"nextLong", "()J"}, {"nextDouble", "()D"}, {"nextFloat", "()F"}, {"nextBoolean", "()Z"}},
                      {{"seed", "J"}});
             regClass(rt, "java/util/Vector", "java/lang/Object",
-                     {{"elements", "()Ljava/util/Enumeration;"}, {"copyInto", "([Ljava/lang/Object;)V"}, {"setSize", "(I)V"}, {"capacity", "()I"}, {"indexOf", "(Ljava/lang/Object;I)I"}, {"lastIndexOf", "(Ljava/lang/Object;)I"}, {"toString", "()Ljava/lang/String;"}, {"<init>", "()V"}, {"<init>", "(I)V"}, {"<init>", "(II)V"}, {"addElement", "(Ljava/lang/Object;)V"}, {"elementAt", "(I)Ljava/lang/Object;"}, {"setElementAt", "(Ljava/lang/Object;I)V"}, {"insertElementAt", "(Ljava/lang/Object;I)V"}, {"removeElement", "(Ljava/lang/Object;)Z"}, {"removeElementAt", "(I)V"}, {"removeAllElements", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}, {"contains", "(Ljava/lang/Object;)Z"}, {"indexOf", "(Ljava/lang/Object;)I"}, {"firstElement", "()Ljava/lang/Object;"}, {"lastElement", "()Ljava/lang/Object;"}},
+                     {{"trimToSize", "()V"}, {"ensureCapacity", "(I)V"}, {"elements", "()Ljava/util/Enumeration;"}, {"copyInto", "([Ljava/lang/Object;)V"}, {"setSize", "(I)V"}, {"capacity", "()I"}, {"indexOf", "(Ljava/lang/Object;I)I"}, {"lastIndexOf", "(Ljava/lang/Object;)I"}, {"toString", "()Ljava/lang/String;"}, {"<init>", "()V"}, {"<init>", "(I)V"}, {"<init>", "(II)V"}, {"addElement", "(Ljava/lang/Object;)V"}, {"elementAt", "(I)Ljava/lang/Object;"}, {"setElementAt", "(Ljava/lang/Object;I)V"}, {"insertElementAt", "(Ljava/lang/Object;I)V"}, {"removeElement", "(Ljava/lang/Object;)Z"}, {"removeElementAt", "(I)V"}, {"removeAllElements", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}, {"contains", "(Ljava/lang/Object;)Z"}, {"indexOf", "(Ljava/lang/Object;)I"}, {"firstElement", "()Ljava/lang/Object;"}, {"lastElement", "()Ljava/lang/Object;"}},
                      {{"elementCount", "I"}, {"elementData", "[Ljava/lang/Object;"}});
             regClass(rt, "java/util/Stack", "java/util/Vector",
                      {{"<init>", "()V"}, {"push", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"pop", "()Ljava/lang/Object;"}, {"peek", "()Ljava/lang/Object;"}, {"empty", "()Z"}, {"search", "(Ljava/lang/Object;)I"}},
@@ -703,27 +712,36 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
             // premier lancement.
             regClass(rt, "javax/microedition/rms/RecordStore", "java/lang/Object",
                      {{"openRecordStore", "(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;"},
-                      {"getNumRecords", "()I"},
-                      {"getRecord", "(I[BI)I"},
-                      {"getRecord", "(I)[B"},
-                      {"getRecordSize", "(I)I"},
-                      {"setRecord", "(I[BII)V"},
-                      {"addRecord", "([BII)I"},
-                      {"closeRecordStore", "()V"},
-                      {"deleteRecordStore", "(Ljava/lang/String;)V"},
+                      {"openRecordStore", "(Ljava/lang/String;ZIZ)Ljavax/microedition/rms/RecordStore;"},
+                      {"openRecordStore", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljavax/microedition/rms/RecordStore;"},
+                      {"getNumRecords", "()I"}, {"getName", "()Ljava/lang/String;"}, {"getVersion", "()I"}, {"getSize", "()I"},
+                      {"getSizeAvailable", "()I"}, {"getLastModified", "()J"}, {"getNextRecordID", "()I"},
+                      {"getRecord", "(I[BI)I"}, {"getRecord", "(I)[B"}, {"getRecordSize", "(I)I"},
+                      {"setRecord", "(I[BII)V"}, {"addRecord", "([BII)I"}, {"deleteRecord", "(I)V"},
+                      {"closeRecordStore", "()V"}, {"deleteRecordStore", "(Ljava/lang/String;)V"},
                       {"listRecordStores", "()[Ljava/lang/String;"},
+                      {"addRecordListener", "(Ljavax/microedition/rms/RecordListener;)V"}, {"removeRecordListener", "(Ljavax/microedition/rms/RecordListener;)V"},
+                      {"setMode", "(IZ)V"},
                       {"enumerateRecords", "(Ljavax/microedition/rms/RecordFilter;Ljavax/microedition/rms/RecordComparator;Z)Ljavax/microedition/rms/RecordEnumeration;"}},
-                     {{"__name", "Ljava/lang/String;"}});
-            // javax.microedition.rms.RecordEnumeration : implémenté nativement par
-            // une classe d'accueil (l'interface elle-même n'a pas de bytecode).
-            // n_RS_enumerate renvoie une énumération vide (hasNextElement()=false)
-            // ce qui fait prendre au jeu le chemin "aucune sauvegarde, nouvelle
-            // partie" (observé sur games/mission.jar, classe obfusquée c).
+                     {{"__name", "Ljava/lang/String;"}, {"__open", "I"}});
+            regClass(rt, "javax/microedition/rms/RecordStoreException", "java/lang/Exception", none, none);
+            regClass(rt, "javax/microedition/rms/RecordStoreNotFoundException", "javax/microedition/rms/RecordStoreException", none, none);
+            regClass(rt, "javax/microedition/rms/RecordStoreNotOpenException", "javax/microedition/rms/RecordStoreException", none, none);
+            regClass(rt, "javax/microedition/rms/RecordStoreFullException", "javax/microedition/rms/RecordStoreException", none, none);
+            regClass(rt, "javax/microedition/rms/InvalidRecordIDException", "javax/microedition/rms/RecordStoreException", none, none);
+            regClass(rt, "javax/microedition/rms/RecordFilter", "java/lang/Object", {{"matches", "([B)Z"}}, none);
+            regClass(rt, "javax/microedition/rms/RecordComparator", "java/lang/Object", {{"compare", "([B[B)I"}}, none);
+            regClass(rt, "javax/microedition/rms/RecordListener", "java/lang/Object", none, none);
+            regClass(rt, "javax/microedition/rms/RecordEnumeration", "java/lang/Object",
+                     {{"hasNextElement", "()Z"}, {"hasPreviousElement", "()Z"}, {"nextRecordId", "()I"}, {"previousRecordId", "()I"}, {"nextRecord", "()[B"}, {"previousRecord", "()[B"}, {"numRecords", "()I"}, {"destroy", "()V"}, {"reset", "()V"}, {"rebuild", "()V"}, {"isKeptUpdated", "()Z"}, {"keepUpdated", "(Z)V"}},
+                     none);
+            // javax.microedition.rms.RecordEnumeration : implémenté nativement par une classe d'accueil (l'interface n'a pas
+            // de bytecode) ; ses instances portent l'instantané des ids (cf. natives.cpp, n_RS_enumerate).
             regClass(rt, "javax/microedition/rms/RecordEnumerationImpl", "java/lang/Object",
-                     {{"hasNextElement", "()Z"}, {"hasPreviousElement", "()Z"}, {"nextRecordId", "()I"}, {"previousRecordId", "()I"}, {"nextRecord", "()[B"}, {"previousRecord", "()[B"}, {"numRecords", "()I"}, {"destroy", "()V"}, {"reset", "()V"}},
-                     {{"store", "Ljava/lang/String;"}, {"ids", "[I"}, {"pos", "I"}});
+                     {{"hasNextElement", "()Z"}, {"hasPreviousElement", "()Z"}, {"nextRecordId", "()I"}, {"previousRecordId", "()I"}, {"nextRecord", "()[B"}, {"previousRecord", "()[B"}, {"numRecords", "()I"}, {"destroy", "()V"}, {"reset", "()V"}, {"rebuild", "()V"}, {"isKeptUpdated", "()Z"}, {"keepUpdated", "(Z)V"}},
+                     {{"store", "Ljava/lang/String;"}, {"ids", "[I"}, {"pos", "I"}, {"keep", "I"}, {"filter", "Ljava/lang/Object;"}, {"cmp", "Ljava/lang/Object;"}});
             regClass(rt, "javax/microedition/lcdui/Graphics", "java/lang/Object",
-                     {{"getRedComponent", "()I"}, {"getGreenComponent", "()I"}, {"getBlueComponent", "()I"}, {"getDisplayColor", "(I)I"}, {"getStrokeStyle", "()I"}, {"setStrokeStyle", "(I)V"}, {"drawSubstring", "(Ljava/lang/String;IIIII)V"}, {"setColor", "(I)V"}, {"setColor", "(III)V"}, {"getColor", "()I"}, {"setGrayScale", "(I)V"}, {"getGrayScale", "()I"}, {"fillRect", "(IIII)V"}, {"drawRect", "(IIII)V"}, {"drawLine", "(IIII)V"}, {"fillTriangle", "(IIIIII)V"}, {"drawArc", "(IIIIII)V"}, {"fillArc", "(IIIIII)V"}, {"fillRoundRect", "(IIIIII)V"}, {"drawRoundRect", "(IIIIII)V"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}, {"getFont", "()Ljavax/microedition/lcdui/Font;"}, {"drawString", "(Ljava/lang/String;II)V"}, {"drawString", "(Ljava/lang/String;III)V"}, {"drawChar", "(CII)V"}, {"drawChars", "([CIIII)V"}, {"drawImage", "(Ljavax/microedition/lcdui/Image;III)V"}, {"drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V"}, {"setClip", "(IIII)V"}, {"clipRect", "(IIII)V"}, {"getClipX", "()I"}, {"getClipY", "()I"}, {"getClipWidth", "()I"}, {"getClipHeight", "()I"}, {"translate", "(II)V"}, {"getTranslateX", "()I"}, {"getTranslateY", "()I"}, {"drawRGB", "([IIIIIIIZ)V"}},
+                     {{"getRedComponent", "()I"}, {"getGreenComponent", "()I"}, {"getBlueComponent", "()I"}, {"getDisplayColor", "(I)I"}, {"getStrokeStyle", "()I"}, {"setStrokeStyle", "(I)V"}, {"drawSubstring", "(Ljava/lang/String;IIIII)V"}, {"setColor", "(I)V"}, {"setColor", "(III)V"}, {"getColor", "()I"}, {"setGrayScale", "(I)V"}, {"getGrayScale", "()I"}, {"fillRect", "(IIII)V"}, {"drawRect", "(IIII)V"}, {"drawLine", "(IIII)V"}, {"fillTriangle", "(IIIIII)V"}, {"drawArc", "(IIIIII)V"}, {"fillArc", "(IIIIII)V"}, {"fillRoundRect", "(IIIIII)V"}, {"drawRoundRect", "(IIIIII)V"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}, {"getFont", "()Ljavax/microedition/lcdui/Font;"}, {"drawString", "(Ljava/lang/String;II)V"}, {"drawString", "(Ljava/lang/String;III)V"}, {"drawChar", "(CIII)V"}, {"drawChars", "([CIIIII)V"}, {"drawImage", "(Ljavax/microedition/lcdui/Image;III)V"}, {"drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V"}, {"setClip", "(IIII)V"}, {"clipRect", "(IIII)V"}, {"getClipX", "()I"}, {"getClipY", "()I"}, {"getClipWidth", "()I"}, {"getClipHeight", "()I"}, {"translate", "(II)V"}, {"getTranslateX", "()I"}, {"getTranslateY", "()I"}, {"drawRGB", "([IIIIIIIZ)V"}},
                      {{"color", "I"}, {"font", "Ljavax/microedition/lcdui/Font;"}, {"translateX", "I"}, {"translateY", "I"}, {"clipX", "I"}, {"clipY", "I"}, {"clipW", "I"}, {"clipH", "I"}, {"mode", "I"}, {"targetW", "I"}, {"targetH", "I"}, {"stride", "I"}, {"buf", "[I"}});
             regClass(rt, "javax/microedition/lcdui/Font", "java/lang/Object",
                      {{"getFont", "(III)Ljavax/microedition/lcdui/Font;"}, {"getDefaultFont", "()Ljavax/microedition/lcdui/Font;"}, {"getHeight", "()I"}, {"getBaselinePosition", "()I"}, {"getFace", "()I"}, {"getStyle", "()I"}, {"getSize", "()I"}, {"stringWidth", "(Ljava/lang/String;)I"}, {"charWidth", "(C)I"}, {"charsWidth", "([CII)I"}},
@@ -784,7 +802,7 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
             regClass(rt, "javax/microedition/lcdui/CommandListener", "java/lang/Object", none, none);
             regClass(rt, "javax/microedition/lcdui/DisplayableCommandListener", "java/lang/Object", none, none);
             regClass(rt, "javax/microedition/lcdui/CustomItem", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;)V"}, {"getMinContentWidth", "()I"}, {"getMinContentHeight", "()I"}, {"getPrefContentWidth", "(I)I"}, {"getPrefContentHeight", "(I)I"}, {"repaint", "()V"}},
+                     {{"<init>", "(Ljava/lang/String;)V"}, {"getMinContentWidth", "()I"}, {"getMinContentHeight", "()I"}, {"getPrefContentWidth", "(I)I"}, {"getPrefContentHeight", "(I)I"}, {"repaint", "()V"}, {"repaint", "(IIII)V"}, {"invalidate", "()V"}, {"getInteractionModes", "()I"}},
                      none);
 
             // --- MMAPI (audio simulé : états + événements "started"/"endOfMedia") ---

@@ -26,10 +26,12 @@ namespace jvm
     const std::vector<Obj *> &jme_threads();
     void jme_threadForget(Obj *r);
     bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls);
+    void jme_yieldNow(); // suspend la fibre courante jusqu'à la prochaine trame (no-op hors fibre)
 
 
     namespace midp
     {
+        int halKeyToMidp(hal::KeyCode kc); // touche HAL -> code de touche MIDP (défini dans midp_natives.cpp)
         extern int g_fbWrites, g_pixdbg, g_screenPix, g_canvasPix, g_flushCalls;
         namespace detail
         {
@@ -187,7 +189,7 @@ namespace jvm
             void drawRegionRaw(Pix &p, Obj *src, int iw, int xs, int ys, int w, int h, int tfm, int dx, int dy);
             // --- lcdui haut niveau (midp_lcdui.cpp) ---
             bool lcduiIsScreen(Obj *o);                        // Form / List / Alert / TextBox
-            void lcduiTick(Obj *disp, uint32_t justPressed);   // entrées + rendu de l'écran courant
+            void lcduiTick(Obj *disp, uint32_t justPressed, uint32_t justReleased);   // entrées + rendu de l'écran courant
             void lcduiPointer(int kind, int x, int y);         // clic souris sur un écran haut niveau
             uint32_t lcduiCanvasSoftKeys(Obj *cur, uint32_t justPressed); // touches programmables -> Commands d'un Canvas
             void lcduiCanvasOverlay(Obj *cur);                 // barre de commandes d'un Canvas non plein écran
@@ -243,11 +245,13 @@ namespace jvm
 
                 void put(int x, int y, uint32_t argb)
                 {
-                    int rx = x - tx, ry = y - ty;
-                    if (rx < clipX || ry < clipY)
+                    // (x,y) = coordonnées UTILISATEUR (repère translaté) : le clip est exprimé dans ce repère
+                    // (spec MIDP), la cible reçoit (x+tx, y+ty). Avant : x - tx (translation inversée !).
+                    if (x < clipX || y < clipY)
                         return;
-                    if (rx >= clipX + clipW || ry >= clipY + clipH)
+                    if (x >= clipX + clipW || y >= clipY + clipH)
                         return;
+                    int rx = x + tx, ry = y + ty;
                     if (rx < 0 || ry < 0 || rx >= tw || ry >= th)
                         return;
 

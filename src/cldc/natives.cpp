@@ -4,6 +4,7 @@
 #include "core/interpreter.h"
 
 #include <algorithm>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -183,7 +184,7 @@ bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
     if (!f)
     {
         f = new JmeFiber();
-        f->stack.resize(256 * 1024);
+        f->stack.resize(512 * 1024);
         f->arena.resize(192 * 1024);
         f->aBase = f->arena.data();
         f->aSize = f->arena.size();
@@ -202,7 +203,10 @@ bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
     g_startingFiber = f;
     interp->setYieldFn([f]() { swapcontext(&f->ctx, &f->callerCtx); });
     interp->swapArena(f->aBase, f->aSize, f->aOff); // installe l'arène de la fibre (f->a* = celle de l'appelant)
+    const char *callerLow = interp->stackLow();
+    interp->setStackLow(f->stack.data() + 48 * 1024); // marge pour les natives et le déroulement de l'exception
     swapcontext(&f->callerCtx, &f->ctx);
+    interp->setStackLow(callerLow);
     interp->swapArena(f->aBase, f->aSize, f->aOff); // rend l'arène de l'appelant (f->a* = celle de la fibre)
     interp->clearYieldFn();
     g_currentFiber = prevCurrent;
@@ -996,15 +1000,27 @@ void n_Boolean_valueOf(NativeContext *ctx)
     setRefResult(ctx, o);
 }
 
-std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> &rsRegistry()
+// ---------------------------------------------------------------------------------------------
+// javax.microedition.rms : RecordStore + RecordEnumeration
+// ---------------------------------------------------------------------------------------------
+// Modèle : `Store` par nom (deux open() du même nom partagent les données) ; identifiants de records
+// STABLES et jamais réutilisés (deleteRecord laisse un trou, nextId ne recule pas). Persistance : un fichier
+// par magasin dans rmsDir() ("<jeu>.rms/"). Format v1 (magasin dense, ids 1..n) : u32 nbRecords puis
+// (u32 taille + octets) par record, little-endian ; format v2 (ids creux) : u32 0xFFFFFFF2, u32 nextId,
+// u32 nbRecords, puis (u32 id, u32 taille, octets). Un fichier corrompu/tronqué = magasin vide, jamais fatal.
+struct RsStore
 {
-    static std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> m;
+    std::map<int, std::vector<uint8_t>> recs;
+    int nextId = 1;
+    int version = 0;
+    int64_t modified = 0;
+};
+std::map<std::string, RsStore> &rsRegistry()
+{
+    static std::map<std::string, RsStore> m;
     return m;
 }
 
-// Persistance : un fichier par magasin dans rmsDir() (défini par main.cpp,
-// "<jeu>.rms/"). Vide = pas de persistance (comportement historique, tests).
-// Format : u32 nbRecords, puis pour chacun u32 taille + octets (little-endian).
 std::string &rmsDir() { return g_rmsDir; }
 std::string rsFile(const std::string &name)
 {
@@ -1023,106 +1039,241 @@ void rsSave(const std::string &name)
     FILE *f = fopen(rsFile(name).c_str(), "wb");
     if (!f) return;
     auto w32 = [&](uint32_t v) { uint8_t b[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)}; fwrite(b, 1, 4, f); };
-    w32(static_cast<uint32_t>(it->second.size()));
-    for (const auto &r : it->second)
+    const RsStore &st = it->second;
+    bool dense = static_cast<int>(st.recs.size()) == st.nextId - 1;
+    if (dense)
     {
-        w32(static_cast<uint32_t>(r.size()));
-        if (!r.empty()) fwrite(r.data(), 1, r.size(), f);
+        int expect = 1;
+        for (const auto &kv : st.recs)
+            if (kv.first != expect++) { dense = false; break; }
+    }
+    if (dense)
+        w32(static_cast<uint32_t>(st.recs.size()));
+    else
+    {
+        w32(0xFFFFFFF2u);
+        w32(static_cast<uint32_t>(st.nextId));
+        w32(static_cast<uint32_t>(st.recs.size()));
+    }
+    for (const auto &kv : st.recs)
+    {
+        if (!dense) w32(static_cast<uint32_t>(kv.first));
+        w32(static_cast<uint32_t>(kv.second.size()));
+        if (!kv.second.empty()) fwrite(kv.second.data(), 1, kv.second.size(), f);
     }
     fclose(f);
 }
-bool rsLoad(const std::string &name, std::vector<std::vector<uint8_t>> &out)
+bool rsLoad(const std::string &name, RsStore &out)
 {
     if (rmsDir().empty()) return false;
     FILE *f = fopen(rsFile(name).c_str(), "rb");
     if (!f) return false;
     auto r32 = [&](uint32_t &v) { uint8_t b[4]; if (fread(b, 1, 4, f) != 4) return false; v = b[0] | (b[1] << 8) | (b[2] << 16) | (uint32_t(b[3]) << 24); return true; };
-    uint32_t n = 0;
-    bool ok = r32(n) && n < 100000;
+    uint32_t n = 0, nextId = 0;
+    bool v2 = false, ok = r32(n);
+    if (ok && n == 0xFFFFFFF2u)
+    {
+        v2 = true;
+        ok = r32(nextId) && r32(n);
+    }
+    ok = ok && n < 100000;
     for (uint32_t i = 0; ok && i < n; i++)
     {
-        uint32_t len = 0;
+        uint32_t id = i + 1, len = 0;
+        if (v2 && !r32(id)) { ok = false; break; }
         if (!r32(len) || len > (16u << 20)) { ok = false; break; }
         std::vector<uint8_t> rec(len);
         if (len && fread(rec.data(), 1, len, f) != len) { ok = false; break; }
-        out.push_back(std::move(rec));
+        out.recs[static_cast<int>(id)] = std::move(rec);
     }
     fclose(f);
-    if (!ok) out.clear();
-    return ok;
+    if (!ok) { out.recs.clear(); out.nextId = 1; return false; }
+    out.nextId = v2 ? static_cast<int>(nextId) : static_cast<int>(n) + 1;
+    if (out.nextId < 1) out.nextId = 1;
+    for (const auto &kv : out.recs)
+        if (kv.first >= out.nextId) out.nextId = kv.first + 1;
+    return true;
 }
+bool rsExists(const std::string &name)
+{
+    if (rsRegistry().count(name)) return true;
+    if (rmsDir().empty()) return false;
+    FILE *f = fopen(rsFile(name).c_str(), "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+RsStore &rsGet(const std::string &name)
+{
+    auto it = rsRegistry().find(name);
+    if (it == rsRegistry().end())
+    {
+        RsStore st;
+        rsLoad(name, st); // magasin rechargé du disque, ou neuf
+        it = rsRegistry().emplace(name, std::move(st)).first;
+    }
+    return it->second;
+}
+void rsTouch(RsStore &st) { st.version++; st.modified = virtualMillis(); }
 
+enum { RS_OPEN = 1 };
 std::string rsName(NativeContext *ctx)
 {
     Obj *n = ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[RS_NAME].o : nullptr;
     return (n && n->kind == ObjKind::String) ? n->str : "";
 }
-
-void n_RS_open(NativeContext *ctx)
+// Magasin de l'objet RecordStore ; lève RecordStoreNotOpenException s'il est fermé.
+RsStore *rsOpen(NativeContext *ctx)
 {
-    Obj *nameObj = argRef(ctx, 0);
-    std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
-    if (rsRegistry().find(name) == rsRegistry().end())
+    Obj *o = ctx->thisObj;
+    if (!o || !o->cells || (o->cellCount > RS_OPEN && !o->cells[RS_OPEN].i))
     {
-        auto &recs = rsRegistry()[name]; // magasin neuf, ou rechargé depuis le disque
-        rsLoad(name, recs);
+        throwJava(ctx, "javax/microedition/rms/RecordStoreNotOpenException");
+        return nullptr;
     }
+    return &rsGet(rsName(ctx));
+}
+Obj *rsBytes(NativeContext *ctx, const std::vector<uint8_t> &rec)
+{
+    Obj *b = ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int>(rec.size()));
+    if (b)
+        for (size_t i = 0; i < rec.size(); i++)
+            b->cells[i].u = rec[i];
+    return b;
+}
+
+void rsOpenImpl(NativeContext *ctx, Obj *nameObj, bool create)
+{
+    if (!nameObj || nameObj->kind != ObjKind::String || nameObj->str.empty() || nameObj->str.size() > 32)
+    {
+        throwJava(ctx, "java/lang/IllegalArgumentException");
+        return;
+    }
+    const std::string &name = nameObj->str;
+    if (!rsExists(name) && !create)
+    {
+        throwJava(ctx, "javax/microedition/rms/RecordStoreNotFoundException");
+        return;
+    }
+    rsGet(name);
     ClassInfo *c = clsOf(ctx, "javax/microedition/rms/RecordStore");
     Obj *rs = c ? ctx->rt->heap().newInstance(c) : nullptr;
-    if (rs && rs->cells) rs->cells[RS_NAME] = Value::fromRef(nameObj);
+    if (rs && rs->cells)
+    {
+        rs->cells[RS_NAME] = Value::fromRef(nameObj);
+        if (rs->cellCount > RS_OPEN) rs->cells[RS_OPEN] = Value::fromInt(1);
+    }
     setRefResult(ctx, rs);
 }
-void n_RS_getNumRecords(NativeContext *ctx)
+void n_RS_open(NativeContext *ctx) { rsOpenImpl(ctx, argRef(ctx, 0), argInt(ctx, 1) != 0); }
+void n_RS_open4(NativeContext *ctx) { rsOpenImpl(ctx, argRef(ctx, 0), argInt(ctx, 1) != 0); } // (name, create, authmode, writable)
+void n_RS_openVendor(NativeContext *ctx) { throwJava(ctx, "javax/microedition/rms/RecordStoreNotFoundException"); }
+void n_RS_close(NativeContext *ctx)
 {
-    setIntResult(ctx, static_cast<int32_t>(rsRegistry()[rsName(ctx)].size()));
+    if (ctx->thisObj && ctx->thisObj->cells && ctx->thisObj->cellCount > RS_OPEN)
+    {
+        if (!ctx->thisObj->cells[RS_OPEN].i) { throwJava(ctx, "javax/microedition/rms/RecordStoreNotOpenException"); return; }
+        ctx->thisObj->cells[RS_OPEN] = Value::fromInt(0);
+    }
 }
-void n_RS_getRecord(NativeContext *ctx)
+void n_RS_getNumRecords(NativeContext *ctx) { if (RsStore *st = rsOpen(ctx)) setIntResult(ctx, static_cast<int32_t>(st->recs.size())); }
+void n_RS_getName(NativeContext *ctx) { if (rsOpen(ctx)) setRefResult(ctx, ctx->rt->heap().newString(rsName(ctx))); }
+void n_RS_getVersion(NativeContext *ctx) { if (RsStore *st = rsOpen(ctx)) setIntResult(ctx, st->version); }
+void n_RS_getLastModified(NativeContext *ctx) { if (RsStore *st = rsOpen(ctx)) setLongResult(ctx, st->modified); }
+void n_RS_getNextRecordID(NativeContext *ctx) { if (RsStore *st = rsOpen(ctx)) setIntResult(ctx, st->nextId); }
+int64_t rsBytesUsed(const RsStore &st)
 {
-    auto &recs = rsRegistry()[rsName(ctx)];
-    int id = argInt(ctx, 1);
+    int64_t n = 0;
+    for (const auto &kv : st.recs) n += static_cast<int64_t>(kv.second.size()) + 8;
+    return n;
+}
+void n_RS_getSize(NativeContext *ctx) { if (RsStore *st = rsOpen(ctx)) setIntResult(ctx, static_cast<int32_t>(rsBytesUsed(*st) + 32)); }
+void n_RS_getSizeAvailable(NativeContext *ctx)
+{
+    if (RsStore *st = rsOpen(ctx))
+    {
+        int64_t avail = (1 << 20) - rsBytesUsed(*st); // « 1 Mo » de RMS par magasin
+        setIntResult(ctx, static_cast<int32_t>(avail > 0 ? avail : 0));
+    }
+}
+void n_RS_getRecord(NativeContext *ctx) // (int id, byte[] buf, int offset) -> taille copiée
+{
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    auto it = st->recs.find(argInt(ctx, 1));
     Obj *buf = argRef(ctx, 2);
     int off = argInt(ctx, 3);
-    if (id < 1 || (size_t)id > recs.size() || !buf) { setIntResult(ctx, 0); return; }
-    const auto &rec = recs[id - 1];
-    for (size_t i = 0; i < rec.size() && off + (int)i < buf->arrayLen; i++)
-        buf->cells[off + i].u = rec[i];
-    setIntResult(ctx, static_cast<int32_t>(rec.size()));
+    if (it == st->recs.end()) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    if (!buf || off < 0 || off + static_cast<int>(it->second.size()) > buf->arrayLen) { throwJava(ctx, "java/lang/ArrayIndexOutOfBoundsException"); return; }
+    for (size_t i = 0; i < it->second.size(); i++)
+        buf->cells[off + i].u = it->second[i];
+    setIntResult(ctx, static_cast<int32_t>(it->second.size()));
 }
-void n_RS_setRecord(NativeContext *ctx)
+void n_RS_getRecordBytes(NativeContext *ctx) // (int id) -> byte[]
 {
-    auto &recs = rsRegistry()[rsName(ctx)];
-    int id = argInt(ctx, 1);
-    Obj *buf = argRef(ctx, 2);
-    int off = argInt(ctx, 3), len = argInt(ctx, 4);
-    if (id < 1 || (size_t)id > recs.size() || !buf || len < 0) return;
-    std::vector<uint8_t> rec(static_cast<size_t>(len));
-    for (int i = 0; i < len && off + i < buf->arrayLen; i++)
-        rec[i] = static_cast<uint8_t>(buf->cells[off + i].u);
-    recs[id - 1] = std::move(rec);
-    rsSave(rsName(ctx));
-}
-void n_RS_addRecord(NativeContext *ctx)
-{
-    auto &recs = rsRegistry()[rsName(ctx)];
-    Obj *buf = argRef(ctx, 1);
-    int off = argInt(ctx, 2), len = argInt(ctx, 3);
-    std::vector<uint8_t> rec(static_cast<size_t>(len < 0 ? 0 : len));
-    if (buf)
-        for (int i = 0; i < len && off + i < buf->arrayLen; i++)
-            rec[i] = static_cast<uint8_t>(buf->cells[off + i].u);
-    recs.push_back(std::move(rec));
-    rsSave(rsName(ctx));
-    setIntResult(ctx, static_cast<int32_t>(recs.size()));
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    auto it = st->recs.find(argInt(ctx, 1));
+    if (it == st->recs.end()) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    setRefResult(ctx, rsBytes(ctx, it->second));
 }
 void n_RS_getRecordSize(NativeContext *ctx)
 {
-    auto &recs = rsRegistry()[rsName(ctx)];
-    int id = argInt(ctx, 1);
-    setIntResult(ctx, (id >= 1 && (size_t)id <= recs.size()) ? static_cast<int32_t>(recs[id - 1].size()) : 0);
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    auto it = st->recs.find(argInt(ctx, 1));
+    if (it == st->recs.end()) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    setIntResult(ctx, static_cast<int32_t>(it->second.size()));
 }
-void n_RS_close(NativeContext *) {}
-// RecordStore.listRecordStores() : magasins ouverts en mémoire + fichiers "<nom>.rms" du dossier
-// persistant. null si aucun (comme la spec MIDP).
+std::vector<uint8_t> rsSlice(Obj *buf, int off, int len)
+{
+    std::vector<uint8_t> rec(static_cast<size_t>(len < 0 ? 0 : len));
+    if (buf)
+        for (int i = 0; i < len && off + i < buf->arrayLen; i++)
+            if (off + i >= 0) rec[i] = static_cast<uint8_t>(buf->cells[off + i].u);
+    return rec;
+}
+void n_RS_setRecord(NativeContext *ctx) // (int id, byte[] data, int offset, int numBytes)
+{
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    auto it = st->recs.find(argInt(ctx, 1));
+    if (it == st->recs.end()) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    it->second = rsSlice(argRef(ctx, 2), argInt(ctx, 3), argInt(ctx, 4));
+    rsTouch(*st);
+    rsSave(rsName(ctx));
+}
+void n_RS_addRecord(NativeContext *ctx) // (byte[] data, int offset, int numBytes) -> id
+{
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    int len = argInt(ctx, 3);
+    if (rsBytesUsed(*st) + len > (1 << 20)) { throwJava(ctx, "javax/microedition/rms/RecordStoreFullException"); return; }
+    int id = st->nextId++;
+    st->recs[id] = rsSlice(argRef(ctx, 1), argInt(ctx, 2), len);
+    rsTouch(*st);
+    rsSave(rsName(ctx));
+    setIntResult(ctx, id);
+}
+void n_RS_deleteRecord(NativeContext *ctx)
+{
+    RsStore *st = rsOpen(ctx);
+    if (!st) return;
+    if (!st->recs.erase(argInt(ctx, 1))) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    rsTouch(*st);
+    rsSave(rsName(ctx));
+}
+void n_RS_deleteStore(NativeContext *ctx)
+{
+    Obj *nameObj = argRef(ctx, 0);
+    std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
+    if (!rsExists(name)) { throwJava(ctx, "javax/microedition/rms/RecordStoreNotFoundException"); return; }
+    rsRegistry().erase(name);
+    if (!rmsDir().empty())
+        remove(rsFile(name).c_str());
+}
+void n_RS_noop(NativeContext *) {}
+// RecordStore.listRecordStores() : magasins connus (mémoire + fichiers "<nom>.rms"), null si aucun.
 void n_RS_list(NativeContext *ctx)
 {
     std::vector<std::string> names;
@@ -1137,91 +1288,91 @@ void n_RS_list(NativeContext *ctx)
                 std::string fn = e->d_name;
                 if (fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".rms") == 0)
                 {
-                    std::string base = fn.substr(0, fn.size() - 4);
                     bool known = false;
                     for (const auto &n : names)
                         if (rsFile(n) == rmsDir() + "/" + fn) { known = true; break; }
-                    if (!known) names.push_back(base);
+                    if (!known) names.push_back(fn.substr(0, fn.size() - 4));
                 }
             }
             closedir(d);
         }
     }
     if (names.empty()) { setRefResult(ctx, nullptr); return; }
+    std::sort(names.begin(), names.end());
     Obj *arr = ctx->rt->heap().newArray(ObjKind::ObjArray, static_cast<int>(names.size()));
     if (arr)
         for (size_t i = 0; i < names.size(); i++)
             arr->cells[i] = Value::fromRef(ctx->rt->heap().newString(names[i]));
     setRefResult(ctx, arr);
 }
-void n_RS_deleteStore(NativeContext *ctx)
+
+// enumerateRecords(filter, comparator, keepUpdated) : liste des ids retenus par `filter.matches([B)Z` (appelé pour de
+// vrai), triés par `comparator.compare([B,[B)I` (PRECEDES=-1, EQUIVALENT=0, FOLLOWS=1) si fourni, sinon par id.
+// L'énumération est un INSTANTANÉ : cells[0]=nom du magasin, cells[1]=int[] des ids, cells[2]=position, cells[3]=
+// keepUpdated (non suivi), cells[4]=filtre, cells[5]=comparateur (pour rebuild()).
+enum { RE_STORE = 0, RE_IDS = 1, RE_POS = 2, RE_KEEP = 3, RE_FILTER = 4, RE_CMP = 5 };
+void reBuild(NativeContext *ctx, Obj *e, const std::string &name, Obj *filter, Obj *cmp)
 {
-    Obj *nameObj = argRef(ctx, 0);
-    std::string name = (nameObj && nameObj->kind == ObjKind::String) ? nameObj->str : "";
-    rsRegistry().erase(name);
-    if (!rmsDir().empty())
-        remove(rsFile(name).c_str());
+    RsStore &st = rsGet(name);
+    std::vector<int> ids;
+    for (const auto &kv : st.recs)
+    {
+        bool keep = true;
+        if (filter && filter->kind == ObjKind::Instance)
+        {
+            Value args[2] = {Value::fromRef(filter), Value::fromRef(rsBytes(ctx, kv.second))}, res;
+            keep = ctx->interp->invokeVirtual(filter->cls, "matches", "([B)Z", filter, args, 2, res) && res.i != 0;
+        }
+        if (keep) ids.push_back(kv.first);
+    }
+    if (cmp && cmp->kind == ObjKind::Instance && ids.size() > 1)
+    {
+        // tri par insertion stable (le comparateur est du bytecode : pas de std::sort, qui exige un ordre strict cohérent)
+        for (size_t i = 1; i < ids.size(); i++)
+        {
+            int cur = ids[i];
+            size_t j = i;
+            while (j > 0)
+            {
+                Value args[3] = {Value::fromRef(cmp), Value::fromRef(rsBytes(ctx, st.recs[ids[j - 1]])), Value::fromRef(rsBytes(ctx, st.recs[cur]))}, res;
+                bool ok = ctx->interp->invokeVirtual(cmp->cls, "compare", "([B[B)I", cmp, args, 3, res);
+                if (ok && res.i == 1) { ids[j] = ids[j - 1]; j--; } // ids[j-1] SUIT cur : cur passe devant
+                else break;
+            }
+            ids[j] = cur;
+        }
+    }
+    Obj *arr = ctx->rt->heap().newArray(ObjKind::IntArray, static_cast<int>(ids.size()));
+    if (arr)
+        for (size_t i = 0; i < ids.size(); i++) arr->cells[i] = Value::fromInt(ids[i]);
+    e->cells[RE_IDS] = Value::fromRef(arr);
+    e->cells[RE_POS] = Value::fromInt(0);
 }
-// getRecord:(I)[B -- variante qui retourne le record sous forme de tableau.
-void n_RS_getRecordBytes(NativeContext *ctx)
-{
-    auto &recs = rsRegistry()[rsName(ctx)];
-    int id = argInt(ctx, 1);
-    if (id < 1 || (size_t)id > recs.size()) { setRefResult(ctx, nullptr); return; }
-    const auto &rec = recs[id - 1];
-    Obj *b = ctx->rt ? ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int>(rec.size())) : nullptr;
-    if (b)
-        for (size_t i = 0; i < rec.size(); i++)
-            b->cells[i].u = rec[i];
-    setRefResult(ctx, b);
-}
-// enumerateRecords(filter, comparator, keepUpdated) : construit la liste des id
-// (1..n) des enregistrements retenus par `filter` (RecordFilter.matches([B)Z,
-// appelé pour de vrai) et la stocke dans l'énumération : cells[0]=nom du
-// magasin, cells[1]=int[] des id, cells[2]=position courante. Le comparateur
-// est ignoré (ordre d'id croissant) et keepUpdated n'est pas suivi.
-enum { RE_STORE = 0, RE_IDS = 1, RE_POS = 2 };
 void n_RS_enumerate(NativeContext *ctx)
 {
+    if (!rsOpen(ctx)) return;
     ClassInfo *c = clsOf(ctx, "javax/microedition/rms/RecordEnumerationImpl");
     Obj *e = c ? ctx->rt->heap().newInstance(c) : nullptr;
-    if (e && e->cells && e->cellCount >= 3)
+    if (e && e->cells && e->cellCount >= 6)
     {
-        std::string name = rsName(ctx);
-        auto &recs = rsRegistry()[name];
-        Obj *filter = argRef(ctx, 1);
-        std::vector<int> ids;
-        for (size_t i = 0; i < recs.size(); i++)
-        {
-            bool keep = true;
-            if (filter && filter->kind == ObjKind::Instance)
-            {
-                Obj *b = ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int>(recs[i].size()));
-                if (b)
-                    for (size_t k = 0; k < recs[i].size(); k++) b->cells[k].u = recs[i][k];
-                Value args[2] = {Value::fromRef(filter), Value::fromRef(b)};
-                Value res;
-                keep = ctx->interp->invokeVirtual(filter->cls, "matches", "([B)Z", filter, args, 2, res) && res.i != 0;
-            }
-            if (keep) ids.push_back(static_cast<int>(i) + 1);
-        }
-        Obj *arr = ctx->rt->heap().newArray(ObjKind::IntArray, static_cast<int>(ids.size()));
-        if (arr)
-            for (size_t i = 0; i < ids.size(); i++) arr->cells[i] = Value::fromInt(ids[i]);
-        e->cells[RE_STORE] = ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[RS_NAME] : Value();
-        e->cells[RE_IDS] = Value::fromRef(arr);
-        e->cells[RE_POS] = Value::fromInt(0);
+        Obj *filter = argRef(ctx, 1), *cmp = argRef(ctx, 2);
+        e->cells[RE_STORE] = ctx->thisObj->cells[RS_NAME];
+        e->cells[RE_KEEP] = Value::fromInt(argInt(ctx, 3));
+        e->cells[RE_FILTER] = Value::fromRef(filter);
+        e->cells[RE_CMP] = Value::fromRef(cmp);
+        reBuild(ctx, e, rsName(ctx), filter, cmp);
     }
     setRefResult(ctx, e);
 }
-int reCount(Obj *e) { return (e && e->cellCount >= 3 && e->cells[RE_IDS].o) ? e->cells[RE_IDS].o->arrayLen : 0; }
-int rePos(Obj *e) { return (e && e->cellCount >= 3) ? e->cells[RE_POS].i : 0; }
-std::vector<uint8_t> *reRecord(Obj *e, int id)
+int reCount(Obj *e) { return (e && e->cellCount >= 6 && e->cells[RE_IDS].o) ? e->cells[RE_IDS].o->arrayLen : 0; }
+int rePos(Obj *e) { return (e && e->cellCount >= 6) ? e->cells[RE_POS].i : 0; }
+const std::vector<uint8_t> *reRecord(Obj *e, int id)
 {
-    Obj *n = (e && e->cellCount >= 3) ? e->cells[RE_STORE].o : nullptr;
+    Obj *n = (e && e->cellCount >= 6) ? e->cells[RE_STORE].o : nullptr;
     if (!n || n->kind != ObjKind::String) return nullptr;
-    auto &recs = rsRegistry()[n->str];
-    return (id >= 1 && (size_t)id <= recs.size()) ? &recs[id - 1] : nullptr;
+    RsStore &st = rsGet(n->str);
+    auto it = st.recs.find(id);
+    return it == st.recs.end() ? nullptr : &it->second;
 }
 void n_RE_hasNext(NativeContext *ctx) { setIntResult(ctx, rePos(ctx->thisObj) < reCount(ctx->thisObj) ? 1 : 0); }
 void n_RE_hasPrev(NativeContext *ctx) { setIntResult(ctx, rePos(ctx->thisObj) > 0 ? 1 : 0); }
@@ -1229,7 +1380,7 @@ void n_RE_nextId(NativeContext *ctx)
 {
     Obj *e = ctx->thisObj;
     int p = rePos(e);
-    if (p >= reCount(e)) { setIntResult(ctx, -1); return; }
+    if (p >= reCount(e)) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
     e->cells[RE_POS] = Value::fromInt(p + 1);
     setIntResult(ctx, e->cells[RE_IDS].o->cells[p].i);
 }
@@ -1237,24 +1388,21 @@ void n_RE_prevId(NativeContext *ctx)
 {
     Obj *e = ctx->thisObj;
     int p = rePos(e) - 1;
-    if (p < 0 || p >= reCount(e)) { setIntResult(ctx, -1); return; }
+    if (p < 0 || p >= reCount(e)) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
     e->cells[RE_POS] = Value::fromInt(p);
     setIntResult(ctx, e->cells[RE_IDS].o->cells[p].i);
 }
 void reBytes(NativeContext *ctx, int id)
 {
-    auto *rec = id > 0 ? reRecord(ctx->thisObj, id) : nullptr;
-    if (!rec) { setRefResult(ctx, nullptr); return; }
-    Obj *b = ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int>(rec->size()));
-    if (b)
-        for (size_t i = 0; i < rec->size(); i++) b->cells[i].u = (*rec)[i];
-    setRefResult(ctx, b);
+    const std::vector<uint8_t> *rec = reRecord(ctx->thisObj, id);
+    if (!rec) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
+    setRefResult(ctx, rsBytes(ctx, *rec));
 }
 void n_RE_next(NativeContext *ctx)
 {
     Obj *e = ctx->thisObj;
     int p = rePos(e);
-    if (p >= reCount(e)) { setRefResult(ctx, nullptr); return; }
+    if (p >= reCount(e)) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
     e->cells[RE_POS] = Value::fromInt(p + 1);
     reBytes(ctx, e->cells[RE_IDS].o->cells[p].i);
 }
@@ -1262,7 +1410,7 @@ void n_RE_prev(NativeContext *ctx)
 {
     Obj *e = ctx->thisObj;
     int p = rePos(e) - 1;
-    if (p < 0 || p >= reCount(e)) { setRefResult(ctx, nullptr); return; }
+    if (p < 0 || p >= reCount(e)) { throwJava(ctx, "javax/microedition/rms/InvalidRecordIDException"); return; }
     e->cells[RE_POS] = Value::fromInt(p);
     reBytes(ctx, e->cells[RE_IDS].o->cells[p].i);
 }
@@ -1270,8 +1418,16 @@ void n_RE_numRecords(NativeContext *ctx) { setIntResult(ctx, reCount(ctx->thisOb
 void n_RE_destroy(NativeContext *) { }
 void n_RE_reset(NativeContext *ctx)
 {
-    if (ctx->thisObj && ctx->thisObj->cellCount >= 3) ctx->thisObj->cells[RE_POS] = Value::fromInt(0);
+    if (ctx->thisObj && ctx->thisObj->cellCount >= 6) ctx->thisObj->cells[RE_POS] = Value::fromInt(0);
 }
+void n_RE_rebuild(NativeContext *ctx)
+{
+    Obj *e = ctx->thisObj;
+    Obj *n = (e && e->cellCount >= 6) ? e->cells[RE_STORE].o : nullptr;
+    if (n && n->kind == ObjKind::String) reBuild(ctx, e, n->str, e->cells[RE_FILTER].o, e->cells[RE_CMP].o);
+}
+void n_RE_isKept(NativeContext *ctx) { setIntResult(ctx, (ctx->thisObj && ctx->thisObj->cellCount >= 6) ? ctx->thisObj->cells[RE_KEEP].i : 0); }
+void n_RE_keepUpdated(NativeContext *ctx) { if (ctx->thisObj && ctx->thisObj->cellCount >= 6) ctx->thisObj->cells[RE_KEEP] = Value::fromInt(argInt(ctx, 1)); }
 
 // --- java.util.Hashtable ---
 int htFieldOff(NativeContext *ctx, const char *cls, const char *fld)
@@ -1742,10 +1898,36 @@ void n_Class_getName(NativeContext *ctx)
     for (auto &ch : n) if (ch == '/') ch = '.';
     setRefResult(ctx, ctx->rt->heap().newString(n));
 }
+// Class.forName(name) : classe du JAR ou native ; ClassNotFoundException sinon.
 void n_Class_forName(NativeContext *ctx)
 {
-    (void)ctx;
-    setRefResult(ctx, nullptr);
+    Obj *nm = argRef(ctx, 0);
+    if (!nm || nm->kind != ObjKind::String) { throwJava(ctx, "java/lang/NullPointerException"); return; }
+    std::string n = nm->str;
+    for (char &c : n) if (c == '.') c = '/';
+    ClassInfo *ci = ctx->rt->classInfoOfName(n);
+    if (!ci) ci = ctx->rt->loadFromJar(n);
+    if (!ci) { throwJava(ctx, "java/lang/ClassNotFoundException"); return; }
+    setRefResult(ctx, ctx->rt->heap().classObjFor(n));
+}
+// Class.newInstance() : instance + constructeur sans argument (bytecode).
+void n_Class_newInstance(NativeContext *ctx)
+{
+    Obj *co = ctx->thisObj;
+    if (!co || co->kind != ObjKind::Class) { setRefResult(ctx, nullptr); return; }
+    ClassInfo *ci = ctx->rt->classInfoOfName(co->str);
+    if (!ci) ci = ctx->rt->loadFromJar(co->str);
+    if (!ci) { throwJava(ctx, "java/lang/InstantiationException"); return; }
+    Obj *o = ctx->rt->heap().newInstance(ci);
+    if (!o) { setRefResult(ctx, nullptr); return; }
+    ctx->interp->ensureInit(ci);
+    Value a[1] = {Value::fromRef(o)}, r;
+    if (!ctx->interp->invokeSpecial(ci, "<init>", "()V", o, a, 1, r))
+    {
+        throwJava(ctx, "java/lang/InstantiationException");
+        return;
+    }
+    setRefResult(ctx, o);
 }
 
 // ---- compléments CLDC 1.1 (String/StringBuffer/Math/Integer/Long/Character/Float/Double/Vector/Hashtable/Stack/Date...)
@@ -1764,6 +1946,7 @@ void initNatives()
     // java.lang.Object
     registerNative("java/lang/Object.<init>:()V", n_Object_init);
     registerNative("java/lang/Object.getClass:()Ljava/lang/Class;", n_Object_getClass);
+    registerNative("java/lang/Class.newInstance:()Ljava/lang/Object;", n_Class_newInstance);
     registerNative("java/lang/Object.equals:(Ljava/lang/Object;)Z", n_Object_equals);
     registerNative("java/lang/Object.hashCode:()I", n_Object_hashCode);
     registerNative("java/lang/Object.toString:()Ljava/lang/String;", n_Object_toString);
@@ -1880,16 +2063,28 @@ void initNatives()
 
     // javax.microedition.rms.RecordStore
     registerNative("javax/microedition/rms/RecordStore.openRecordStore:(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;", n_RS_open);
+    registerNative("javax/microedition/rms/RecordStore.openRecordStore:(Ljava/lang/String;ZIZ)Ljavax/microedition/rms/RecordStore;", n_RS_open4);
+    registerNative("javax/microedition/rms/RecordStore.openRecordStore:(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljavax/microedition/rms/RecordStore;", n_RS_openVendor);
     registerNative("javax/microedition/rms/RecordStore.getNumRecords:()I", n_RS_getNumRecords);
+    registerNative("javax/microedition/rms/RecordStore.getName:()Ljava/lang/String;", n_RS_getName);
+    registerNative("javax/microedition/rms/RecordStore.getVersion:()I", n_RS_getVersion);
+    registerNative("javax/microedition/rms/RecordStore.getSize:()I", n_RS_getSize);
+    registerNative("javax/microedition/rms/RecordStore.getSizeAvailable:()I", n_RS_getSizeAvailable);
+    registerNative("javax/microedition/rms/RecordStore.getLastModified:()J", n_RS_getLastModified);
+    registerNative("javax/microedition/rms/RecordStore.getNextRecordID:()I", n_RS_getNextRecordID);
     registerNative("javax/microedition/rms/RecordStore.getRecord:(I[BI)I", n_RS_getRecord);
+    registerNative("javax/microedition/rms/RecordStore.getRecord:(I)[B", n_RS_getRecordBytes);
     registerNative("javax/microedition/rms/RecordStore.getRecordSize:(I)I", n_RS_getRecordSize);
     registerNative("javax/microedition/rms/RecordStore.setRecord:(I[BII)V", n_RS_setRecord);
     registerNative("javax/microedition/rms/RecordStore.addRecord:([BII)I", n_RS_addRecord);
+    registerNative("javax/microedition/rms/RecordStore.deleteRecord:(I)V", n_RS_deleteRecord);
     registerNative("javax/microedition/rms/RecordStore.closeRecordStore:()V", n_RS_close);
     registerNative("javax/microedition/rms/RecordStore.deleteRecordStore:(Ljava/lang/String;)V", n_RS_deleteStore);
     registerNative("javax/microedition/rms/RecordStore.listRecordStores:()[Ljava/lang/String;", n_RS_list);
+    registerNative("javax/microedition/rms/RecordStore.addRecordListener:(Ljavax/microedition/rms/RecordListener;)V", n_RS_noop);
+    registerNative("javax/microedition/rms/RecordStore.removeRecordListener:(Ljavax/microedition/rms/RecordListener;)V", n_RS_noop);
+    registerNative("javax/microedition/rms/RecordStore.setMode:(IZ)V", n_RS_noop);
     registerNative("javax/microedition/rms/RecordStore.enumerateRecords:(Ljavax/microedition/rms/RecordFilter;Ljavax/microedition/rms/RecordComparator;Z)Ljavax/microedition/rms/RecordEnumeration;", n_RS_enumerate);
-    registerNative("javax/microedition/rms/RecordStore.getRecord:(I)[B", n_RS_getRecordBytes);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.hasNextElement:()Z", n_RE_hasNext);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.hasPreviousElement:()Z", n_RE_hasPrev);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.nextRecordId:()I", n_RE_nextId);
@@ -1899,6 +2094,9 @@ void initNatives()
     registerNative("javax/microedition/rms/RecordEnumerationImpl.numRecords:()I", n_RE_numRecords);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.destroy:()V", n_RE_destroy);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.reset:()V", n_RE_reset);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.rebuild:()V", n_RE_rebuild);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.isKeptUpdated:()Z", n_RE_isKept);
+    registerNative("javax/microedition/rms/RecordEnumerationImpl.keepUpdated:(Z)V", n_RE_keepUpdated);
 
     // java.util.Hashtable
     registerNative("java/util/Hashtable.<init>:()V", n_HT_init);

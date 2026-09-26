@@ -23,7 +23,8 @@ namespace hal
     bool display_init(const DisplayConfig *cfg);
     void display_shutdown();
     Framebuffer *display_get_framebuffer();
-    void display_present(const Framebuffer *fb);
+    void display_present(const Framebuffer *fb); // marque l'image « à afficher » (peu coûteux, appelable souvent)
+    void display_flip();                         // affiche réellement (1 fois par trame : boucle principale, launcher)
     // Rotation d'affichage (0 ou 90 = vue tournée de 90° anti-horaire), lue de
     // JME_ROTATE. Pour les jeux 480x800 dessinés de côté (téléphone tenu en paysage).
     int display_rotation();

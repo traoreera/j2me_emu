@@ -441,8 +441,8 @@ namespace jvm
                                 MidiEvt e;
                                 e.tick = absTick;
                                 e.type = 1;
-                                e.note = d1;
-                                e.vel = d2;
+                                e.note = d1 & 0x7F; // octet de donnée MIDI = 7 bits (fichier corrompu : débordait activeStart[128])
+                                e.vel = d2 & 0x7F;
                                 evs.push_back(e);
                             }
                             else if (hi == 0x80 || (hi == 0x90 && d2 == 0))
@@ -450,7 +450,7 @@ namespace jvm
                                 MidiEvt e;
                                 e.tick = absTick;
                                 e.type = 2;
-                                e.note = d1;
+                                e.note = d1 & 0x7F;
                                 e.vel = 0;
                                 evs.push_back(e);
                             }

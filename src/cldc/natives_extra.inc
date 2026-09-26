@@ -853,6 +853,8 @@ void registerExtraNatives()
     RN("java/util/ArrayEnumeration.hasMoreElements:()Z", x_Enum_hasMore);
     RN("java/util/ArrayEnumeration.nextElement:()Ljava/lang/Object;", x_Enum_next);
     RN("java/util/Vector.elements:()Ljava/util/Enumeration;", x_Vec_elements);
+    RN("java/util/Vector.trimToSize:()V", x_SB_ensureCapacity);
+    RN("java/util/Vector.ensureCapacity:(I)V", x_SB_ensureCapacity);
     RN("java/util/Vector.copyInto:([Ljava/lang/Object;)V", x_Vec_copyInto);
     RN("java/util/Vector.setSize:(I)V", x_Vec_setSize);
     RN("java/util/Vector.capacity:()I", x_Vec_capacity);

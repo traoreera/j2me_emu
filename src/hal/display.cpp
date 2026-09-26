@@ -161,8 +161,20 @@ namespace hal
         }
     }
 
+    // display_present() ne fait que marquer l'image comme « à afficher » : les MIDlets appellent flushGraphics()/
+    // repaint() plusieurs fois par trame (Stalker : des dizaines), et chaque SDL_RenderPresent attend le vsync.
+    // display_flip() (une fois par trame, boucle principale / launcher) envoie réellement l'image à l'écran.
+    static bool g_dirty = false;
     void display_present(const Framebuffer *fb)
     {
+        (void)fb;
+        g_dirty = true;
+    }
+
+    void display_flip()
+    {
+        const Framebuffer *fb = &g_fb;
+        g_dirty = false;
         SDL_UpdateTexture(g_texture, nullptr, fb->pixels, fb->stride * sizeof(uint16_t));
         SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
         SDL_RenderClear(g_renderer);
