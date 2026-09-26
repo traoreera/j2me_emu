@@ -49,6 +49,29 @@ static const kernel::audio::Device *pickAudioDevice()
     return &kernel::audio::kSdlDevice;
 }
 
+// Repli quand ni le manifeste ni un .jad ne donnent MIDlet-1 (JAR mal packagé) : première classe
+// du JAR dont la super-classe est javax.microedition.midlet.MIDlet. PC uniquement (index en RAM).
+static std::string findMidletClass(jme::JarReader &jar)
+{
+    std::vector<uint8_t> buf;
+    for (const jme::JarEntry &e : jar.entries())
+    {
+        if (e.name.size() < 7 || e.name.compare(e.name.size() - 6, 6, ".class") != 0 || e.uncompressedSize == 0)
+            continue;
+        buf.resize(e.uncompressedSize);
+        size_t n = jar.extractEntry(e.name, buf.data(), buf.size());
+        jvm::ClassFile cf;
+        if (n && jvm::ClassFile::parse(buf.data(), n, cf) && cf.superClassName() == "javax/microedition/midlet/MIDlet")
+        {
+            std::string c = cf.thisClassName();
+            for (auto &ch : c)
+                if (ch == '/') ch = '.';
+            return c;
+        }
+    }
+    return "";
+}
+
 static_assert(sizeof(void *) == 8, "build 64 bits requis (Pi Zero 2 W : AArch64)");
 
 // Relance ce même binaire (launcher <-> jeu) : état propre à chaque jeu, sans
@@ -141,11 +164,39 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Descripteur d'application "<jeu>.jad" à côté du .jar (facultatif) : certains JAR (ex. Akatis,
+    // packagé par Ant) n'ont pas MIDlet-1 dans le manifeste, il n'est que dans le .jad. Le .jad
+    // complète le manifeste (et ses attributs sont lisibles via getAppProperty, comme sur un vrai téléphone).
+    std::string jadText;
+    {
+        std::string jadPath(jarPath);
+        if (jadPath.size() > 4 && jadPath.compare(jadPath.size() - 4, 4, ".jar") == 0)
+            jadPath.resize(jadPath.size() - 4);
+        jadPath += ".jad";
+        if (FILE *jf = fopen(jadPath.c_str(), "rb"))
+        {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, jf)) > 0)
+                jadText.append(buf, n);
+            fclose(jf);
+            fprintf(stderr, "[jad] descripteur charge : %s\n", jadPath.c_str());
+        }
+    }
     jme::ManifestInfo manifest;
     if (!jar.readManifest(manifest))
     {
-        fprintf(stderr, "MANIFEST.MF invalide ou MIDlet-1 absent\n");
-        return 1;
+        if (jadText.empty() || !jme::parseManifestText(jadText.data(), jadText.size(), manifest))
+        {
+            manifest.mainClass = findMidletClass(jar);
+            if (manifest.mainClass.empty())
+            {
+                fprintf(stderr, "MANIFEST.MF invalide ou MIDlet-1 absent (ni .jad voisin, ni classe MIDlet)\n");
+                return 1;
+            }
+            fprintf(stderr, "[manifest] MIDlet-1 absent : classe MIDlet detectee = %s\n", manifest.mainClass.c_str());
+            manifest.valid = true;
+        }
     }
 
     printf("MIDlet: %s (%s) - classe principale: %s\n",
@@ -245,23 +296,27 @@ int main(int argc, char **argv)
     {
         static uint8_t mfBuf[16384];
         size_t n = jar.extractEntry("META-INF/MANIFEST.MF", mfBuf, sizeof(mfBuf));
-        std::string mf(reinterpret_cast<char *>(mfBuf), n);
-        size_t pos = 0;
-        while (pos < mf.size())
+        auto exposeProps = [](const std::string &mf)
         {
-            size_t eol = mf.find('\n', pos);
-            if (eol == std::string::npos) eol = mf.size();
-            std::string line = mf.substr(pos, eol - pos);
-            pos = eol + 1;
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-            size_t colon = line.find(':');
-            if (colon == std::string::npos || colon == 0 || line[0] == ' ') continue;
-            std::string k = line.substr(0, colon), v = line.substr(colon + 1);
-            size_t b = v.find_first_not_of(' ');
-            v = b == std::string::npos ? "" : v.substr(b);
-            if (k == "MIDlet-Name" || k == "MIDlet-Version" || k == "MIDlet-Vendor") continue;
-            jvm::midp::setAppProperty(k, v);
-        }
+            size_t pos = 0;
+            while (pos < mf.size())
+            {
+                size_t eol = mf.find('\n', pos);
+                if (eol == std::string::npos) eol = mf.size();
+                std::string line = mf.substr(pos, eol - pos);
+                pos = eol + 1;
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                size_t colon = line.find(':');
+                if (colon == std::string::npos || colon == 0 || line[0] == ' ') continue;
+                std::string k = line.substr(0, colon), v = line.substr(colon + 1);
+                size_t b = v.find_first_not_of(' ');
+                v = b == std::string::npos ? "" : v.substr(b);
+                if (k == "MIDlet-Name" || k == "MIDlet-Version" || k == "MIDlet-Vendor") continue;
+                jvm::midp::setAppProperty(k, v);
+            }
+        };
+        exposeProps(std::string(reinterpret_cast<char *>(mfBuf), n));
+        exposeProps(jadText); // le .jad prime sur le manifeste
         for (const auto &kv : confProps)
             jvm::midp::setAppProperty(kv.first, kv.second);
     }
@@ -302,8 +357,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // startApp()
-    if (!interp.invokeVirtual(mainCls, "startApp", "()V", midlet, &thisV, 1, res))
+    // startApp() : appel synchrone, sans fibre ni yield -> garde-fou anti-boucle infinie (1,5 G d'instructions,
+    // largement au-delà d'un démarrage réel) pour ne jamais figer toute la fenêtre.
+    interp.setInstrBudget(1500000000LL);
+    bool startOk = interp.invokeVirtual(mainCls, "startApp", "()V", midlet, &thisV, 1, res);
+    interp.setInstrBudget(-1);
+    if (!startOk)
     {
         fprintf(stderr, "Echec startApp\n");
     }

@@ -54,6 +54,11 @@ namespace jvm
                     n = len;
                 if (n < 0)
                     n = 0;
+                // InputStream.read(byte[],off,len) : -1 en fin de flux (0 seulement si len == 0). Renvoyer 0
+                // faisait boucler à l'infini les `while ((r = in.read(buf, o, l)) >= 0) o += r;`
+                // (Warehouse : hang dans readResource).
+                if (n == 0 && len > 0)
+                    return -1;
                 if (data)
                     for (int i = 0; i < n; i++)
                         dst->cells[off + i].u = data->cells[pos + i].u;

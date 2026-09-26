@@ -232,9 +232,10 @@ namespace jvm
             if (!g_rt || !g_interp)
                 return;
             updateKeyState(pressedMask);
+            // Pas encore de Displayable courant : on continue quand même (threads, minuteries) --
+            // beaucoup de MIDlets (Super FX-BALL, Sperm Race...) démarrent un thread dans startApp()
+            // qui appelle lui-même Display.setCurrent(). Rendre la main ici les figeait à jamais.
             Obj *cur = g_current;
-            if (!cur || cur->kind != ObjKind::Instance)
-                return;
 
             // Premier paint() : livré AVANT que les threads du jeu ne progressent,
             // comme sur un vrai appareil où Display.setCurrent() déclenche un paint
@@ -248,7 +249,7 @@ namespace jvm
             // suivants sortaient immédiatement -- écran figé sur le premier dessin
             // pour toujours, alors que le jeu chargeait et tournait normalement.
             static bool initialPaintDone = false;
-            if (!initialPaintDone && g_paintRequested &&
+            if (!initialPaintDone && g_paintRequested && cur && cur->kind == ObjKind::Instance &&
                 isSubclassOf(cur, "javax/microedition/lcdui/Canvas"))
             {
                 initialPaintDone = true;
@@ -333,6 +334,13 @@ namespace jvm
             if (!cur || cur->kind != ObjKind::Instance)
                 return;
 
+            // Garde-fou : callbacks synchrones (touches, paint) sans fibre -> une boucle infinie dans le
+            // bytecode du jeu figeait toute la fenêtre. 200 M d'instructions par trame, puis l'appel est abandonné.
+            struct SyncBudget
+            {
+                explicit SyncBudget() { g_interp->setInstrBudget(200000000LL); }
+                ~SyncBudget() { g_interp->setInstrBudget(-1); }
+            } syncBudget;
             bool isCanvas = isSubclassOf(cur, "javax/microedition/lcdui/Canvas");
             bool isFullCanvas = isSubclassOf(cur, "com/nokia/mid/ui/FullCanvas");
             // NOTE : GameCanvas hérite de Canvas et NE supprime PAS le mécanisme
@@ -491,10 +499,10 @@ namespace jvm
                      {{"<init>", "()V"}, {"getClass", "()Ljava/lang/Class;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"}, {"wait", "()V"}, {"wait", "(I)V"}, {"wait", "(J)V"}, {"notify", "()V"}, {"notifyAll", "()V"}},
                      none);
             regClass(rt, "java/lang/String", "java/lang/Object",
-                     {{"<init>", "()V"}, {"<init>", "(Ljava/lang/StringBuffer;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "([BLjava/lang/String;)V"}, {"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"<init>", "([BIILjava/lang/String;)V"}, {"<init>", "([CII)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(Ljava/lang/String;I)I"}, {"indexOf", "(I)I"}, {"indexOf", "(II)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"getChars", "(II[CI)V"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}, {"valueOf", "(I)Ljava/lang/String;"}, {"intern", "()Ljava/lang/String;"}},
+                     {{"hashCode", "()I"}, {"getBytes", "()[B"}, {"getBytes", "(Ljava/lang/String;)[B"}, {"lastIndexOf", "(I)I"}, {"lastIndexOf", "(II)I"}, {"lastIndexOf", "(Ljava/lang/String;)I"}, {"replace", "(CC)Ljava/lang/String;"}, {"startsWith", "(Ljava/lang/String;I)Z"}, {"toString", "()Ljava/lang/String;"}, {"isEmpty", "()Z"}, {"compareToIgnoreCase", "(Ljava/lang/String;)I"}, {"<init>", "([C)V"}, {"valueOf", "(C)Ljava/lang/String;"}, {"valueOf", "(J)Ljava/lang/String;"}, {"valueOf", "(Z)Ljava/lang/String;"}, {"valueOf", "(F)Ljava/lang/String;"}, {"valueOf", "(D)Ljava/lang/String;"}, {"valueOf", "([C)Ljava/lang/String;"}, {"copyValueOf", "([C)Ljava/lang/String;"}, {"valueOf", "(Ljava/lang/Object;)Ljava/lang/String;"}, {"<init>", "()V"}, {"<init>", "(Ljava/lang/StringBuffer;)V"}, {"<init>", "(Ljava/lang/String;)V"}, {"<init>", "([BLjava/lang/String;)V"}, {"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"<init>", "([BIILjava/lang/String;)V"}, {"<init>", "([CII)V"}, {"length", "()I"}, {"charAt", "(I)C"}, {"toCharArray", "()[C"}, {"concat", "(Ljava/lang/String;)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"substring", "(I)Ljava/lang/String;"}, {"substring", "(II)Ljava/lang/String;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"indexOf", "(Ljava/lang/String;I)I"}, {"indexOf", "(I)I"}, {"indexOf", "(II)I"}, {"trim", "()Ljava/lang/String;"}, {"toLowerCase", "()Ljava/lang/String;"}, {"toUpperCase", "()Ljava/lang/String;"}, {"compareTo", "(Ljava/lang/String;)I"}, {"startsWith", "(Ljava/lang/String;)Z"}, {"getChars", "(II[CI)V"}, {"endsWith", "(Ljava/lang/String;)Z"}, {"equalsIgnoreCase", "(Ljava/lang/String;)Z"}, {"valueOf", "(I)Ljava/lang/String;"}, {"intern", "()Ljava/lang/String;"}},
                      none);
             regClass(rt, "java/lang/Math", "java/lang/Object",
-                     {{"abs", "(I)I"}, {"abs", "(J)J"}, {"min", "(II)I"}, {"min", "(JJ)J"}, {"max", "(II)I"}, {"max", "(JJ)J"}, {"sqrt", "(D)D"}, {"floor", "(D)D"}, {"ceil", "(D)D"}, {"round", "(D)J"}, {"pow", "(DD)D"}, {"random", "()D"}},
+                     {{"sin", "(D)D"}, {"cos", "(D)D"}, {"tan", "(D)D"}, {"asin", "(D)D"}, {"acos", "(D)D"}, {"atan", "(D)D"}, {"atan2", "(DD)D"}, {"exp", "(D)D"}, {"log", "(D)D"}, {"toRadians", "(D)D"}, {"toDegrees", "(D)D"}, {"abs", "(D)D"}, {"abs", "(F)F"}, {"min", "(FF)F"}, {"max", "(FF)F"}, {"min", "(DD)D"}, {"max", "(DD)D"}, {"round", "(F)I"}, {"abs", "(I)I"}, {"abs", "(J)J"}, {"min", "(II)I"}, {"min", "(JJ)J"}, {"max", "(II)I"}, {"max", "(JJ)J"}, {"sqrt", "(D)D"}, {"floor", "(D)D"}, {"ceil", "(D)D"}, {"round", "(D)J"}, {"pow", "(DD)D"}, {"random", "()D"}},
                      none);
             regClass(rt, "java/lang/System", "java/lang/Object",
                      {{"currentTimeMillis", "()J"}, {"arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"}, {"gc", "()V"}, {"identityHashCode", "(Ljava/lang/Object;)I"}, {"getProperty", "(Ljava/lang/String;)Ljava/lang/String;"}},
@@ -538,25 +546,61 @@ namespace jvm
 
             // --- java.lang compléments CLDC basiques ---
             regClass(rt, "java/lang/Integer", "java/lang/Object",
-                     {{"<init>", "(I)V"}, {"intValue", "()I"}, {"byteValue", "()B"}, {"shortValue", "()S"}, {"longValue", "()J"}, {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(I)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"compareTo", "(Ljava/lang/Integer;)I"}, {"valueOf", "(I)Ljava/lang/Integer;"}, {"parseInt", "(Ljava/lang/String;)I"}},
+                     {{"parseInt", "(Ljava/lang/String;I)I"}, {"toHexString", "(I)Ljava/lang/String;"}, {"toBinaryString", "(I)Ljava/lang/String;"}, {"toOctalString", "(I)Ljava/lang/String;"}, {"toString", "(II)Ljava/lang/String;"}, {"valueOf", "(Ljava/lang/String;)Ljava/lang/Integer;"}, {"<init>", "(I)V"}, {"intValue", "()I"}, {"byteValue", "()B"}, {"shortValue", "()S"}, {"longValue", "()J"}, {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(I)Ljava/lang/String;"}, {"equals", "(Ljava/lang/Object;)Z"}, {"compareTo", "(Ljava/lang/Integer;)I"}, {"valueOf", "(I)Ljava/lang/Integer;"}, {"parseInt", "(Ljava/lang/String;)I"}},
                      {{"value", "I"}});
+            regClass(rt, "java/lang/Boolean", "java/lang/Object",
+                     {{"<init>", "(Z)V"}, {"booleanValue", "()Z"}, {"toString", "()Ljava/lang/String;"}, {"hashCode", "()I"}, {"equals", "(Ljava/lang/Object;)Z"}, {"valueOf", "(Z)Ljava/lang/Boolean;"}},
+                     {{"value", "Z"}, {"TRUE", "Ljava/lang/Boolean;"}, {"FALSE", "Ljava/lang/Boolean;"}});
+            regClass(rt, "java/lang/Long", "java/lang/Object",
+                     {{"<init>", "(J)V"}, {"longValue", "()J"}, {"intValue", "()I"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(J)Ljava/lang/String;"}, {"parseLong", "(Ljava/lang/String;)J"}, {"valueOf", "(J)Ljava/lang/Long;"}, {"valueOf", "(Ljava/lang/String;)Ljava/lang/Long;"}, {"hashCode", "()I"}, {"equals", "(Ljava/lang/Object;)Z"}},
+                     {{"value", "J"}});
+            regClass(rt, "java/lang/Short", "java/lang/Object",
+                     {{"<init>", "(S)V"}, {"shortValue", "()S"}, {"intValue", "()I"}, {"toString", "()Ljava/lang/String;"}, {"parseShort", "(Ljava/lang/String;)S"}},
+                     {{"value", "I"}});
+            regClass(rt, "java/lang/Byte", "java/lang/Object",
+                     {{"<init>", "(B)V"}, {"byteValue", "()B"}, {"intValue", "()I"}, {"toString", "()Ljava/lang/String;"}, {"parseByte", "(Ljava/lang/String;)B"}},
+                     {{"value", "I"}});
+            regClass(rt, "java/lang/Character", "java/lang/Object",
+                     {{"<init>", "(C)V"}, {"charValue", "()C"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(C)Ljava/lang/String;"}, {"isDigit", "(C)Z"}, {"isLetter", "(C)Z"}, {"isLetterOrDigit", "(C)Z"}, {"isUpperCase", "(C)Z"}, {"isLowerCase", "(C)Z"}, {"isSpace", "(C)Z"}, {"isWhitespace", "(C)Z"}, {"toUpperCase", "(C)C"}, {"toLowerCase", "(C)C"}, {"digit", "(CI)I"}, {"forDigit", "(II)C"}, {"valueOf", "(C)Ljava/lang/Character;"}, {"hashCode", "()I"}, {"equals", "(Ljava/lang/Object;)Z"}},
+                     {{"value", "I"}});
+            regClass(rt, "java/lang/Float", "java/lang/Object",
+                     {{"<init>", "(F)V"}, {"floatValue", "()F"}, {"doubleValue", "()D"}, {"intValue", "()I"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(F)Ljava/lang/String;"}, {"parseFloat", "(Ljava/lang/String;)F"}, {"valueOf", "(Ljava/lang/String;)Ljava/lang/Float;"}, {"valueOf", "(F)Ljava/lang/Float;"}, {"isNaN", "(F)Z"}, {"isNaN", "()Z"}, {"isInfinite", "(F)Z"}, {"floatToIntBits", "(F)I"}, {"intBitsToFloat", "(I)F"}},
+                     {{"value", "F"}});
+            regClass(rt, "java/lang/Double", "java/lang/Object",
+                     {{"<init>", "(D)V"}, {"doubleValue", "()D"}, {"floatValue", "()F"}, {"intValue", "()I"}, {"toString", "()Ljava/lang/String;"}, {"toString", "(D)Ljava/lang/String;"}, {"parseDouble", "(Ljava/lang/String;)D"}, {"valueOf", "(Ljava/lang/String;)Ljava/lang/Double;"}, {"valueOf", "(D)Ljava/lang/Double;"}, {"isNaN", "(D)Z"}, {"isNaN", "()Z"}, {"isInfinite", "(D)Z"}, {"doubleToLongBits", "(D)J"}, {"longBitsToDouble", "(J)D"}},
+                     {{"value", "D"}});
+            regClass(rt, "java/util/Enumeration", "java/lang/Object", {{"hasMoreElements", "()Z"}, {"nextElement", "()Ljava/lang/Object;"}}, none);
+            regClass(rt, "java/util/ArrayEnumeration", "java/lang/Object", {{"hasMoreElements", "()Z"}, {"nextElement", "()Ljava/lang/Object;"}},
+                     {{"arr", "[Ljava/lang/Object;"}, {"pos", "I"}});
+            regClass(rt, "java/util/Date", "java/lang/Object",
+                     {{"<init>", "()V"}, {"<init>", "(J)V"}, {"getTime", "()J"}, {"setTime", "(J)V"}, {"toString", "()Ljava/lang/String;"}},
+                     {{"time", "J"}});
+            regClass(rt, "java/util/Calendar", "java/lang/Object",
+                     {{"getInstance", "()Ljava/util/Calendar;"}, {"get", "(I)I"}, {"getTime", "()Ljava/util/Date;"}, {"setTime", "(Ljava/util/Date;)V"}, {"getTimeInMillis", "()J"}, {"setTimeInMillis", "(J)V"}},
+                     {{"time", "J"}});
+            regClass(rt, "java/util/TimeZone", "java/lang/Object",
+                     {{"getDefault", "()Ljava/util/TimeZone;"}, {"getID", "()Ljava/lang/String;"}},
+                     {{"id", "I"}});
             regClass(rt, "java/lang/StringBuffer", "java/lang/Object",
-                     {{"<init>", "()V"}, {"<init>", "(Ljava/lang/String;)V"}, {"append", "([C)Ljava/lang/StringBuffer;"}, {"<init>", "(I)V"}, {"append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;"}, {"append", "(I)Ljava/lang/StringBuffer;"}, {"append", "(C)Ljava/lang/StringBuffer;"}, {"append", "(J)Ljava/lang/StringBuffer;"}, {"append", "(Z)Ljava/lang/StringBuffer;"}, {"append", "(Ljava/lang/Object;)Ljava/lang/StringBuffer;"}, {"append", "(F)Ljava/lang/StringBuffer;"}, {"append", "(D)Ljava/lang/StringBuffer;"}, {"toString", "()Ljava/lang/String;"}, {"length", "()I"}, {"charAt", "(I)C"}, {"setCharAt", "(IC)V"}, {"setLength", "(I)V"}, {"delete", "(II)Ljava/lang/StringBuffer;"}},
+                     {{"insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;"}, {"insert", "(IC)Ljava/lang/StringBuffer;"}, {"insert", "(II)Ljava/lang/StringBuffer;"}, {"reverse", "()Ljava/lang/StringBuffer;"}, {"deleteCharAt", "(I)Ljava/lang/StringBuffer;"}, {"capacity", "()I"}, {"ensureCapacity", "(I)V"}, {"append", "([CII)Ljava/lang/StringBuffer;"}, {"indexOf", "(Ljava/lang/String;)I"}, {"substring", "(II)Ljava/lang/String;"}, {"substring", "(I)Ljava/lang/String;"}, {"<init>", "()V"}, {"<init>", "(Ljava/lang/String;)V"}, {"append", "([C)Ljava/lang/StringBuffer;"}, {"<init>", "(I)V"}, {"append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;"}, {"append", "(I)Ljava/lang/StringBuffer;"}, {"append", "(C)Ljava/lang/StringBuffer;"}, {"append", "(J)Ljava/lang/StringBuffer;"}, {"append", "(Z)Ljava/lang/StringBuffer;"}, {"append", "(Ljava/lang/Object;)Ljava/lang/StringBuffer;"}, {"append", "(F)Ljava/lang/StringBuffer;"}, {"append", "(D)Ljava/lang/StringBuffer;"}, {"toString", "()Ljava/lang/String;"}, {"length", "()I"}, {"charAt", "(I)C"}, {"setCharAt", "(IC)V"}, {"setLength", "(I)V"}, {"delete", "(II)Ljava/lang/StringBuffer;"}},
                      {{"str", "Ljava/lang/String;"}
 
                      });
             regClass(rt, "java/lang/Thread", "java/lang/Object",
-                     {{"<init>", "(Ljava/lang/Runnable;)V"}, {"run", "()V"}, {"start", "()V"}, {"sleep", "(J)V"}, {"yield", "()V"}, {"currentThread", "()Ljava/lang/Thread;"}, {"setPriority", "(I)V"}, {"interrupt", "()V"}, {"isAlive", "()Z"}, {"join", "()V"}},
+                     {{"<init>", "(Ljava/lang/Runnable;)V"}, {"<init>", "(Ljava/lang/Runnable;Ljava/lang/String;)V"}, {"run", "()V"}, {"start", "()V"}, {"sleep", "(J)V"}, {"yield", "()V"}, {"currentThread", "()Ljava/lang/Thread;"}, {"setPriority", "(I)V"}, {"interrupt", "()V"}, {"isAlive", "()Z"}, {"join", "()V"}},
                      {{"r", "Ljava/lang/Runnable;"}});
             regClass(rt, "java/util/Hashtable", "java/lang/Object",
-                     {{"<init>", "()V"}, {"get", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"}, {"remove", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"containsKey", "(Ljava/lang/Object;)Z"}, {"clear", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}},
+                     {{"keys", "()Ljava/util/Enumeration;"}, {"elements", "()Ljava/util/Enumeration;"}, {"contains", "(Ljava/lang/Object;)Z"}, {"<init>", "(I)V"}, {"<init>", "()V"}, {"get", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"}, {"remove", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"containsKey", "(Ljava/lang/Object;)Z"}, {"clear", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}},
                      {{"count", "I"}, {"table", "[Ljava/lang/Object;"}});
             regClass(rt, "java/util/Random", "java/lang/Object",
                      {{"<init>", "(J)V"}, {"<init>", "()V"}, {"setSeed", "(J)V"}, {"nextInt", "()I"}, {"nextInt", "(I)I"}, {"nextLong", "()J"}, {"nextDouble", "()D"}, {"nextFloat", "()F"}, {"nextBoolean", "()Z"}},
                      {{"seed", "J"}});
             regClass(rt, "java/util/Vector", "java/lang/Object",
-                     {{"<init>", "()V"}, {"<init>", "(I)V"}, {"addElement", "(Ljava/lang/Object;)V"}, {"elementAt", "(I)Ljava/lang/Object;"}, {"setElementAt", "(Ljava/lang/Object;I)V"}, {"insertElementAt", "(Ljava/lang/Object;I)V"}, {"removeElement", "(Ljava/lang/Object;)Z"}, {"removeElementAt", "(I)V"}, {"removeAllElements", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}, {"contains", "(Ljava/lang/Object;)Z"}, {"indexOf", "(Ljava/lang/Object;)I"}, {"firstElement", "()Ljava/lang/Object;"}, {"lastElement", "()Ljava/lang/Object;"}},
+                     {{"elements", "()Ljava/util/Enumeration;"}, {"copyInto", "([Ljava/lang/Object;)V"}, {"setSize", "(I)V"}, {"capacity", "()I"}, {"indexOf", "(Ljava/lang/Object;I)I"}, {"lastIndexOf", "(Ljava/lang/Object;)I"}, {"toString", "()Ljava/lang/String;"}, {"<init>", "()V"}, {"<init>", "(I)V"}, {"<init>", "(II)V"}, {"addElement", "(Ljava/lang/Object;)V"}, {"elementAt", "(I)Ljava/lang/Object;"}, {"setElementAt", "(Ljava/lang/Object;I)V"}, {"insertElementAt", "(Ljava/lang/Object;I)V"}, {"removeElement", "(Ljava/lang/Object;)Z"}, {"removeElementAt", "(I)V"}, {"removeAllElements", "()V"}, {"size", "()I"}, {"isEmpty", "()Z"}, {"contains", "(Ljava/lang/Object;)Z"}, {"indexOf", "(Ljava/lang/Object;)I"}, {"firstElement", "()Ljava/lang/Object;"}, {"lastElement", "()Ljava/lang/Object;"}},
                      {{"elementCount", "I"}, {"elementData", "[Ljava/lang/Object;"}});
+            regClass(rt, "java/util/Stack", "java/util/Vector",
+                     {{"<init>", "()V"}, {"push", "(Ljava/lang/Object;)Ljava/lang/Object;"}, {"pop", "()Ljava/lang/Object;"}, {"peek", "()Ljava/lang/Object;"}, {"empty", "()Z"}, {"search", "(Ljava/lang/Object;)I"}},
+                     none);
 
             // --- java.io ---
             regClass(rt, "java/io/InputStream", "java/lang/Object",
@@ -603,7 +647,7 @@ regClass(rt, "java/io/DataInputStream", "java/lang/Object",
             // écrasé par le booléen passé à setFullScreenMode(true), provoquant un
             // crash différé bien plus tard sur un getfield lisant ce même champ).
             regClass(rt, "javax/microedition/lcdui/Canvas", "javax/microedition/lcdui/Displayable",
-                     {{"getWidth", "()I"}, {"getHeight", "()I"}, {"isDoubleBuffered", "()Z"}, {"repaint", "()V"}, {"repaint", "(IIII)V"}, {"serviceRepaints", "()V"}, {"showNotify", "()V"}, {"hideNotify", "()V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}, {"getGameAction", "(I)I"}, {"getKeyCode", "(I)I"}, {"keyPressed", "(I)V"}, {"keyReleased", "(I)V"}, {"keyRepeated", "(I)V"}, {"pointerPressed", "(II)V"}, {"pointerReleased", "(II)V"}, {"pointerDragged", "(II)V"}},
+                     {{"getWidth", "()I"}, {"getHeight", "()I"}, {"isDoubleBuffered", "()Z"}, {"hasPointerEvents", "()Z"}, {"hasPointerMotionEvents", "()Z"}, {"hasRepeatEvents", "()Z"}, {"repaint", "()V"}, {"repaint", "(IIII)V"}, {"serviceRepaints", "()V"}, {"showNotify", "()V"}, {"hideNotify", "()V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}, {"getGameAction", "(I)I"}, {"getKeyCode", "(I)I"}, {"keyPressed", "(I)V"}, {"keyReleased", "(I)V"}, {"keyRepeated", "(I)V"}, {"pointerPressed", "(II)V"}, {"pointerReleased", "(II)V"}, {"pointerDragged", "(II)V"}},
                      {{"__fullscreen", "Z"}, {"__gfx", "Ljavax/microedition/lcdui/Graphics;"}});
             regClass(rt, "javax/microedition/lcdui/game/GameCanvas", "javax/microedition/lcdui/Canvas",
                      {{"<init>", "(Z)V"}, {"setFullScreenMode", "(Z)V"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"flushGraphics", "()V"}, {"flushGraphics", "(IIII)V"}, {"getKeyStates", "()I"}},
@@ -685,6 +729,7 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                       {"addRecord", "([BII)I"},
                       {"closeRecordStore", "()V"},
                       {"deleteRecordStore", "(Ljava/lang/String;)V"},
+                      {"listRecordStores", "()[Ljava/lang/String;"},
                       {"enumerateRecords", "(Ljavax/microedition/rms/RecordFilter;Ljavax/microedition/rms/RecordComparator;Z)Ljavax/microedition/rms/RecordEnumeration;"}},
                      {{"__name", "Ljava/lang/String;"}});
             // javax.microedition.rms.RecordEnumeration : implémenté nativement par
@@ -699,7 +744,7 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                      {{"setColor", "(I)V"}, {"setColor", "(III)V"}, {"getColor", "()I"}, {"setGrayScale", "(I)V"}, {"getGrayScale", "()I"}, {"fillRect", "(IIII)V"}, {"drawRect", "(IIII)V"}, {"drawLine", "(IIII)V"}, {"fillTriangle", "(IIIIII)V"}, {"drawArc", "(IIIIII)V"}, {"fillArc", "(IIIIII)V"}, {"fillRoundRect", "(IIIIII)V"}, {"drawRoundRect", "(IIIIII)V"}, {"setFont", "(Ljavax/microedition/lcdui/Font;)V"}, {"getFont", "()Ljavax/microedition/lcdui/Font;"}, {"drawString", "(Ljava/lang/String;II)V"}, {"drawString", "(Ljava/lang/String;III)V"}, {"drawChar", "(CII)V"}, {"drawChars", "([CIIII)V"}, {"drawImage", "(Ljavax/microedition/lcdui/Image;III)V"}, {"drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V"}, {"setClip", "(IIII)V"}, {"clipRect", "(IIII)V"}, {"getClipX", "()I"}, {"getClipY", "()I"}, {"getClipWidth", "()I"}, {"getClipHeight", "()I"}, {"translate", "(II)V"}, {"getTranslateX", "()I"}, {"getTranslateY", "()I"}, {"drawRGB", "([IIIIIIIZ)V"}},
                      {{"color", "I"}, {"font", "Ljavax/microedition/lcdui/Font;"}, {"translateX", "I"}, {"translateY", "I"}, {"clipX", "I"}, {"clipY", "I"}, {"clipW", "I"}, {"clipH", "I"}, {"mode", "I"}, {"targetW", "I"}, {"targetH", "I"}, {"stride", "I"}, {"buf", "[I"}});
             regClass(rt, "javax/microedition/lcdui/Font", "java/lang/Object",
-                     {{"getFont", "(III)Ljavax/microedition/lcdui/Font;"}, {"getHeight", "()I"}, {"getBaselinePosition", "()I"}, {"getFace", "()I"}, {"getStyle", "()I"}, {"getSize", "()I"}, {"stringWidth", "(Ljava/lang/String;)I"}, {"charWidth", "(C)I"}, {"charsWidth", "([CII)I"}},
+                     {{"getFont", "(III)Ljavax/microedition/lcdui/Font;"}, {"getDefaultFont", "()Ljavax/microedition/lcdui/Font;"}, {"getHeight", "()I"}, {"getBaselinePosition", "()I"}, {"getFace", "()I"}, {"getStyle", "()I"}, {"getSize", "()I"}, {"stringWidth", "(Ljava/lang/String;)I"}, {"charWidth", "(C)I"}, {"charsWidth", "([CII)I"}},
                      {{"face", "I"}, {"style", "I"}, {"size", "I"}});
             regClass(rt, "javax/microedition/lcdui/Image", "java/lang/Object",
                      {{"createImage", "(II)Ljavax/microedition/lcdui/Image;"}, {"createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;"}, {"createImage", "(Ljava/io/InputStream;)Ljavax/microedition/lcdui/Image;"}, {"createImage", "([BII)Ljavax/microedition/lcdui/Image;"}, {"createImage", "(Ljavax/microedition/lcdui/Image;)Ljavax/microedition/lcdui/Image;"}, {"createRGBImage", "([IIIZ)Ljavax/microedition/lcdui/Image;"}, {"getGraphics", "()Ljavax/microedition/lcdui/Graphics;"}, {"getWidth", "()I"}, {"getHeight", "()I"}, {"isMutable", "()Z"}, {"getRGB", "([IIIIII)V"}, {"getRGB", "([IIIIIII)V"}},
@@ -725,10 +770,10 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
             regClass(rt, "javax/microedition/lcdui/Item", "java/lang/Object",
                      {{"getLabel", "()Ljava/lang/String;"}, {"setLabel", "(Ljava/lang/String;)V"}}, none);
             regClass(rt, "javax/microedition/lcdui/Form", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Item;)V"}, {"append", "(Ljavax/microedition/lcdui/Item;)I"}, {"append", "(Ljava/lang/String;)I"}, {"size", "()I"}, {"set", "(ILjavax/microedition/lcdui/Item;)V"}},
+                     {{"<init>", "(Ljava/lang/String;)V"}, {"<init>", "(Ljava/lang/String;Ljavax/microedition/lcdui/Item;)V"}, {"append", "(Ljavax/microedition/lcdui/Item;)I"}, {"append", "(Ljava/lang/String;)I"}, {"append", "(Ljavax/microedition/lcdui/Image;)I"}, {"size", "()I"}, {"set", "(ILjavax/microedition/lcdui/Item;)V"}, {"get", "(I)Ljavax/microedition/lcdui/Item;"}, {"delete", "(I)V"}, {"deleteAll", "()V"}, {"insert", "(ILjavax/microedition/lcdui/Item;)V"}, {"setItemStateListener", "(Ljavax/microedition/lcdui/ItemStateListener;)V"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/List", "javax/microedition/lcdui/Displayable",
-                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"setSelectedIndex", "(IZ)V"}, {"setSelectCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}},
+                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"setSelectedIndex", "(IZ)V"}, {"setSelectCommand", "(Ljavax/microedition/lcdui/Command;)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}, {"getString", "(I)Ljava/lang/String;"}},
                      {{"SELECT_COMMAND", "Ljavax/microedition/lcdui/Command;"}});
             regClass(rt, "javax/microedition/lcdui/TextBox", "javax/microedition/lcdui/Displayable",
                      {{"<init>", "(Ljava/lang/String;Ljava/lang/String;II)V"}, {"setString", "(Ljava/lang/String;)V"}, {"getString", "()Ljava/lang/String;"}},
@@ -744,9 +789,10 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
             regClass(rt, "javax/microedition/lcdui/Gauge", "javax/microedition/lcdui/Item",
                      {{"<init>", "(Ljava/lang/String;ZII)V"}, {"setValue", "(I)V"}, {"getValue", "()I"}}, none);
             regClass(rt, "javax/microedition/lcdui/ChoiceGroup", "javax/microedition/lcdui/Item",
-                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}},
+                     {{"<init>", "(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V"}, {"<init>", "(Ljava/lang/String;I)V"}, {"append", "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I"}, {"getSelectedIndex", "()I"}, {"size", "()I"}},
                      none);
             regClass(rt, "javax/microedition/lcdui/Choice", "java/lang/Object", none, none);
+            regClass(rt, "javax/microedition/lcdui/ItemStateListener", "java/lang/Object", none, none);
             regClass(rt, "javax/microedition/lcdui/Ticker", "java/lang/Object",
                      {{"<init>", "(Ljava/lang/String;)V"}}, none);
             regClass(rt, "javax/microedition/lcdui/Screen", "javax/microedition/lcdui/Displayable", none, none);
@@ -860,6 +906,22 @@ regClass(rt, "java/util/TimerTask", "java/lang/Object",
                         }
                     }
                 }
+            }
+
+            // java.lang.Boolean.TRUE/FALSE : constantes objet (non inlinées par javac), amorcées comme AlertType.
+            {
+                ClassInfo *bc = rt->classInfoOfName("java/lang/Boolean");
+                if (bc)
+                    for (int v = 0; v < 2; v++)
+                    {
+                        const MethodRecord *f = bc->findField(v ? "TRUE" : "FALSE", "Ljava/lang/Boolean;");
+                        Obj *inst = f ? rt->heap().newInstance(bc) : nullptr;
+                        if (inst)
+                        {
+                            inst->cells[0] = Value::fromInt(v);
+                            bc->statics[f->slot] = Value::fromRef(inst);
+                        }
+                    }
             }
 
             // javax.microedition.lcdui.List.SELECT_COMMAND : constante objet

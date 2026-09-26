@@ -1,7 +1,9 @@
+#include <dirent.h>
 #include "core/debug.h"
 #include "core/native.h"
 #include "core/interpreter.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -842,6 +844,52 @@ void n_Thread_currentThread(NativeContext *ctx)
 // partagent les mêmes enregistrements, comme le vrai RMS).
 enum { RS_NAME = 0 };
 
+// --- java.lang.Boolean ---
+void n_Boolean_init(NativeContext *ctx)
+{
+    if (ctx->thisObj && ctx->thisObj->cells)
+        ctx->thisObj->cells[0] = Value::fromInt(argInt(ctx, 1) ? 1 : 0);
+}
+void n_Boolean_booleanValue(NativeContext *ctx)
+{
+    setIntResult(ctx, ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[0].i : 0);
+}
+void n_Boolean_toString(NativeContext *ctx)
+{
+    bool v = ctx->thisObj && ctx->thisObj->cells && ctx->thisObj->cells[0].i;
+    setRefResult(ctx, ctx->rt->heap().newString(v ? "true" : "false"));
+}
+void n_Boolean_hashCode(NativeContext *ctx)
+{
+    bool v = ctx->thisObj && ctx->thisObj->cells && ctx->thisObj->cells[0].i;
+    setIntResult(ctx, v ? 1231 : 1237);
+}
+void n_Boolean_equals(NativeContext *ctx)
+{
+    Obj *k = argRef(ctx, 1);
+    bool v = ctx->thisObj && ctx->thisObj->cells && ctx->thisObj->cells[0].i;
+    setIntResult(ctx, (k && k->kind == ObjKind::Instance && k->cls == ctx->thisObj->cls && (k->cells[0].i != 0) == v) ? 1 : 0);
+}
+// Boolean.valueOf(boolean) : renvoie les singletons TRUE/FALSE (statics amorcés par midp::init).
+void n_Boolean_valueOf(NativeContext *ctx)
+{
+    ClassInfo *c = clsOf(ctx, "java/lang/Boolean");
+    bool v = argInt(ctx, 0) != 0;
+    Obj *o = nullptr;
+    if (c)
+    {
+        const MethodRecord *f = c->findField(v ? "TRUE" : "FALSE", "Ljava/lang/Boolean;");
+        if (f && (size_t)f->slot < c->statics.size())
+            o = c->statics[f->slot].o;
+        if (!o)
+        {
+            o = ctx->rt->heap().newInstance(c);
+            if (o) o->cells[0] = Value::fromInt(v ? 1 : 0);
+        }
+    }
+    setRefResult(ctx, o);
+}
+
 std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> &rsRegistry()
 {
     static std::unordered_map<std::string, std::vector<std::vector<uint8_t>>> m;
@@ -967,6 +1015,39 @@ void n_RS_getRecordSize(NativeContext *ctx)
     setIntResult(ctx, (id >= 1 && (size_t)id <= recs.size()) ? static_cast<int32_t>(recs[id - 1].size()) : 0);
 }
 void n_RS_close(NativeContext *) {}
+// RecordStore.listRecordStores() : magasins ouverts en mémoire + fichiers "<nom>.rms" du dossier
+// persistant. null si aucun (comme la spec MIDP).
+void n_RS_list(NativeContext *ctx)
+{
+    std::vector<std::string> names;
+    for (const auto &kv : rsRegistry())
+        names.push_back(kv.first);
+    if (!rmsDir().empty())
+    {
+        if (DIR *d = opendir(rmsDir().c_str()))
+        {
+            while (dirent *e = readdir(d))
+            {
+                std::string fn = e->d_name;
+                if (fn.size() > 4 && fn.compare(fn.size() - 4, 4, ".rms") == 0)
+                {
+                    std::string base = fn.substr(0, fn.size() - 4);
+                    bool known = false;
+                    for (const auto &n : names)
+                        if (rsFile(n) == rmsDir() + "/" + fn) { known = true; break; }
+                    if (!known) names.push_back(base);
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (names.empty()) { setRefResult(ctx, nullptr); return; }
+    Obj *arr = ctx->rt->heap().newArray(ObjKind::ObjArray, static_cast<int>(names.size()));
+    if (arr)
+        for (size_t i = 0; i < names.size(); i++)
+            arr->cells[i] = Value::fromRef(ctx->rt->heap().newString(names[i]));
+    setRefResult(ctx, arr);
+}
 void n_RS_deleteStore(NativeContext *ctx)
 {
     Obj *nameObj = argRef(ctx, 0);
@@ -1545,6 +1626,9 @@ void n_Class_forName(NativeContext *ctx)
     setRefResult(ctx, nullptr);
 }
 
+// ---- compléments CLDC 1.1 (String/StringBuffer/Math/Integer/Long/Character/Float/Double/Vector/Hashtable/Stack/Date...)
+#include "cldc/natives_extra.inc"
+
 } // namespace
 
 static int64_t g_virtualMillis = 0;
@@ -1621,6 +1705,12 @@ void initNatives()
     registerNative("java/lang/Math.max:(JJ)J", n_Math_maxL);
 
     // java.lang.Integer
+    registerNative("java/lang/Boolean.<init>:(Z)V", n_Boolean_init);
+    registerNative("java/lang/Boolean.booleanValue:()Z", n_Boolean_booleanValue);
+    registerNative("java/lang/Boolean.toString:()Ljava/lang/String;", n_Boolean_toString);
+    registerNative("java/lang/Boolean.hashCode:()I", n_Boolean_hashCode);
+    registerNative("java/lang/Boolean.equals:(Ljava/lang/Object;)Z", n_Boolean_equals);
+    registerNative("java/lang/Boolean.valueOf:(Z)Ljava/lang/Boolean;", n_Boolean_valueOf);
     registerNative("java/lang/Integer.<init>:(I)V", n_Integer_init);
     registerNative("java/lang/Integer.intValue:()I", n_Integer_intValue);
     registerNative("java/lang/Integer.byteValue:()B", n_Integer_byteValue);
@@ -1655,6 +1745,7 @@ void initNatives()
 
     // java.lang.Thread
     registerNative("java/lang/Thread.<init>:(Ljava/lang/Runnable;)V", n_Thread_init);
+    registerNative("java/lang/Thread.<init>:(Ljava/lang/Runnable;Ljava/lang/String;)V", n_Thread_init); // nom ignoré
     registerNative("java/lang/Thread.start:()V", n_Thread_start);
     registerNative("java/lang/Thread.run:()V", n_Thread_start);
     registerNative("java/lang/Thread.sleep:(J)V", n_Thread_sleep);
@@ -1674,6 +1765,7 @@ void initNatives()
     registerNative("javax/microedition/rms/RecordStore.addRecord:([BII)I", n_RS_addRecord);
     registerNative("javax/microedition/rms/RecordStore.closeRecordStore:()V", n_RS_close);
     registerNative("javax/microedition/rms/RecordStore.deleteRecordStore:(Ljava/lang/String;)V", n_RS_deleteStore);
+    registerNative("javax/microedition/rms/RecordStore.listRecordStores:()[Ljava/lang/String;", n_RS_list);
     registerNative("javax/microedition/rms/RecordStore.enumerateRecords:(Ljavax/microedition/rms/RecordFilter;Ljavax/microedition/rms/RecordComparator;Z)Ljavax/microedition/rms/RecordEnumeration;", n_RS_enumerate);
     registerNative("javax/microedition/rms/RecordStore.getRecord:(I)[B", n_RS_getRecordBytes);
     registerNative("javax/microedition/rms/RecordEnumerationImpl.hasNextElement:()Z", n_RE_hasNext);
@@ -1699,6 +1791,7 @@ void initNatives()
     // java.util.Vector
     registerNative("java/util/Vector.<init>:()V", n_Vec_init0);
     registerNative("java/util/Vector.<init>:(I)V", n_Vec_initCap);
+    registerNative("java/util/Vector.<init>:(II)V", n_Vec_initCap);
     registerNative("java/util/Vector.addElement:(Ljava/lang/Object;)V", n_Vec_addElement);
     registerNative("java/util/Vector.elementAt:(I)Ljava/lang/Object;", n_Vec_elementAt);
     registerNative("java/util/Vector.setElementAt:(Ljava/lang/Object;I)V", n_Vec_setElementAt);
@@ -1748,6 +1841,7 @@ void initNatives()
     // java.lang.Class
     registerNative("java/lang/Class.getName:()Ljava/lang/String;", n_Class_getName);
     registerNative("java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;", n_Class_forName);
+    registerExtraNatives(); // en dernier : prime sur les enregistrements précédents (ex. Math.pow corrigé)
 }
 
 } // namespace jvm

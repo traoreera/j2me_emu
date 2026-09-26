@@ -388,6 +388,33 @@ namespace jvm
                 u->items.push_back(argRef(ctx, 1));
                 setInt(ctx, static_cast<int32_t>(u->items.size()) - 1);
             }
+            static void ui_form_get(NativeContext *ctx)
+            {
+                JmeUi *u = uiFind(ctx->thisObj);
+                int i = argInt(ctx, 1);
+                setRef(ctx, (u && i >= 0 && (size_t)i < u->items.size()) ? u->items[i] : nullptr);
+            }
+            static void ui_form_delete(NativeContext *ctx)
+            {
+                JmeUi *u = uiFind(ctx->thisObj);
+                int i = argInt(ctx, 1);
+                if (u && i >= 0 && (size_t)i < u->items.size())
+                    u->items.erase(u->items.begin() + i);
+            }
+            static void ui_form_deleteAll(NativeContext *ctx)
+            {
+                JmeUi *u = uiFind(ctx->thisObj);
+                if (u)
+                    u->items.clear();
+            }
+            static void ui_form_insert(NativeContext *ctx)
+            {
+                JmeUi *u = uiFor(ctx->thisObj);
+                int i = argInt(ctx, 1);
+                if (i < 0 || (size_t)i > u->items.size())
+                    i = (int)u->items.size();
+                u->items.insert(u->items.begin() + i, argRef(ctx, 2));
+            }
             static void ui_form_size(NativeContext *ctx)
             {
                 JmeUi *u = uiFind(ctx->thisObj);
@@ -512,6 +539,9 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.getWidth:()I", cv_getWidth);
                 regN("javax/microedition/lcdui/Canvas.getHeight:()I", cv_getHeight);
                 regN("javax/microedition/lcdui/Canvas.isDoubleBuffered:()Z", cv_isDoubleBuffered);
+                regN("javax/microedition/lcdui/Canvas.hasPointerEvents:()Z", cv_isDoubleBuffered); // toujours vrai : souris/tactile
+                regN("javax/microedition/lcdui/Canvas.hasPointerMotionEvents:()Z", cv_isDoubleBuffered);
+                regN("javax/microedition/lcdui/Canvas.hasRepeatEvents:()Z", cv_isDoubleBuffered);
                 regN("javax/microedition/lcdui/Canvas.repaint:()V", cv_repaint);
                 regN("javax/microedition/lcdui/Canvas.repaint:(IIII)V", cv_repaintRegion);
                 regN("javax/microedition/lcdui/Canvas.serviceRepaints:()V", cv_service);
@@ -557,9 +587,16 @@ namespace jvm
                 regN("javax/microedition/lcdui/Form.<init>:(Ljava/lang/String;Ljavax/microedition/lcdui/Item;)V", ui_form_init);
                 regN("javax/microedition/lcdui/Form.append:(Ljavax/microedition/lcdui/Item;)I", ui_form_append);
                 regN("javax/microedition/lcdui/Form.append:(Ljava/lang/String;)I", ui_form_append);
+                regN("javax/microedition/lcdui/Form.append:(Ljavax/microedition/lcdui/Image;)I", ui_form_append);
                 regN("javax/microedition/lcdui/Form.size:()I", ui_form_size);
+                regN("javax/microedition/lcdui/Form.get:(I)Ljavax/microedition/lcdui/Item;", ui_form_get);
+                regN("javax/microedition/lcdui/Form.delete:(I)V", ui_form_delete);
+                regN("javax/microedition/lcdui/Form.deleteAll:()V", ui_form_deleteAll);
+                regN("javax/microedition/lcdui/Form.insert:(ILjavax/microedition/lcdui/Item;)V", ui_form_insert);
+                regN("javax/microedition/lcdui/Form.setItemStateListener:(Ljavax/microedition/lcdui/ItemStateListener;)V", ui_noop);
                 regN("javax/microedition/lcdui/Form.set:(ILjavax/microedition/lcdui/Item;)V", ui_noop);
                 regN("javax/microedition/lcdui/List.<init>:(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V", ui_list_init4);
+                regN("javax/microedition/lcdui/List.<init>:(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V", ui_list_init4);
                 regN("javax/microedition/lcdui/List.<init>:(Ljava/lang/String;I)V", ui_list_init2);
                 regN("javax/microedition/lcdui/List.setSelectedIndex:(IZ)V", ui_list_setSel);
                 regN("javax/microedition/lcdui/List.setSelectCommand:(Ljavax/microedition/lcdui/Command;)V", ui_list_setSelectCmd);
@@ -581,6 +618,8 @@ namespace jvm
                 regN("javax/microedition/lcdui/Gauge.setValue:(I)V", ui_noop);
                 regN("javax/microedition/lcdui/Gauge.getValue:()I", ui_noop);
                 regN("javax/microedition/lcdui/ChoiceGroup.<init>:(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V", ui_noop);
+                regN("javax/microedition/lcdui/ChoiceGroup.<init>:(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V", ui_noop);
+                regN("javax/microedition/lcdui/ChoiceGroup.<init>:(Ljava/lang/String;I)V", ui_noop);
                 regN("javax/microedition/lcdui/ChoiceGroup.append:(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I", ui_noop);
                 regN("javax/microedition/lcdui/ChoiceGroup.getSelectedIndex:()I", ui_noop);
                 regN("javax/microedition/lcdui/ChoiceGroup.size:()I", ui_noop);

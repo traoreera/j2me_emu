@@ -714,6 +714,23 @@ namespace jvm
                 }
                 setRef(ctx, f);
             }
+            static void f_getDefaultFont(NativeContext *ctx)
+            {
+                // FACE_SYSTEM(0), STYLE_PLAIN(0), SIZE_MEDIUM(0) : même objet que getFont(0,0,0).
+                Obj *f = g_fontCache[0][1];
+                if (!f)
+                {
+                    f = makeInstance("javax/microedition/lcdui/Font");
+                    if (f)
+                    {
+                        f->cells[F_FACE] = Value::fromInt(0);
+                        f->cells[F_STYLE] = Value::fromInt(0);
+                        f->cells[F_SIZE] = Value::fromInt(0);
+                        g_fontCache[0][1] = f;
+                    }
+                }
+                setRef(ctx, f);
+            }
             static void f_getHeight(NativeContext *ctx)
             {
                 (void)ctx;
@@ -1359,6 +1376,7 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.getTranslateX:()I", g_getTranslateX);
                 regN("javax/microedition/lcdui/Graphics.getTranslateY:()I", g_getTranslateY);
                 regN("javax/microedition/lcdui/Font.getFont:(III)Ljavax/microedition/lcdui/Font;", f_getFont);
+                regN("javax/microedition/lcdui/Font.getDefaultFont:()Ljavax/microedition/lcdui/Font;", f_getDefaultFont);
                 regN("javax/microedition/lcdui/Font.getHeight:()I", f_getHeight);
                 regN("javax/microedition/lcdui/Font.getBaselinePosition:()I", f_getBaseline);
                 regN("javax/microedition/lcdui/Font.getFace:()I", f_getFace);

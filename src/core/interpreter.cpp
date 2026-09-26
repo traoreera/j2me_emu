@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "core/interpreter.h"
 #include "core/native.h"
 
@@ -214,6 +215,54 @@ void Interpreter::frameFree(size_t mark)
 // Dispatch
 // ---------------------------------------------------------------------
 
+// Sous-typage par nom : chaîne de super-classes + interfaces déclarées (récursif, borné).
+static ClassInfo *loadClassCached(Runtime *rt, const std::string &name)
+{
+    static std::unordered_set<std::string> failed; // évite de ré-extraire à chaque instanceof une classe absente
+    if (failed.count(name)) return nullptr;
+    ClassInfo *c = rt->classInfoOfName(name);
+    if (!c) c = rt->loadFromJar(name);
+    if (!c) failed.insert(name);
+    return c;
+}
+static bool classIsA(Runtime *rt, ClassInfo *c, const std::string &target, int depth = 0)
+{
+    for (; c; c = c->super)
+    {
+        if (c->name == target) return true;
+        if (c->cf && depth < 8)
+            for (uint16_t ii : c->cf->interfaces)
+            {
+                std::string in = c->cf->constantPool.getClassName(ii);
+                if (in == target) return true;
+                if (ClassInfo *ic = loadClassCached(rt, in))
+                    if (classIsA(rt, ic, target, depth + 1)) return true;
+            }
+    }
+    return false;
+}
+
+// Méthode ABSENTE d'une classe native (API MIDP/CLDC partielle) : plutôt que d'avorter toute la chaîne
+// d'appels (le jeu ne démarre plus du tout pour un simple setter cosmétique manquant), on journalise UNE
+// fois et on rend 0/null. JME_STRICT=1 conserve l'ancien comportement (échec dur), utile pour lister les
+// trous de l'API. Ne s'applique pas aux classes purement issues du JAR (dont la racine native est Object).
+static bool stubMissing(ClassInfo *c, const std::string &name, const std::string &desc, Value &result)
+{
+    static const bool strict = getenv("JME_STRICT") != nullptr;
+    if (strict)
+        return false;
+    ClassInfo *n = c;
+    while (n && n->cf)
+        n = n->super;
+    if (!n || n->name == "java/lang/Object")
+        return false;
+    static std::unordered_set<std::string> warned;
+    if (warned.insert(c->name + "." + name + desc).second)
+        fprintf(stderr, "[stub] %s.%s%s absente de l'API native : no-op (retour 0/null)\n", c->name.c_str(), name.c_str(), desc.c_str());
+    result = Value();
+    return true;
+}
+
 bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
                            Value *args, int nargs, Value &result)
 {
@@ -243,6 +292,8 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
         NativeFn fn = findNative(key);
         if (!fn)
         {
+            if (stubMissing(cls, m->name, m->desc, result))
+                return true;
             fprintf(stderr, "JVM: native manquante: %s\n", key.c_str());
             return false;
         }
@@ -295,6 +346,8 @@ bool Interpreter::invokeStatic(ClassInfo *declClass, const std::string &name, co
         }
         c = c->super;
     }
+    if (declClass && stubMissing(declClass, name, desc, result))
+        return true;
     if (envDebug())
         fprintf(stderr, "invokeStatic: méthode %s%s introuvable dans %s\n",
                 name.c_str(), desc.c_str(), declClass ? declClass->name.c_str() : "(null)");
@@ -321,6 +374,8 @@ bool Interpreter::invokeSpecial(ClassInfo *declClass, const std::string &name, c
     const MethodRecord *m = declClass ? declClass->findMethodVirtual(name, desc) : nullptr;
     if (!m)
     {
+        if (declClass && stubMissing(declClass, name, desc, result))
+            return true;
         fprintf(stderr, "JVM: invokeSpecial: méthode %s%s introuvable dans %s\n",
                 name.c_str(), desc.c_str(),
                 declClass ? declClass->name.c_str() : "(null, classe non résolue)");
@@ -351,6 +406,8 @@ bool Interpreter::invokeVirtual(ClassInfo *declClass, const std::string &name, c
     const MethodRecord *m = rc->findMethodVirtual(name, desc);
     if (!m)
     {
+        if (stubMissing(rc, name, desc, result))
+            return true;
         fprintf(stderr, "JVM: invokeVirtual: méthode %s%s introuvable dans %s\n",
                 name.c_str(), desc.c_str(), rc->name.c_str());
         return false;
@@ -518,6 +575,19 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     excls->name.c_str(), cls->name.c_str(), m->name.c_str(), throwPc);
         pendingException_ = ex;
         return false;
+    };
+    // Résolution d'un champ d'INSTANCE : depuis la classe nommée par le Fieldref (sémantique JVMS),
+    // PAS depuis le type d'exécution du receveur. Sinon un champ redéclaré (même nom+desc) dans une
+    // sous-classe cache celui de la super-classe : Mobapp `MobappMIDlet.a:Z` vs `GameMIDlet.a:Z`
+    // (deux champs privés distincts, obfuscation) tombaient sur le même slot.
+    auto resolveInstField = [&](const std::string &fclass, ClassInfo *runtimeCls, const std::string &fn,
+                                const std::string &fd) -> const MethodRecord *
+    {
+        ClassInfo *decl = fclass.empty() ? nullptr : rt_->classInfoOfName(fclass);
+        if (decl)
+            if (const MethodRecord *r = decl->findFieldRecursive(fn, fd))
+                return r;
+        return runtimeCls->findFieldRecursive(fn, fd);
     };
     auto raiseIfBadArray = [&](Obj *arr, int idx, int throwPc) -> bool
     {
@@ -795,6 +865,76 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0x5f:
         {
             if (sp >= 2) { Value a = st[sp - 1]; st[sp - 1] = st[sp - 2]; st[sp - 2] = a; uint8_t ca = ct[sp - 1]; ct[sp - 1] = ct[sp - 2]; ct[sp - 2] = ca; }
+            break;
+        }
+
+        // dup2_x1 / dup2_x2 : au niveau des SLOTS (un long/double = 2 slots), les 4 formes de la JVMS
+        // se réduisent à "recopier les 2 slots du dessus sous les 1 (x1) ou 2 (x2) slots suivants".
+        case 0x5d: case 0x5e:
+        {
+            const int under = (op == 0x5d) ? 1 : 2;
+            const int n = under + 2;
+            if (sp >= n && sp + 2 <= f.stackCap)
+            {
+                Value tv[4];
+                uint8_t tc[4];
+                for (int i = 0; i < n; i++) { tv[i] = st[sp - n + i]; tc[i] = ct[sp - n + i]; }
+                const int d = sp - n;
+                // [u..., a, b]  ->  [a, b, u..., a, b]
+                st[d] = tv[under];     ct[d] = tc[under];
+                st[d + 1] = tv[under + 1]; ct[d + 1] = tc[under + 1];
+                for (int i = 0; i < under; i++) { st[d + 2 + i] = tv[i]; ct[d + 2 + i] = tc[i]; }
+                st[d + 2 + under] = tv[under];         ct[d + 2 + under] = tc[under];
+                st[d + 3 + under] = tv[under + 1];     ct[d + 3 + under] = tc[under + 1];
+                sp += 2;
+            }
+            break;
+        }
+
+        // ---- arithmétique flottante (float = 1 slot .f, double = 2 slots bits IEEE) ----
+        case 0x62: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a + b), 1); break; }
+        case 0x66: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a - b), 1); break; }
+        case 0x6a: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a * b), 1); break; }
+        case 0x6e: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a / b), 1); break; }
+        case 0x72: { float b = pop().f; float a = pop().f; push(Value::fromFloat(std::fmod(a, b)), 1); break; }
+        case 0x76: { float a = pop().f; push(Value::fromFloat(-a), 1); break; }
+        case 0x63: case 0x67: case 0x6b: case 0x6f: case 0x73:
+        {
+            int64_t bb = popLong(); int64_t ab = popLong();
+            double a, b, r;
+            std::memcpy(&a, &ab, 8); std::memcpy(&b, &bb, 8);
+            switch (op)
+            {
+            case 0x63: r = a + b; break;
+            case 0x67: r = a - b; break;
+            case 0x6b: r = a * b; break;
+            case 0x6f: r = a / b; break;
+            default: r = std::fmod(a, b); break;
+            }
+            int64_t rb_; std::memcpy(&rb_, &r, 8); pushLong(rb_);
+            break;
+        }
+        case 0x77: { int64_t ab = popLong(); double a; std::memcpy(&a, &ab, 8); a = -a; int64_t r; std::memcpy(&r, &a, 8); pushLong(r); break; }
+
+        // jsr/ret (finally compilé par les vieux javac, cible <= 1.4) : l'adresse de retour est un int.
+        case 0xa8:
+        {
+            int16_t off = rb16(c, pc);
+            pushInt(pc); // adresse de l'instruction suivante
+            pc = (pc - 3) + off;
+            break;
+        }
+        case 0xc9:
+        {
+            int32_t off = rb32(c, pc);
+            pushInt(pc);
+            pc = (pc - 5) + off;
+            break;
+        }
+        case 0xa9:
+        {
+            uint8_t idx = rb(c, pc);
+            pc = lv[idx].i;
             break;
         }
 
@@ -1092,7 +1232,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             // getfield/putfield. `tc` reste nullptr ici (pas d'ensureInit
             // pour un champ d'instance) ; validité expliquée dans runtime.h.
             const MethodRecord *ff = (idx < cls->fieldRefCache.size()) ? cls->fieldRefCache[idx].field : nullptr;
-            std::string fn, fd;
+            std::string fn, fd, fclass;
             int w;
             if (ff)
             {
@@ -1102,6 +1242,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             {
                 auto fr = cp.getFieldRef(idx);
                 if (fr.first.empty()) { okResult = false; done = true; break; }
+                fclass = fr.first;
                 size_t colon = fr.second.find(':');
                 fn = fr.second.substr(0, colon);
                 fd = fr.second.substr(colon + 1);
@@ -1114,7 +1255,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
                 if (!ff)
                 {
-                    ff = o->cls->findFieldRecursive(fn, fd);
+                    ff = resolveInstField(fclass, o->cls, fn, fd);
                     if (ff)
                     {
                         if (idx >= cls->fieldRefCache.size())
@@ -1135,7 +1276,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             if (!o || o->kind != ObjKind::Instance) { okResult = false; done = true; break; }
             if (!ff)
             {
-                ff = o->cls->findFieldRecursive(fn, fd);
+                ff = resolveInstField(fclass, o->cls, fn, fd);
                 if (ff)
                 {
                     if (idx >= cls->fieldRefCache.size())
@@ -1221,6 +1362,8 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     ClassInfo *owner = e.staticM->owner;
                     ok = ensureInit(owner) && dispatch(owner, e.staticM, nullptr, &st[sp - nslots], nslots, mres);
                 }
+                else
+                    ok = stubMissing(tc, mname, mdesc, mres);
                 sp -= nslots;
             }
             else
@@ -1380,13 +1523,27 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 else
                     is = (o->kind == leafArrayKind(base));
             }
-            else
+            else if (o)
             {
-                ClassInfo *tc = rt_->classInfoOfName(classRef);
-                if (o && o->kind == ObjKind::Instance)
+                // Sous-typage PAR NOM (chaîne de super + interfaces déclarées) : la classe cible n'est
+                // pas forcément déjà chargée (chargement paresseux) -- l'ancien code répondait « oui » à
+                // tout `instanceof` dont la cible n'était pas encore chargée (bug d'aliasing sur des
+                // hiérarchies obfusquées : `o instanceof k` vrai pour un `o` pur, puis champ introuvable).
+                if (classRef == "java/lang/Object")
+                    is = true;
+                else if (o->kind == ObjKind::Instance)
+                    is = classIsA(rt_, o->cls, classRef);
+                else if (o->kind == ObjKind::String)
+                    is = (classRef == "java/lang/String" || classRef == "java/lang/CharSequence" || classRef == "java/lang/Comparable");
+                else if (o->kind == ObjKind::Class)
+                    is = (classRef == "java/lang/Class");
+                if (!is && op == 0xc0 && o->kind == ObjKind::Instance)
                 {
-                    ClassInfo *oc = o->cls;
-                    while (oc) { if (!tc || oc == tc) { is = true; break; } oc = oc->super; }
+                    // checkcast vers un type introuvable (interface native non déclarée, classe absente
+                    // du JAR) : permissif comme avant plutôt que d'avorter l'appel.
+                    ClassInfo *tc = rt_->classInfoOfName(classRef);
+                    if (!tc) tc = loadClassCached(rt_, classRef);
+                    if (!tc) is = true;
                 }
             }
             if (op == 0xc1)
