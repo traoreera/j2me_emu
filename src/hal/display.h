@@ -27,6 +27,8 @@ namespace hal
     // Rotation d'affichage (0 ou 90 = vue tournée de 90° anti-horaire), lue de
     // JME_ROTATE. Pour les jeux 480x800 dessinés de côté (téléphone tenu en paysage).
     int display_rotation();
+    void display_toggle_fullscreen();          // F11 / Alt+Entrée
+    void display_set_title(const char *title); // titre de la fenêtre (nom du jeu)
     // Coordonnées fenêtre -> écran logique (rotation, letterbox et échelle inclus).
     void display_window_to_logical(int wx, int wy, int &lx, int &ly);
     void display_clear(uint16_t color = 0x0000);

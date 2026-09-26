@@ -4,6 +4,7 @@
 // display (SDL2 côté PC, écran RGB565 côté RP2040).
 
 #include <vector>
+#include <algorithm>
 #include "hal/jar_reader.h"
 #include "hal/display.h"
 #include "hal/input.h"
@@ -184,6 +185,15 @@ int main(int argc, char **argv)
     };
     kernel::driverRegister(&audioDrv);
     kernel::kernelBoot(0);
+    hal::display_set_title(("J2ME Emu - " + manifest.midletName).c_str());
+    // JME_AUDIO_TEST=1 : bip de 0,8 s à 440 Hz au démarrage (vérifie la chaîne audio de bout en bout).
+    if (const char *at = getenv("JME_AUDIO_TEST"))
+        if (atoi(at) != 0)
+            kernel::audio::playTone(440.f, 800, 0.5f);
+    float masterVol = 1.0f, volBeforeMute = 1.0f;
+    bool muted = false;
+    int osdFrames = 0;
+    char osdText[32] = "";
 
     size_t heapSize = jvm::Heap::kDefaultPoolSize;
     if (const char *hs = getenv("JME_HEAP"))
@@ -596,6 +606,34 @@ int main(int argc, char **argv)
         frame++;
         if (maxFrames > 0 && frame >= maxFrames)
             break;
+
+        // Volume maître : F9/F10 (PgBas/PgHaut) par pas de 10 %, F8 = muet. Petit OSD ~1,5 s.
+        if (input.volumeStep || input.muteToggle)
+        {
+            if (input.muteToggle)
+            {
+                muted = !muted;
+            }
+            if (input.volumeStep)
+            {
+                muted = false;
+                masterVol = std::max(0.0f, std::min(1.0f, masterVol + 0.1f * input.volumeStep));
+            }
+            kernel::audio::setMasterVolume(muted ? 0.0f : masterVol);
+            snprintf(osdText, sizeof osdText, muted ? "MUET" : "VOL %d%%", (int)(masterVol * 100 + 0.5f));
+            osdFrames = 45;
+        }
+        if (osdFrames > 0)
+        {
+            osdFrames--;
+            hal::Framebuffer *ofb = hal::display_get_framebuffer();
+            int tw = (int)strlen(osdText) * 6 + 4;
+            if (ofb->width >= tw + 4)
+            {
+                hal::display_fill_rect(2, 2, tw, 11, 0x0000);
+                hal::display_draw_text(4, 4, osdText, muted ? 0xF800 : 0xFFFF);
+            }
+        }
 
         hal::display_present(hal::display_get_framebuffer());
 

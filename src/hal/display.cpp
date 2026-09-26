@@ -29,18 +29,25 @@ namespace hal
             g_integerScale = (strcmp(s, "integer") == 0);
         const int fbW = g_rotation ? cfg->height : cfg->width; // taille affichée (après rotation)
         const int fbH = g_rotation ? cfg->width : cfg->height;
-        // Fenêtre : JME_WINDOW_WIDTH/HEIGHT sinon taille affichée x2 (x1 si trop grande).
+        // Fenêtre : JME_WINDOW_WIDTH/HEIGHT sinon le PLUS GRAND facteur entier qui tient dans
+        // ~90 % de la zone utile du bureau (24" : 240x320 -> x3, 480x320 -> x2...).
+        // Redimensionnable ensuite (image proportionnelle + bandes noires), F11 = plein écran.
         int winW = 0, winH = 0;
         if (const char *v = getenv("JME_WINDOW_WIDTH")) winW = atoi(v);
         if (const char *v = getenv("JME_WINDOW_HEIGHT")) winH = atoi(v);
         if (winW <= 0 || winH <= 0)
         {
-            int mul = (fbW * 2 > 1200 || fbH * 2 > 1000) ? 1 : 2;
-            if (fbW < 200) // petits écrans (Nokia 96x65...) : agrandir pour rester lisible
-                mul = std::max(2, std::min(8, std::min(1200 / fbW, 960 / fbH)));
+            int mul = 0;
+            SDL_Rect ub{};
+            if (SDL_GetDisplayUsableBounds(0, &ub) == 0 && ub.w > 0 && ub.h > 0)
+                mul = std::min((int)(ub.w * 0.90) / fbW, (int)(ub.h * 0.90) / fbH);
+            if (mul <= 0) // bureau inconnu (headless) ou écran plus petit que l'image
+                mul = (fbW * 2 > 1200 || fbH * 2 > 1000) ? 1 : 2;
+            mul = std::max(1, std::min(mul, 12));
             winW = fbW * mul;
             winH = fbH * mul;
         }
+        fprintf(stderr, "[display] fenetre %dx%d pour une image %dx%d\n", winW, winH, fbW, fbH);
         Uint32 wflags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
         const char *fs = getenv("JME_FULLSCREEN");
         if (fs && atoi(fs) != 0)
@@ -68,6 +75,20 @@ namespace hal
         g_fb.stride = cfg->width;
 
         return true;
+    }
+
+    void display_toggle_fullscreen()
+    {
+        if (!g_window)
+            return;
+        bool fs = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+        SDL_SetWindowFullscreen(g_window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
+
+    void display_set_title(const char *title)
+    {
+        if (g_window && title)
+            SDL_SetWindowTitle(g_window, title);
     }
 
     void display_shutdown()

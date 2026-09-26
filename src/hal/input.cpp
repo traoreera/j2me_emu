@@ -59,6 +59,8 @@ static KeyMask g_justReleased = 0;
 static bool g_quitRequested = false;
 static bool g_menuRequested = false;
 static int g_wheel = 0;
+static int g_volStep = 0;
+static bool g_muteToggle = false;
 
 bool input_init()
 {
@@ -75,6 +77,8 @@ void input_poll(InputState *out)
     g_justReleased = 0;
     out->pointerCount = 0;
     g_wheel = 0;
+    g_volStep = 0;
+    g_muteToggle = false;
 
     // Fenêtre -> écran logique (le rendu étire le framebuffer sur toute la
     // fenêtre : un clic à (wx,wy) vise le pixel wx*fbW/winW).
@@ -113,6 +117,18 @@ void input_poll(InputState *out)
                 g_quitRequested = true;
                 g_menuRequested = true;
             }
+            if (down && !e.key.repeat)
+            {
+                SDL_Keycode k = e.key.keysym.sym;
+                if (k == SDLK_F11 || (k == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))
+                    display_toggle_fullscreen();
+                if (k == SDLK_F8)
+                    g_muteToggle = true;
+            }
+            if (down && (e.key.keysym.sym == SDLK_F9 || e.key.keysym.sym == SDLK_PAGEDOWN))
+                g_volStep -= 1;
+            if (down && (e.key.keysym.sym == SDLK_F10 || e.key.keysym.sym == SDLK_PAGEUP))
+                g_volStep += 1;
             if (down && e.key.keysym.sym == SDLK_q && (e.key.keysym.mod & KMOD_CTRL))
                 g_quitRequested = true;
             auto it = g_keyMap.find(e.key.keysym.sym);
@@ -136,6 +152,8 @@ void input_poll(InputState *out)
     out->quit = g_quitRequested;
     out->exitToMenu = g_menuRequested;
     out->wheel = g_wheel;
+    out->volumeStep = g_volStep;
+    out->muteToggle = g_muteToggle;
 }
 
 bool input_applyKeyMap(const char *spec)
