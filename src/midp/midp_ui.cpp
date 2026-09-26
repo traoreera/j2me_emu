@@ -203,12 +203,6 @@ namespace jvm
             static void mid_getAppProperty(NativeContext *ctx)
             {
                 const std::string &key = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : "";
-                // Propriété absente : chaîne VIDE (et non null comme le veut la spec
-                // MIDP). Les jeux Gameloft lisent des attributs du .jad (ex. "HAS-BLOOD")
-                // qu'un .jar seul n'a pas, et enchaînent `.equals("yes")` sans test
-                // de null : renvoyer null les fait planter (NPE dès le démarrage d'AC III),
-                // une chaîne vide les fait simplement prendre la branche "non".
-                // `PROP:Nom=valeur` dans <jeu>.conf permet de fournir la vraie valeur.
                 for (const auto &kv : g_appProps)
                     if (kv.first == key)
                     {
@@ -216,8 +210,25 @@ namespace jvm
                         return;
                     }
                 if (jvm::jmeDebug())
-                    fprintf(stderr, "[midp] getAppProperty(\"%s\") absent -> \"\"\n", key.c_str());
-                setRef(ctx, g_rt->heap().newString(""));
+                    fprintf(stderr, "[midp] getAppProperty(\"%s\") absent\n", key.c_str());
+                // Propriété absente : `null` (spec MIDP) -- sauf pour les jeux qui l'enchaînent sans test de
+                // null : les Gameloft lisent des attributs du .jad (« HAS-BLOOD », « Blood-Censor »...) que
+                // le .jar seul n'a pas et font `.equals("yes")` : `null` les fait planter (NPE dès le
+                // démarrage d'AC III), une chaîne vide les fait prendre la branche « non ». À l'inverse
+                // nmania (`Commit`) fait `.charAt(0)` sur la valeur sans test d'égalité et ne tolère PAS la
+                // chaîne vide. Règle : chaîne vide si l'éditeur est Gameloft ou si JME_PROP_EMPTY=1
+                // (`.conf`), `null` sinon. `PROP:Nom=valeur` dans <jeu>.conf fournit la vraie valeur.
+                static const bool forceEmpty = getenv("JME_PROP_EMPTY") && atoi(getenv("JME_PROP_EMPTY")) != 0;
+                std::string vendor;
+                for (const auto &kv : g_appProps)
+                    if (kv.first == "MIDlet-Vendor")
+                        vendor = kv.second;
+                for (char &c : vendor)
+                    c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                if (forceEmpty || vendor.find("gameloft") != std::string::npos)
+                    setRef(ctx, g_rt->heap().newString(""));
+                else
+                    setRef(ctx, nullptr);
             }
             static void mid_notifyDestroyed(NativeContext *ctx)
             {

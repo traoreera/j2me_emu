@@ -1609,14 +1609,23 @@ void n_System_getProperty(NativeContext *ctx)
     // un appareil Nokia/Siemens/etc. spécifique : notre hal::input.cpp émule
     // un clavier numérique + softkeys standard, pas un layout propriétaire.
     std::string val;
+    bool known = true;
     if (key == "microedition.configuration") val = "CLDC-1.1";
     else if (key == "microedition.profiles") val = "MIDP-2.0";
     else if (key == "microedition.locale") val = "en-US";
     else if (key == "microedition.encoding") val = "ISO-8859-1";
-    else val = "";
+    else if (key == "microedition.platform") val = ""; // jamais null : les jeux font `.indexOf/.startsWith` dessus
+    else if (key == "microedition.media.version") val = "1.1";
+    else if (key == "supports.mixing") val = "true";
+    else if (key == "supports.audio.capture" || key == "supports.video.capture" || key == "supports.recording") val = "false";
+    else if (key == "file.separator") val = "/";
+    else known = false;
+    // Propriété inconnue : `null` (spec CLDC) -- p.ex. `fileconn.dir.*`, `microedition.hostname`,
+    // `microedition.io.file.FileConnection.version` : les jeux testent null pour détecter l'absence
+    // de la fonctionnalité (nmania faisait `.charAt(0)` sur la chaîne vide qu'on renvoyait).
     if (jvm::jmeDebug())
-        fprintf(stderr, "[cldc] System.getProperty(\"%s\") -> \"%s\"\n", key.c_str(), val.c_str());
-    setRefResult(ctx, ctx->rt->heap().newString(val));
+        fprintf(stderr, "[cldc] System.getProperty(\"%s\") -> %s%s%s\n", key.c_str(), known ? "\"" : "null", known ? val.c_str() : "", known ? "\"" : "");
+    setRefResult(ctx, known ? ctx->rt->heap().newString(val) : nullptr);
 }
 void n_System_gc(NativeContext *) {}
 void n_System_identityHashCode(NativeContext *ctx)
