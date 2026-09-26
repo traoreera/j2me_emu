@@ -192,6 +192,7 @@ namespace jvm
             void lcduiTick(Obj *disp, uint32_t justPressed, uint32_t justReleased);   // entrées + rendu de l'écran courant
             void lcduiPointer(int kind, int x, int y);         // clic souris sur un écran haut niveau
             uint32_t lcduiCanvasSoftKeys(Obj *cur, uint32_t justPressed); // touches programmables -> Commands d'un Canvas
+            void presentGameCanvasBuffer(Obj *gc);                  // GameCanvas.paint() par défaut : tampon hors écran -> écran
             void lcduiCanvasOverlay(Obj *cur);                 // barre de commandes d'un Canvas non plein écran
             void lcduiSetTextInput(const char *utf8, int backspaces);
             void lcduiMarkDirty();
@@ -226,13 +227,15 @@ namespace jvm
                     th = g->cells[G_TH].i;
                     stride = g->cells[G_STRIDE].i;
                     mode = g->cells[G_MODE].i;
-                    buf = g->cells[G_BUF].o;
                     u565 = nullptr;
                     if (mode == GM_CANVAS_565)
                     {
-                        u565 = g_canvas565;
+                        buf = nullptr;
+                        u565 = reinterpret_cast<uint16_t *>(g->cells[G_BUF].u); // tampon propre au GameCanvas
                         g_canvasPix++;
                     }
+                    else
+                        buf = g->cells[G_BUF].o;
                     if (mode == GM_SCREEN_565)
                         g_screenPix++;
                     if (jvm::pixDbg() && g_pixdbg < 8)

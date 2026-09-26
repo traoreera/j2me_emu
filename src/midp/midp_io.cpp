@@ -630,6 +630,7 @@ static void native_TimerTask_init(NativeContext *ctx)
             {
                 Obj *name = argRef(ctx, 1);
                 std::string path = (name && name->kind == ObjKind::String) ? name->str : "";
+                const bool absolute = !path.empty() && path[0] == '/';
                 while (!path.empty() && path[0] == '/')
                     path.erase(0, 1);
                 jme::JarReader *jar = ctx->rt->jar();
@@ -639,6 +640,22 @@ static void native_TimerTask_init(NativeContext *ctx)
                     return;
                 }
                 jme::JarEntry e;
+                // Java : un nom SANS « / » initial est relatif au paquetage de la classe (2048 : Logo, dans
+                // game2048/scene, demande "images/logo.png" -> game2048/scene/images/logo.png). On essaie ce chemin
+                // d'abord, puis la racine du JAR (indulgence pour les jeux dont la ressource est à la racine).
+                if (!absolute && ctx->thisObj && ctx->thisObj->kind == ObjKind::Class)
+                {
+                    std::string cn = ctx->thisObj->str;
+                    if (cn.empty() && ctx->thisObj->cls)
+                        cn = ctx->thisObj->cls->name;
+                    size_t sl = cn.rfind('/');
+                    if (sl != std::string::npos)
+                    {
+                        std::string rel = cn.substr(0, sl + 1) + path;
+                        if (jar->findEntry(rel, e))
+                            path = rel;
+                    }
+                }
                 if (!jar->findEntry(path, e) || e.uncompressedSize > 4u * 1024 * 1024)
                 {
                     if (jvm::jmeDebug())

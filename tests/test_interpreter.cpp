@@ -449,6 +449,17 @@ TEST(interpreter_dup2_x1_inserts_pair_under_third_slot)
     ASSERT_EQ(runInt({0x04, 0x05, 0x06, 0x5d, 0x60, 0x64, 0x64, 0x64, 0xac}, 6, 1, nullptr, 0), -5);
 }
 
+TEST(interpreter_pop2_pops_two_slots_for_ints_and_one_long)
+{
+    // Régression (Yet Another Snake) : pop2 sur DEUX int ne retirait qu'un slot -> le tableau visé par
+    // l'iastore suivant était perdu (NPE). iconst_5, iconst_1, iconst_2, pop2, ireturn -> 5.
+    ASSERT_EQ(runInt({0x08, 0x04, 0x05, 0x58, 0xac}, 4, 1, nullptr, 0), 5);
+    // iconst_2 (0x05), iconst_3, iconst_4, pop2, ireturn -> 2 (les deux du dessus sont retirés)
+    ASSERT_EQ(runInt({0x05, 0x06, 0x07, 0x58, 0xac}, 4, 1, nullptr, 0), 2);
+    // un long : iconst_2, lconst_1, pop2, ireturn -> 2
+    ASSERT_EQ(runInt({0x05, 0x0a, 0x58, 0xac}, 4, 1, nullptr, 0), 2);
+}
+
 TEST(interpreter_jsr_ret_subroutine)
 {
     // iconst_1 ; jsr 9 ; iload_0 ; iadd ; ireturn ; nop ; nop ; astore_1 ; iinc 0,10 ; ret 1

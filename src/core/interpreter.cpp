@@ -836,7 +836,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
 
         case 0x57: if (sp > 0) sp--; break;
-        case 0x58: { int k = (sp >= 1 && ct[sp - 1] == 2) ? 2 : 1; if (sp >= k) sp -= k; break; }
+        case 0x58: if (sp >= 2) sp -= 2; else sp = 0; break; // pop2 : TOUJOURS 2 slots (deux int, ou un long/double sur 2 slots)
         case 0x59:
         {
             if (sp >= 1) { st[sp] = st[sp - 1]; ct[sp] = ct[sp - 1]; sp++; }

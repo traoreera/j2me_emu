@@ -264,9 +264,11 @@ namespace jvm
                     fprintf(stderr, "TICK paint initial sur %s\n", cur->cls ? cur->cls->name.c_str() : "?");
                 Value pargs[2] = {Value::fromRef(cur), Value::fromRef(screenGraphics())};
                 Value pres;
-                if (const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V"))
-                    if (pm->mi)
-                        g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, pargs, 2, pres);
+                const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V");
+                if (pm && pm->mi)
+                    g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, pargs, 2, pres);
+                else if (isSubclassOf(cur, "javax/microedition/lcdui/game/GameCanvas"))
+                    presentGameCanvasBuffer(cur);
                 g_paintRequested = false;
                 hal::display_present(hal::display_get_framebuffer());
             }
@@ -300,7 +302,10 @@ namespace jvm
             }();
             static double instrPerMs = 20000.0; // estimation initiale prudente
             static int64_t budget = 400000;
-            const std::vector<Obj *> &threads = jme_threads();
+            // Copie : un thread qui en démarre un autre (Thread.start() dans run()/showNotify()) fait un push_back
+            // sur la liste globale pendant l'itération -> itérateurs invalidés (plantage). Le nouveau thread
+            // tourne dès la trame suivante.
+            const std::vector<Obj *> threads = jme_threads();
             std::vector<Obj *> done;
             const double targetMs = 16.0 / (threads.empty() ? 1 : threads.size());
             for (Obj *r : threads)
@@ -396,9 +401,11 @@ namespace jvm
                 args[0] = Value::fromRef(cur);
                 args[1] = Value::fromRef(screenGraphics());
                 Value res;
-                if (const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V"))
-                    if (pm->mi) // paint() du jeu (bytecode) ; un GameCanvas peut ne dessiner que via flushGraphics()
-                        g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, args, 2, res);
+                const MethodRecord *pm = cur->cls->findMethodVirtual("paint", "(Ljavax/microedition/lcdui/Graphics;)V");
+                if (pm && pm->mi) // paint() du jeu (bytecode)
+                    g_interp->invokeVirtual(cur->cls, "paint", "(Ljavax/microedition/lcdui/Graphics;)V", cur, args, 2, res);
+                else if (isSubclassOf(cur, "javax/microedition/lcdui/game/GameCanvas"))
+                    presentGameCanvasBuffer(cur); // paint() par défaut de GameCanvas : affiche le tampon hors écran
                 g_paintRequested = false;
                 lcduiCanvasOverlay(cur);
                 hal::display_present(hal::display_get_framebuffer());

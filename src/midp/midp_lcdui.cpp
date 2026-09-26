@@ -304,11 +304,36 @@ namespace jvm
             }
             static void clearFramebuffers()
             {
-                for (int i = 0; i < screenW() * screenH(); i++)
-                    g_canvas565[i] = 0;
                 if (auto *fb = hal::display_get_framebuffer())
                     for (int i = 0; i < fb->width * fb->height; i++)
                         fb->pixels[i] = 0;
+            }
+            // Canvas.showNotify()/hideNotify() (MIDP) : appelés quand le Canvas devient / cesse d'être l'écran courant,
+            // showNotify() AVANT le premier paint(). Beaucoup de jeux y démarrent/arrêtent leur thread de rendu
+            // (BluWar : le thread de rafraîchissement n'est lancé que dans showNotify(), écran figé sans cela).
+            static void callNotify(Obj *d, const char *name)
+            {
+                if (!d || d->kind != ObjKind::Instance || !d->cls || !g_interp)
+                    return;
+                if (!isSubclassOf(d, "javax/microedition/lcdui/Canvas"))
+                    return;
+                const MethodRecord *pm = d->cls->findMethodVirtual(name, "()V");
+                if (!pm || !pm->mi) // pas de surcharge bytecode : rien à faire
+                    return;
+                Value args[1] = {Value::fromRef(d)};
+                Value res;
+                g_interp->invokeVirtual(d->cls, name, "()V", d, args, 1, res);
+            }
+            // Change le Displayable courant en notifiant l'ancien (hideNotify) puis le nouveau (showNotify).
+            static void switchCurrent(Obj *next)
+            {
+                Obj *old = g_current;
+                g_current = next;
+                if (old == next)
+                    return;
+                callNotify(old, "hideNotify");
+                if (g_current == next) // hideNotify() peut lui-même avoir changé d'écran
+                    callNotify(next, "showNotify");
             }
             static void d_setCurrent(NativeContext *ctx)
             {
@@ -325,7 +350,7 @@ namespace jvm
                         a.prev = g_current; // sans « next » explicite : retour au displayable précédent
                         a.next = nullptr;
                     }
-                    g_current = d;
+                    switchCurrent(d);
                     g_paintRequested = true;
                     clearFramebuffers();
                     enterScreen(d);
@@ -339,12 +364,12 @@ namespace jvm
                     Scr &a = scrOf(alert);
                     a.next = next;
                     a.prev = g_current == alert ? a.prev : g_current;
-                    g_current = alert;
+                    switchCurrent(alert);
                     clearFramebuffers();
                     enterScreen(alert);
                 }
                 else
-                    g_current = next;
+                    switchCurrent(next);
                 g_paintRequested = true;
             }
             static void d_setCurrentItem(NativeContext *ctx)
@@ -359,7 +384,7 @@ namespace jvm
                     for (size_t i = 0; i < f.items.size(); i++)
                         if (f.items[i] == item)
                             f.focus = static_cast<int>(i);
-                    g_current = it.owner;
+                    switchCurrent(it.owner);
                     g_paintRequested = true;
                     clearFramebuffers();
                     enterScreen(it.owner);
@@ -1515,7 +1540,7 @@ namespace jvm
                 Obj *next = a.next ? a.next : a.prev;
                 if (next && next != alert)
                 {
-                    g_current = next;
+                    switchCurrent(next);
                     g_paintRequested = true;
                     clearFramebuffers();
                     enterScreen(next);

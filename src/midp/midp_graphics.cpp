@@ -69,14 +69,30 @@ namespace jvm
                 return g_screenGfx;
             }
 
+            // Chaque GameCanvas possède son PROPRE tampon hors écran (MIDP 2.0 : « initialement rempli de blanc »),
+            // hors tas Java, dont le pointeur brut est rangé dans la cellule G_BUF de son Graphics. Un tampon
+            // partagé perdait le dessin fait dans le constructeur d'un canvas dès qu'un autre était affiché
+            // (écran d'accueil de SnakeWar, noir).
             static Obj *canvasGfx(Obj *gc)
             {
                 if (gc && gc->cells[GC_GFX].o)
                     return gc->cells[GC_GFX].o;
                 Obj *g = makeGraphics(GM_CANVAS_565, nullptr, screenW(), screenH(), screenW());
+                if (g)
+                {
+                    size_t n = static_cast<size_t>(screenW()) * static_cast<size_t>(screenH());
+                    uint16_t *b = new uint16_t[n];
+                    std::fill(b, b + n, static_cast<uint16_t>(0xFFFF));
+                    g->cells[G_BUF].u = reinterpret_cast<uint64_t>(b);
+                }
                 if (gc)
                     gc->cells[GC_GFX] = Value::fromRef(g);
                 return g;
+            }
+            static uint16_t *canvasBuffer(Obj *gc)
+            {
+                Obj *g = canvasGfx(gc);
+                return g ? reinterpret_cast<uint16_t *>(g->cells[G_BUF].u) : nullptr;
             }
 
             static void hline(Pix &p, int x0, int x1, int y, uint32_t c)
@@ -947,11 +963,14 @@ namespace jvm
                     return;
                 g_flushCalls++;
                 auto *fb = hal::display_get_framebuffer();
-                if (fb && fb->pixels)
-                    if (jvm::jmeDebug())
-                        fprintf(stderr, "flushGraphics()\n");
-                std::memcpy(fb->pixels, g_canvas565, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
-                hal::display_present(fb);
+                if (jvm::jmeDebug())
+                    fprintf(stderr, "flushGraphics()\n");
+                if (uint16_t *src = canvasBuffer(ctx->thisObj))
+                    if (fb && fb->pixels)
+                    {
+                        std::memcpy(fb->pixels, src, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
+                        hal::display_present(fb);
+                    }
                 // Sur un vrai téléphone flushGraphics() est synchronisé sur l'affichage : beaucoup de boucles de jeu
                 // n'ont AUCUN Thread.sleep et comptent sur lui pour se cadencer. Ici on cède la main jusqu'à la trame
                 // suivante (une image par trame et par thread, sans brûler tout le budget de CPU en dessins inutiles).
@@ -960,6 +979,16 @@ namespace jvm
             static void gc_flushRegion(NativeContext *ctx)
             {
                 gc_flushGraphics(ctx);
+            }
+            // Implémentation par défaut de GameCanvas.paint() (MIDP 2.0) : affiche le tampon hors écran
+            // (celui de getGraphics()). Un GameCanvas qui ne surcharge pas paint() et dessine une fois
+            // dans son constructeur (SnakeWar : écran d'accueil) reste sinon noir.
+            void presentGameCanvasBuffer(Obj *gc)
+            {
+                auto *fb = hal::display_get_framebuffer();
+                if (uint16_t *src = canvasBuffer(gc))
+                    if (fb && fb->pixels)
+                        std::memcpy(fb->pixels, src, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
             }
             static void gc_getKeyStates(NativeContext *ctx)
             {
