@@ -37,8 +37,10 @@ namespace jvm
     // Enregistrement de toutes les natives (CLDC + MIDP). À appeler une fois.
     void initNatives();
 
-    // Horloge virtuelle (ms) simulée, avancée à chaque frame (déterministe).
+    // Horloge du jeu : avancée à chaque trame de la durée réelle écoulée (ou d'un pas fixe, JME_FRAME_TIME).
     int64_t virtualMillis();
+    int64_t virtualMicros();
+    void setVirtualMicros(int64_t us); // monotone : ignoré si en arrière
     void advanceVirtualMillis(int64_t ms);
 
 } // namespace jvm

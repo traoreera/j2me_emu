@@ -24,6 +24,7 @@ namespace hal
     void display_shutdown();
     Framebuffer *display_get_framebuffer();
     void display_present(const Framebuffer *fb); // marque l'image « à afficher » (peu coûteux, appelable souvent)
+    bool display_vsync_active();                 // le rendu attend réellement le vsync (display_flip bloque ~1/60 s)
     void display_flip();                         // affiche réellement (1 fois par trame : boucle principale, launcher)
     // Rotation d'affichage (0 ou 90 = vue tournée de 90° anti-horaire), lue de
     // JME_ROTATE. Pour les jeux 480x800 dessinés de côté (téléphone tenu en paysage).

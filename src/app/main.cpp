@@ -4,6 +4,7 @@
 // display (SDL2 côté PC, écran RGB565 côté RP2040).
 
 #include <vector>
+#include <ctime>
 #include <algorithm>
 #include "hal/jar_reader.h"
 #include "hal/display.h"
@@ -92,6 +93,7 @@ static void reexec(const char *jar)
 
 int main(int argc, char **argv)
 {
+    jvm::profileInit();
     // Sans argument : launcher (JME_LAUNCHER=0 pour l'ancien défaut games/assasin.jar).
     const bool launcherOff = getenv("JME_LAUNCHER") && atoi(getenv("JME_LAUNCHER")) == 0;
     if (argc <= 1 && !launcherOff)
@@ -583,12 +585,33 @@ int main(int argc, char **argv)
 
     // Budget RÉEL d'une trame (ms). JME_FRAME_BUDGET ; ne pas confondre avec
     // JME_FRAME_TIME (durée VIRTUELLE vue par l'horloge du jeu).
-    uint32_t kFrameBudgetMs = 33; // ~30 fps cible
+    // Cadence : l'horloge du jeu suit le temps réel (cf. midp::tick), la fréquence de trame ne change donc pas la
+    // vitesse du jeu, seulement la finesse (les sleep() sont honorés à leur instant exact dans la trame). Défaut 16 ms
+    // (~60 trames/s). Avec le vsync actif, le flip bloque déjà ~1/60 s : aucune attente en plus (elle décalerait
+    // l'image d'un vsync et donnerait 33/50 ms en alternance) ; seule une garde de 4 ms évite l'emballement si le
+    // vsync ne bloque pas (fenêtre cachée).
+    uint32_t kFrameBudgetMs = 16;
+    bool frameBudgetForced = false;
     if (const char *fb = getenv("JME_FRAME_BUDGET"))
         if (atoi(fb) > 0)
+        {
             kFrameBudgetMs = static_cast<uint32_t>(atoi(fb));
+            frameBudgetForced = true;
+        }
+    const bool vsyncPacing = !frameBudgetForced && hal::display_vsync_active();
     uint32_t lateFrames = 0;
     uint32_t frameStart = SDL_GetTicks();
+    // JME_RENDER_STATS : durée de traitement de chaque trame (hors attente) pour repérer les à-coups.
+    std::vector<uint16_t> workMs;   // temps de traitement (entrée + JVM + rendu + flip)
+    std::vector<uint16_t> cpuMs;    // idem en temps CPU du processus (insensible à la charge de la machine)
+    std::vector<uint16_t> periodMs; // intervalle réel entre deux débuts de trame
+    auto cpuNowUs = []() -> int64_t {
+        timespec ts;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+    };
+    int64_t cpuFrameStart = cpuNowUs();
+    uint32_t prevStart = frameStart;
 
     while (running)
     {
@@ -699,6 +722,8 @@ int main(int argc, char **argv)
             }
         }
 
+        const uint32_t beforeFlip = SDL_GetTicks() - frameStart;
+        cpuMs.push_back(static_cast<uint16_t>(std::min<int64_t>((cpuNowUs() - cpuFrameStart) / 1000, 65535)));
         hal::display_flip();
 
         // Rythme de trame adaptatif : on ne dort que le temps restant du
@@ -711,11 +736,18 @@ int main(int argc, char **argv)
         // déjà dépassé le budget, on ne dort pas du tout (rattrapage) plutôt
         // que d'accumuler du retard trame après trame.
         uint32_t elapsed = SDL_GetTicks() - frameStart;
-        if (elapsed < kFrameBudgetMs)
-            SDL_Delay(kFrameBudgetMs - elapsed);
-        else
+        workMs.push_back(static_cast<uint16_t>(std::min<uint32_t>(beforeFlip, 65535))); // hors attente du vsync
+        if (beforeFlip > 60 && getenv("JME_RENDER_STATS"))
+            fprintf(stderr, "[stats] trame %d lente : %u ms\n", frame, beforeFlip);
+        const uint32_t target = vsyncPacing ? 4 : kFrameBudgetMs;
+        if (elapsed < target)
+            SDL_Delay(target - elapsed);
+        else if (elapsed > kFrameBudgetMs * 2)
             lateFrames++;
         frameStart = SDL_GetTicks();
+        cpuFrameStart = cpuNowUs();
+        periodMs.push_back(static_cast<uint16_t>(std::min<uint32_t>(frameStart - prevStart, 65535)));
+        prevStart = frameStart;
     }
 
     if (const char *dump = getenv("JME_DUMP"))
@@ -747,6 +779,7 @@ int main(int argc, char **argv)
     kernel::kernelShutdown(0);
     hal::input_shutdown();
     hal::display_shutdown();
+    jvm::profileReport();
     printf("Emulation terminee apres %d frames\n", frame);
     // Lancé depuis le launcher : fin de jeu (F12, notifyDestroyed) -> retour au menu.
     if (fromLauncher && !leaveByQuit && !getenv("JME_MAXFRAMES"))
@@ -772,6 +805,25 @@ int main(int argc, char **argv)
             printf("[stats] frames=%d en_retard=%u (budget %u ms) heap=%zu/%zu KiB RSS=%ld KiB pic=%ld KiB\n",
                    frame, lateFrames, kFrameBudgetMs, rt.heap().used() / 1024,
                    rt.heap().capacity() / 1024, rssKb, hwmKb);
+            auto pct = [](std::vector<uint16_t> v, double q) -> unsigned {
+                if (v.empty()) return 0;
+                std::sort(v.begin(), v.end());
+                return v[std::min(v.size() - 1, static_cast<size_t>(q * v.size()))];
+            };
+            if (!workMs.empty())
+            {
+                double sum = 0;
+                for (uint16_t w : workMs) sum += w;
+                unsigned over66 = 0, over100 = 0;
+                for (uint16_t w : workMs) { over66 += w > 66; over100 += w > 100; }
+                printf("[stats] traitement/trame ms : moy=%.1f p50=%u p95=%u p99=%u max=%u ; >66ms:%u >100ms:%u\n",
+                       sum / workMs.size(), pct(workMs, 0.5), pct(workMs, 0.95), pct(workMs, 0.99), pct(workMs, 1.0), over66, over100);
+                printf("[stats] CPU/trame ms (processus entier) : moy=%.1f p50=%u p95=%u p99=%u max=%u\n",
+                       [&]() { double t = 0; for (uint16_t c : cpuMs) t += c; return cpuMs.empty() ? 0.0 : t / cpuMs.size(); }(),
+                       pct(cpuMs, 0.5), pct(cpuMs, 0.95), pct(cpuMs, 0.99), pct(cpuMs, 1.0));
+                printf("[stats] intervalle reel entre trames ms : p50=%u p95=%u max=%u\n",
+                       pct(periodMs, 0.5), pct(periodMs, 0.95), pct(periodMs, 1.0));
+            }
             if (hwmKb > 256 * 1024)
                 printf("[stats] ATTENTION: pic RSS > 256 MiB (seuil d'alerte Pi Zero 2)\n");
         }

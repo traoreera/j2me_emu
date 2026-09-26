@@ -221,10 +221,13 @@ namespace jvm
             // 33 SECONDES par trame, ce qui casse les minuteries des MIDlets (dialogue
             // "Sound Set" d'Assassin's Creed 2 figé, touches ignorées). On la
             // convertit donc en ms avec un avertissement plutôt que de la subir.
-            static const int frameTimeMs = []() {
+            // Pas FIXE (ms) si JME_FRAME_TIME est posé : runs déterministes (CI, comparaisons pixel-à-pixel).
+            // Sinon l'horloge du jeu suit le temps RÉEL écoulé depuis la trame précédente (bornée à 100 ms pour
+            // qu'une trame très lente ou une fenêtre déplacée ne fasse pas sauter les minuteries des jeux).
+            static const int fixedFrameMs = []() {
                 const char *e = getenv("JME_FRAME_TIME");
                 if (!e)
-                    return 16;
+                    return 0;
                 long v = atol(e);
                 if (v >= 1000)
                 {
@@ -233,11 +236,33 @@ namespace jvm
                 }
                 return v < 1 ? 1 : static_cast<int>(v);
             }();
-            advanceVirtualMillis(frameTimeMs);
+            int64_t dtUs;
+            if (fixedFrameMs > 0)
+                dtUs = static_cast<int64_t>(fixedFrameMs) * 1000;
+            else
+            {
+                static bool firstDt = true;
+                static std::chrono::steady_clock::time_point lastReal;
+                auto nowReal = std::chrono::steady_clock::now();
+                if (firstDt)
+                {
+                    firstDt = false;
+                    dtUs = 16000;
+                }
+                else
+                    dtUs = std::chrono::duration_cast<std::chrono::microseconds>(nowReal - lastReal).count();
+                lastReal = nowReal;
+                dtUs = std::max<int64_t>(1000, std::min<int64_t>(100000, dtUs));
+            }
+            const int64_t tickStartUs = virtualMicros();
+            const int64_t tickEndUs = tickStartUs + dtUs;
             if (getenv("JME_VTRACE") && g_tickN % 10 == 0)
-                fprintf(stderr, "VTRACE frame=%d vms=%lld\n", g_tickN, (long long)virtualMillis());
+                fprintf(stderr, "VTRACE frame=%d vms=%lld dt=%lldus\n", g_tickN, (long long)(tickEndUs / 1000), (long long)dtUs);
             if (!g_rt || !g_interp)
+            {
+                setVirtualMicros(tickEndUs);
                 return;
+            }
             updateKeyState(pressedMask);
             // Pas encore de Displayable courant : on continue quand même (threads, minuteries) --
             // beaucoup de MIDlets (Super FX-BALL, Sperm Race...) démarrent un thread dans startApp()
@@ -308,7 +333,10 @@ namespace jvm
             const std::vector<Obj *> threads = jme_threads();
             std::vector<Obj *> done;
             const double targetMs = 16.0 / (threads.empty() ? 1 : threads.size());
-            for (Obj *r : threads)
+            // Ordonnancement par événements sur [tickStartUs, tickEndUs] : un thread endormi par sleep(ms) est
+            // repris à SON instant de réveil s'il tombe dans la trame (cf. jme_schedNext).
+            jme_schedBegin(g_tickN, tickEndUs);
+            while (Obj *r = jme_schedNext(threads))
             {
                 const MethodRecord *rm = r->cls->findMethodVirtual("run", "()V");
                 if (jvm::jmeDebug() && !rm)
@@ -338,6 +366,7 @@ namespace jvm
             }
             for (Obj *r : done)
                 jme_threadForget(r);
+            setVirtualMicros(tickEndUs); // la suite de la trame (minuteries, touches, paint) voit la fin de trame
 
             fireTimers();
             mediaFlush();

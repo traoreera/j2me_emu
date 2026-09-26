@@ -19,6 +19,14 @@ namespace hal
 
     int display_rotation() { return g_rotation; }
 
+    bool display_vsync_active()
+    {
+        SDL_RendererInfo info;
+        if (!g_renderer || SDL_GetRendererInfo(g_renderer, &info) != 0)
+            return false;
+        return (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
+    }
+
     bool display_init(const DisplayConfig *cfg)
     {
         if (SDL_Init(SDL_INIT_VIDEO) != 0)

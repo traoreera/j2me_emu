@@ -974,7 +974,7 @@ namespace jvm
                 // Sur un vrai téléphone flushGraphics() est synchronisé sur l'affichage : beaucoup de boucles de jeu
                 // n'ont AUCUN Thread.sleep et comptent sur lui pour se cadencer. Ici on cède la main jusqu'à la trame
                 // suivante (une image par trame et par thread, sans brûler tout le budget de CPU en dessins inutiles).
-                jvm::jme_yieldNow();
+                jvm::jme_flushYield();
             }
             static void gc_flushRegion(NativeContext *ctx)
             {

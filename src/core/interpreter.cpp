@@ -7,6 +7,87 @@
 #include <cstdlib>
 #include <cmath>
 
+// ---------------------------------------------------------------------------------------------
+// JME_PROFILE=1 : profil d'échantillonnage des méthodes Java (SIGPROF toutes les ms, temps CPU « propre » :
+// les natives sont comptées chez la méthode qui les appelle). Résultat sur stderr en fin de run.
+// ---------------------------------------------------------------------------------------------
+#include <csignal>
+#include <sys/time.h>
+#include <algorithm>
+#include <vector>
+#include <atomic>
+namespace
+{
+struct ProfSlot
+{
+    std::atomic<const void *> key{nullptr};
+    const jvm::ClassInfo *cls = nullptr;
+    const jvm::MethodRecord *m = nullptr;
+    std::atomic<uint32_t> n{0};
+};
+constexpr int kProfSlots = 8192;
+ProfSlot g_profTab[kProfSlots];
+std::atomic<uint32_t> g_profIdle{0};
+} // namespace
+namespace jvm
+{
+bool g_profOn = false;
+const ClassInfo *g_profCls = nullptr;
+const MethodRecord *g_profM = nullptr;
+static void profSignal(int)
+{
+    const MethodRecord *m = g_profM;
+    if (!m) { g_profIdle++; return; }
+    size_t h = (reinterpret_cast<uintptr_t>(m) >> 4) % kProfSlots;
+    for (int i = 0; i < kProfSlots; i++, h = (h + 1) % kProfSlots)
+    {
+        const void *k = g_profTab[h].key.load();
+        if (k == m) { g_profTab[h].n++; return; }
+        if (!k)
+        {
+            const void *exp = nullptr;
+            if (g_profTab[h].key.compare_exchange_strong(exp, m))
+            {
+                g_profTab[h].cls = g_profCls;
+                g_profTab[h].m = m;
+                g_profTab[h].n++;
+                return;
+            }
+            if (g_profTab[h].key.load() == m) { g_profTab[h].n++; return; }
+        }
+    }
+}
+void profileReport()
+{
+    if (!g_profOn) return;
+    g_profOn = false;
+    std::vector<std::pair<uint32_t, int>> v;
+    uint32_t total = g_profIdle;
+    for (int i = 0; i < kProfSlots; i++)
+        if (g_profTab[i].key.load()) { v.push_back({g_profTab[i].n.load(), i}); total += g_profTab[i].n.load(); }
+    std::sort(v.rbegin(), v.rend());
+    fprintf(stderr, "[profile] %u echantillons (1 ms) dont %u hors bytecode (natives/rendu/boucle principale)\n", total, g_profIdle.load());
+    for (size_t i = 0; i < v.size() && i < 30; i++)
+    {
+        const ProfSlot &p = g_profTab[v[i].second];
+        fprintf(stderr, "[profile] %6u %5.1f%%  %s.%s%s\n", v[i].first, 100.0 * v[i].first / (total ? total : 1),
+                p.cls ? p.cls->name.c_str() : "?", p.m ? p.m->name.c_str() : "?", p.m ? p.m->desc.c_str() : "");
+    }
+}
+void profileInit()
+{
+    if (!getenv("JME_PROFILE")) return;
+    g_profOn = true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = profSignal;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGPROF, &sa, nullptr);
+    itimerval it = {{0, 1000}, {0, 1000}};
+    setitimer(ITIMER_PROF, &it, nullptr);
+}
+} // namespace jvm
+
 namespace jvm
 {
 
@@ -485,6 +566,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     if (!chunk)
         return false;
     std::memset(chunk, 0, nframes);
+    const ClassInfo *profPrevCls = g_profCls;
+    const MethodRecord *profPrevM = g_profM;
+    if (g_profOn) { g_profCls = cls; g_profM = m; }
 
     Frame f;
     f.cls = cls;
@@ -1678,6 +1762,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
     }
     frameFree(mark);
+    if (g_profOn) { g_profCls = profPrevCls; g_profM = profPrevM; }
     return okResult;
 }
 

@@ -27,6 +27,9 @@ namespace jvm
     void jme_threadForget(Obj *r);
     bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls);
     void jme_yieldNow(); // suspend la fibre courante jusqu'à la prochaine trame (no-op hors fibre)
+    void jme_flushYield(); // flushGraphics() : cède la main (>= 33 ms entre deux flush d'un thread qui ne dort pas)
+    void jme_schedBegin(int tickN, int64_t endUs);            // début d'une trame : elle couvre l'horloge jusqu'à endUs
+    Obj *jme_schedNext(const std::vector<Obj *> &threads);    // prochain thread à reprendre dans la trame (nullptr = fini)
 
 
     namespace midp

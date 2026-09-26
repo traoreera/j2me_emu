@@ -733,3 +733,12 @@ Jeux de test supplémentaires : `games/os2_*.jar` (19 JAR publiés par leurs aut
 - **`pop2` ne retirait qu'un slot** quand le sommet n'était pas un long/double : `pop2` sur deux `int` (motif `dup2_x1; pop2; iastore` de Yet Another Snake) perdait le tableau visé → NPE. Test de régression `interpreter_pop2_pops_two_slots_for_ints_and_one_long`.
 - **`Class.getResourceAsStream("images/x.png")` sans `/` initial est relatif au paquetage de la classe** (2048 : `game2048/scene/images/logo.png`). On essaie le chemin de paquetage puis la racine du JAR (indulgence).
 - **`midp::tick()` itère sur une COPIE de la liste des threads** : un `Thread.start()` fait pendant `run()`/`showNotify()` invalidait les itérateurs (plantage dans `tick`).
+
+## Cadence et horloge du jeu (session du 26/09, « saccades, tantôt rapide tantôt lent »)
+
+Cause : `Thread.sleep(ms)` ignorait `ms` (une trame par itération) et l'horloge du jeu avançait de 16 ms fixes par trame de 33 ms réelles. Les jeux rythmés par `sleep` tournaient trop vite, ceux rythmés par `currentTimeMillis` deux fois trop lentement, et toute trame lente ralentissait tout.
+- **Horloge du jeu = temps RÉEL** (`midp::tick`, µs, `virtualMicros()`), bornée à 100 ms par trame. `JME_FRAME_TIME=ms` garde un pas FIXE déterministe (CI, comparaisons pixel-à-pixel : à poser pour les tests).
+- **`Thread.sleep(ms)` / `Object.wait(ms)` honorés** (`sleepFiber`, `SchedState` dans `natives.cpp`) : ordonnanceur par événements (`jme_schedNext`), un thread endormi est repris à son instant exact dans la trame (max 6 reprises/trame). `notify` réveille un `wait(ms)`. Plancher `JME_MIN_SLEEP` (défaut 33 ms) : les `sleep(5)` des jeux réglés pour des téléphones lents ne les font pas tourner 6x trop vite. `JME_SLEEP=frame` = ancien comportement (vérifié pixel-identique sur 50 jeux).
+- **`flushGraphics()`** (`jme_flushYield`) : cède la main avec ≥ 33 ms entre deux flush, sauf si la boucle dort déjà entre deux flush.
+- **Cadence de la boucle principale** : 16 ms (~60 trames/s) ; si le vsync est actif (`display_vsync_active()`), aucune attente ajoutée (elle donnait 33/50 ms en alternance). `JME_FRAME_BUDGET` force une période.
+- Outils : `JME_RENDER_STATS=1` (durées de trame p50/p95/max, trames lentes), `JME_PROFILE=1` (profil d'échantillonnage des méthodes Java), `JME_SLEEPDBG=1` (sleeps/s en temps de jeu vs réel). Les mesures de temps sont très bruitées si le PC est chargé (VS Code, navigateur).

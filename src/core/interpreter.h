@@ -7,6 +7,9 @@
 namespace jvm
 {
 
+    void profileReport(); // affiche le rapport (à appeler tant que le Runtime est vivant)
+    void profileInit(); // JME_PROFILE=1 : profil d'échantillonnage des méthodes Java (rapport sur stderr en fin de run)
+
     // Frame d'exécution
     struct Frame
     {
