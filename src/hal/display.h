@@ -32,6 +32,10 @@ namespace hal
     void display_clear(uint16_t color = 0x0000);
 
     // Dessine du texte 5x7 dans le framebuffer courant (clipsé aux bords).
+    // Idem avec facteur d'agrandissement entier (launcher).
+    void display_draw_text_scaled(int x, int y, const char *text, uint16_t color, int scale);
+    bool display_dump_ppm(const char *path); // framebuffer courant -> PPM (debug/CI)
+    void display_fill_rect(int x, int y, int w, int h, uint16_t color);
     void display_draw_text(int x, int y, const char *text, uint16_t color = 0xFFFF);
 
 } // namespace hal

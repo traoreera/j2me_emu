@@ -49,6 +49,8 @@ namespace hal
         KeyMask justPressed = 0;  // pressed this frame
         KeyMask justReleased = 0; // released this frame
         bool quit = false;        // quitter demandé (F12 / Ctrl+Q / fermeture fenêtre)
+        bool exitToMenu = false;  // F12 : retour au launcher (quit est aussi vrai)
+        int wheel = 0;            // molette de la trame (+1 = vers le haut), pour le launcher
     };
 
     bool input_init();

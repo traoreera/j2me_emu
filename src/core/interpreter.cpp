@@ -1227,7 +1227,19 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             {
                 Obj *receiver = st[sp - nslots - 1].o;
                 Value *argsPtr = st + (sp - nslots - 1);
-                if (op == 0xb7)
+                if (!receiver)
+                {
+                    // Récepteur null : vraie NullPointerException Java (rattrapable par un
+                    // `catch` de l'appelant, ex. `try { in.close(); } catch (Exception e)`
+                    // sur un flux jamais ouvert), au lieu d'un simple échec d'appel.
+                    if (envDebug())
+                        fprintf(stderr, "NPE: invoke%s %s%s sur null dans %s.%s pc=%d\n", op == 0xb7 ? "special" : "virtual",
+                                mname.c_str(), mdesc.c_str(), cls->name.c_str(), m->name.c_str(), opcodePc);
+                    if (ClassInfo *npe = rt_->classInfoOfName("java/lang/NullPointerException"))
+                        pendingException_ = rt_->heap().newInstance(npe);
+                    ok = false;
+                }
+                else if (op == 0xb7)
                 {
                     if (!e.staticM && tc)
                         e.staticM = tc->findMethodVirtual(mname, mdesc);

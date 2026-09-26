@@ -5,7 +5,7 @@
 **Single command (matches CI):**
 ```
 g++ -std=c++17 -O2 -Isrc -DJAR_READER_INDEX_IN_RAM \
-    src/app/main.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
+    src/app/*.cpp src/hal/*.cpp src/core/*.cpp src/cldc/*.cpp \
     src/midp/*.cpp src/kernel/kernel.cpp src/kernel/audio/*.cpp \
     -o j2me_emu $(pkg-config --cflags --libs sdl2)
 ```

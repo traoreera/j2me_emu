@@ -57,6 +57,8 @@ static KeyMask g_pressed = 0;
 static KeyMask g_justPressed = 0;
 static KeyMask g_justReleased = 0;
 static bool g_quitRequested = false;
+static bool g_menuRequested = false;
+static int g_wheel = 0;
 
 bool input_init()
 {
@@ -72,6 +74,7 @@ void input_poll(InputState *out)
     g_justPressed = 0;
     g_justReleased = 0;
     out->pointerCount = 0;
+    g_wheel = 0;
 
     // Fenêtre -> écran logique (le rendu étire le framebuffer sur toute la
     // fenêtre : un clic à (wx,wy) vise le pixel wx*fbW/winW).
@@ -101,10 +104,15 @@ void input_poll(InputState *out)
             toLogical(e.motion.windowID, e.motion.x, e.motion.y, lx, ly);
             pushPointer(PointerEvent::DRAG, lx, ly);
         }
+        if (e.type == SDL_MOUSEWHEEL)
+            g_wheel += e.wheel.y > 0 ? 1 : (e.wheel.y < 0 ? -1 : 0);
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
             bool down = (e.type == SDL_KEYDOWN);
             if (down && e.key.keysym.sym == SDLK_F12)
+            {
                 g_quitRequested = true;
+                g_menuRequested = true;
+            }
             if (down && e.key.keysym.sym == SDLK_q && (e.key.keysym.mod & KMOD_CTRL))
                 g_quitRequested = true;
             auto it = g_keyMap.find(e.key.keysym.sym);
@@ -126,6 +134,8 @@ void input_poll(InputState *out)
     out->justPressed = g_justPressed;
     out->justReleased = g_justReleased;
     out->quit = g_quitRequested;
+    out->exitToMenu = g_menuRequested;
+    out->wheel = g_wheel;
 }
 
 bool input_applyKeyMap(const char *spec)

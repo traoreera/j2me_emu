@@ -20,6 +20,8 @@
 #include <cstring>
 #include <string>
 #include <SDL2/SDL.h>
+#include <unistd.h>
+#include "app/launcher.h"
 
 static std::string toInternal(const std::string &name)
 {
@@ -48,8 +50,41 @@ static const kernel::audio::Device *pickAudioDevice()
 
 static_assert(sizeof(void *) == 8, "build 64 bits requis (Pi Zero 2 W : AArch64)");
 
+// Relance ce même binaire (launcher <-> jeu) : état propre à chaque jeu, sans
+// avoir à réinitialiser Runtime/heap/globales MIDP dans le même processus.
+static void reexec(const char *jar)
+{
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n <= 0)
+        return;
+    self[n] = 0;
+    if (jar)
+        execl(self, self, jar, (char *)nullptr);
+    else
+        execl(self, self, (char *)nullptr);
+    perror("execl");
+}
+
 int main(int argc, char **argv)
 {
+    // Sans argument : launcher (JME_LAUNCHER=0 pour l'ancien défaut games/assasin.jar).
+    const bool launcherOff = getenv("JME_LAUNCHER") && atoi(getenv("JME_LAUNCHER")) == 0;
+    if (argc <= 1 && !launcherOff)
+    {
+        const char *gd = getenv("JME_GAMES_DIR");
+        const char *last = getenv("JME_LAUNCHER_LAST");
+        std::string chosen = launcher::run(gd ? gd : "games", last ? last : "");
+        if (chosen.empty())
+            return 0;
+        setenv("JME_FROM_LAUNCHER", "1", 1);
+        setenv("JME_LAUNCHER_LAST", chosen.c_str(), 1);
+        reexec(chosen.c_str());
+        return 1;
+    }
+    const bool fromLauncher = getenv("JME_FROM_LAUNCHER") != nullptr;
+    std::vector<std::string> confKeys; // variables posées par le .conf (à retirer avant de relancer le launcher)
+    bool leaveByQuit = false;
     const char *jarPath = (argc > 1) ? argv[1] : "games/assasin.jar";
 
     std::vector<std::pair<std::string, std::string>> confProps; // lignes `PROP:Nom=valeur`
@@ -89,6 +124,8 @@ int main(int argc, char **argv)
                 }
                 if (k.compare(0, 4, "JME_") != 0 && k != "SDL_VIDEODRIVER")
                     continue; // on ne touche qu'aux variables de l'émulateur
+                if (!getenv(k.c_str()))
+                    confKeys.push_back(k);
                 setenv(k.c_str(), v.c_str(), 0); // 0 = ne pas écraser l'environnement
             }
             fclose(cf);
@@ -488,6 +525,7 @@ int main(int argc, char **argv)
         {
             if (getenv("JME_DEBUG"))
                 fprintf(stderr, "BREAK: input.quit a la frame %d\n", frame);
+            leaveByQuit = !input.exitToMenu; // Ctrl+Q / fermeture fenêtre = quitter pour de bon
             break;
         }
 
@@ -608,6 +646,13 @@ int main(int argc, char **argv)
     hal::input_shutdown();
     hal::display_shutdown();
     printf("Emulation terminee apres %d frames\n", frame);
+    // Lancé depuis le launcher : fin de jeu (F12, notifyDestroyed) -> retour au menu.
+    if (fromLauncher && !leaveByQuit && !getenv("JME_MAXFRAMES"))
+    {
+        for (const std::string &k : confKeys)
+            unsetenv(k.c_str());
+        reexec(nullptr);
+    }
     if (const char *rs = getenv("JME_RENDER_STATS"))
         if (atoi(rs) != 0)
         {
