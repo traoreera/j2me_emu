@@ -323,6 +323,47 @@ void n_Throwable_printStackTrace(NativeContext *ctx)
         fprintf(stderr, "%s\n", cn.c_str());
 }
 
+// --- encodages : les String du projet sont des octets 8 bits (Latin-1). UTF-8 <-> Latin-1 : les caractères
+// hors Latin-1 (cyrillique, thaï, CJK...) deviennent « ? » à la décodage (limite connue).
+bool encIsUtf8(Obj *enc)
+{
+    if (!enc || enc->kind != ObjKind::String) return false;
+    std::string e = enc->str;
+    for (char &c : e) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+    return e == "UTF-8" || e == "UTF8";
+}
+std::string utf8ToLatin1(const uint8_t *p, size_t n)
+{
+    std::string out;
+    out.reserve(n);
+    for (size_t i = 0; i < n;)
+    {
+        uint8_t b = p[i];
+        if (b < 0x80) { out += static_cast<char>(b); i++; }
+        else if ((b & 0xE0) == 0xC0 && i + 1 < n)
+        {
+            uint32_t cp = ((b & 0x1Fu) << 6) | (p[i + 1] & 0x3Fu);
+            out += cp < 256 ? static_cast<char>(cp) : '?';
+            i += 2;
+        }
+        else if ((b & 0xF0) == 0xE0 && i + 2 < n) { out += '?'; i += 3; }
+        else if ((b & 0xF8) == 0xF0 && i + 3 < n) { out += '?'; i += 4; }
+        else { out += '?'; i++; }
+    }
+    return out;
+}
+std::string latin1ToUtf8(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+    {
+        if (c < 0x80) out += static_cast<char>(c);
+        else { out += static_cast<char>(0xC0 | (c >> 6)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    }
+    return out;
+}
+
 void n_String_initBytes(NativeContext *ctx)
 {
     Obj *self = argRef(ctx, 0);
@@ -330,9 +371,11 @@ void n_String_initBytes(NativeContext *ctx)
     if (!self || !data || data->kind != ObjKind::ByteArray) return;
     self->kind = ObjKind::String;
     self->str.clear();
-    self->str.reserve(static_cast<size_t>(data->arrayLen));
+    std::string raw;
+    raw.reserve(static_cast<size_t>(data->arrayLen));
     for (int i = 0; i < data->arrayLen; i++)
-        self->str += static_cast<char>(data->cells[i].u & 0xFF);
+        raw += static_cast<char>(data->cells[i].u & 0xFF);
+    self->str = encIsUtf8(argRef(ctx, 2)) ? utf8ToLatin1(reinterpret_cast<const uint8_t *>(raw.data()), raw.size()) : raw;
 }
 
 void n_String_initBytesRange(NativeContext *ctx)
@@ -347,9 +390,11 @@ void n_String_initBytesRange(NativeContext *ctx)
     if (off + len > data->arrayLen) len = data->arrayLen - off > 0 ? data->arrayLen - off : 0;
     self->kind = ObjKind::String;
     self->str.clear();
-    self->str.reserve(static_cast<size_t>(len));
+    std::string raw;
+    raw.reserve(static_cast<size_t>(len));
     for (int i = 0; i < len; i++)
-        self->str += static_cast<char>(data->cells[off + i].u & 0xFF);
+        raw += static_cast<char>(data->cells[off + i].u & 0xFF);
+    self->str = encIsUtf8(argRef(ctx, 4)) ? utf8ToLatin1(reinterpret_cast<const uint8_t *>(raw.data()), raw.size()) : raw;
 }
 
 void n_String_initCharsRange(NativeContext *ctx)

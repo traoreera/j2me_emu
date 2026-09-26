@@ -72,7 +72,10 @@ void x_String_hashCode(NativeContext *ctx)
 }
 void x_String_getBytes(NativeContext *ctx)
 {
-    const std::string &s = strOf(ctx->thisObj);
+    std::string enc8;
+    const std::string &s0 = strOf(ctx->thisObj);
+    if (ctx->nargs > 1 && encIsUtf8(argRef(ctx, 1))) enc8 = latin1ToUtf8(s0);
+    const std::string &s = enc8.empty() && !s0.empty() ? s0 : (enc8.empty() ? s0 : enc8);
     Obj *o = ctx->rt->heap().newArray(ObjKind::ByteArray, static_cast<int32_t>(s.size()));
     if (o)
         for (size_t i = 0; i < s.size(); i++)

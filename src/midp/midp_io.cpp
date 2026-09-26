@@ -378,8 +378,7 @@ static void native_TimerTask_init(NativeContext *ctx)
                     else
                     {
                         int need = (b < 0xE0) ? 2 : 3;
-                        std::string seq;
-                        seq += static_cast<char>(b);
+                        int bs[3] = {b, 0, 0};
                         int ok = 1;
                         for (int k = 1; k < need; k++)
                         {
@@ -389,10 +388,15 @@ static void native_TimerTask_init(NativeContext *ctx)
                                 ok = 0;
                                 break;
                             }
-                            seq += static_cast<char>(b2);
+                            bs[k] = b2;
                         }
                         if (ok)
-                            out += seq;
+                        {
+                            // Les String du projet sont en Latin-1 : U+0080..U+00FF conservés, le reste -> '?'.
+                            uint32_t cp = (need == 2) ? (((b & 0x1Fu) << 6) | (bs[1] & 0x3Fu))
+                                                      : (((b & 0x0Fu) << 12) | ((bs[1] & 0x3Fu) << 6) | (bs[2] & 0x3Fu));
+                            out += cp < 256 ? static_cast<char>(cp) : '?';
+                        }
                         i += need;
                     }
                 }
@@ -530,10 +534,11 @@ static void native_TimerTask_init(NativeContext *ctx)
                 // (scores, noms, clés de préférences).
                 std::string enc;
                 enc.reserve(str.size());
-                for (char c : str)
+                for (unsigned char c : str)
                 {
-                    if (c == '\0') { enc += '\xC0'; enc += '\x80'; }
-                    else enc += c;
+                    if (c == 0) { enc += '\xC0'; enc += '\x80'; }
+                    else if (c < 0x80) enc += static_cast<char>(c);
+                    else { enc += static_cast<char>(0xC0 | (c >> 6)); enc += static_cast<char>(0x80 | (c & 0x3F)); } // Latin-1 -> 2 octets
                 }
                 dosWriteN(ctx->thisObj, static_cast<int64_t>(enc.size()), 2);
                 for (char c : enc)

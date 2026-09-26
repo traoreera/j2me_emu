@@ -711,3 +711,9 @@ Avant : `Form`, `List`, `Alert`, `TextBox`, `ChoiceGroup`… n'étaient que des 
 - Saisie texte : `hal::InputState.text/backspaces` (SDL_TEXTINPUT + Backspace) -> `midp::setTextInput()` avant `tick()`. Limité à l'ASCII.
 - Non implémenté : `CustomItem` (paint), `Ticker` (ignoré), images de `List` réduites à un icône, `DateField` = libellé seul.
 - Autres corrections du même lot : `AIOOBE extends IndexOutOfBoundsException`, `ClassNotFoundException`…, exceptions **levées depuis les natives** (`throwJava`, `NativeContext::exception`) : `NumberFormatException` (parseInt/Long/Float/Double strict), `StringIndexOutOfBoundsException` (charAt/substring), `ArrayIndexOutOfBounds`/`NoSuchElement` (Vector), `EmptyStackException`, `EOFException` (`DataInputStream.read*`), `ConnectionNotFoundException` (`Connector.open` : aucun réseau/fichier émulé), Sprite/TiledLayer MIDP 2.0 réels (tuiles 1-based, collisions pixel, rectangle de collision, transformations + pixel de référence), `Image.createImage(Image,x,y,w,h,transform)`, **arène de frames par fibre** (`Interpreter::swapArena`).
+
+## Police et texte (`src/hal/font.cpp`)
+
+- **Une seule police 5x7** pour tout (HAL, launcher, lcdui, `Graphics.drawString`) : ASCII + **Latin-1 composé** (À-ÿ : lettre de base + accent posé sur les 2 rangées du haut, cédille, ñ, ø, ß, ¡ ¿ ° ± × ÷ « » £ ¥ µ § ² ³ ¹ ...). Les `String` du projet restent des octets 8 bits (Latin-1) : cyrillique/thaï/CJK/polonais hors Latin-1 → `?`.
+- `Font` : `getHeight()` = 8×échelle, `getBaselinePosition()` = 6×échelle, `stringWidth/charWidth` = 6×échelle par caractère, échelle = ×2 si l'écran fait ≥ 400 px de large, ×2 de plus pour `SIZE_LARGE` ; `STYLE_BOLD` (double frappe) et `STYLE_UNDERLINED` gérés. Ancres texte : `BASELINE`=0x40, `BOTTOM`=0x20 (avant : inversées).
+- Encodages : `new String(byte[],"UTF-8")`, `getBytes("UTF-8")`, `DataInputStream.readUTF`/`DataOutputStream.writeUTF` transcodent UTF-8 ↔ Latin-1.

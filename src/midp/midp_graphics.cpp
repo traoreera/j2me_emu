@@ -2,6 +2,7 @@
 // Découpé de l'ancien midp_natives.cpp ; état partagé : midp_internal.h.
 
 #include "midp/midp_internal.h"
+#include "hal/font.h"
 
 namespace jvm
 {
@@ -100,111 +101,22 @@ namespace jvm
                     p.put(x, y, c);
             }
 
-            // Font 5x7 (même table que hal/display.cpp).
-            static const uint8_t kFont5x7[96][5] = {
-                {0x00, 0x00, 0x00, 0x00, 0x00},
-                {0x00, 0x00, 0x4F, 0x00, 0x00},
-                {0x00, 0x07, 0x00, 0x07, 0x00},
-                {0x14, 0x7F, 0x14, 0x7F, 0x14},
-                {0x24, 0x2A, 0x7F, 0x2A, 0x12},
-                {0x23, 0x13, 0x08, 0x64, 0x62},
-                {0x36, 0x49, 0x55, 0x22, 0x50},
-                {0x00, 0x05, 0x03, 0x00, 0x00},
-                {0x00, 0x1C, 0x22, 0x41, 0x00},
-                {0x00, 0x41, 0x22, 0x1C, 0x00},
-                {0x14, 0x08, 0x3E, 0x08, 0x14},
-                {0x08, 0x08, 0x3E, 0x08, 0x08},
-                {0x00, 0x50, 0x30, 0x00, 0x00},
-                {0x08, 0x08, 0x08, 0x08, 0x08},
-                {0x00, 0x60, 0x60, 0x00, 0x00},
-                {0x20, 0x10, 0x08, 0x04, 0x02},
-                {0x3E, 0x51, 0x49, 0x45, 0x3E},
-                {0x00, 0x42, 0x7F, 0x40, 0x00},
-                {0x42, 0x61, 0x51, 0x49, 0x46},
-                {0x21, 0x41, 0x45, 0x4B, 0x31},
-                {0x18, 0x14, 0x12, 0x7F, 0x10},
-                {0x27, 0x45, 0x45, 0x45, 0x39},
-                {0x3C, 0x4A, 0x49, 0x49, 0x30},
-                {0x01, 0x71, 0x09, 0x05, 0x03},
-                {0x36, 0x49, 0x49, 0x49, 0x36},
-                {0x06, 0x49, 0x49, 0x29, 0x1E},
-                {0x00, 0x14, 0x14, 0x00, 0x00},
-                {0x00, 0x40, 0x34, 0x00, 0x00},
-                {0x00, 0x08, 0x14, 0x22, 0x41},
-                {0x14, 0x14, 0x14, 0x14, 0x14},
-                {0x41, 0x22, 0x14, 0x08, 0x00},
-                {0x02, 0x01, 0x51, 0x09, 0x06},
-                {0x32, 0x49, 0x79, 0x41, 0x3E},
-                {0x7E, 0x11, 0x11, 0x11, 0x7E},
-                {0x7F, 0x49, 0x49, 0x49, 0x36},
-                {0x3E, 0x41, 0x41, 0x41, 0x22},
-                {0x7F, 0x41, 0x41, 0x22, 0x1C},
-                {0x7F, 0x49, 0x49, 0x49, 0x41},
-                {0x7F, 0x09, 0x09, 0x09, 0x01},
-                {0x3E, 0x41, 0x49, 0x49, 0x7A},
-                {0x7F, 0x08, 0x08, 0x08, 0x7F},
-                {0x00, 0x41, 0x7F, 0x41, 0x00},
-                {0x20, 0x40, 0x41, 0x3F, 0x01},
-                {0x7F, 0x08, 0x14, 0x22, 0x41},
-                {0x7F, 0x40, 0x40, 0x40, 0x40},
-                {0x7F, 0x02, 0x0C, 0x02, 0x7F},
-                {0x7F, 0x04, 0x08, 0x10, 0x7F},
-                {0x3E, 0x41, 0x41, 0x41, 0x3E},
-                {0x7F, 0x09, 0x09, 0x09, 0x06},
-                {0x3E, 0x41, 0x51, 0x21, 0x5E},
-                {0x7F, 0x09, 0x19, 0x29, 0x46},
-                {0x46, 0x49, 0x49, 0x49, 0x31},
-                {0x01, 0x01, 0x7F, 0x01, 0x01},
-                {0x3F, 0x40, 0x40, 0x40, 0x3F},
-                {0x1F, 0x20, 0x40, 0x20, 0x1F},
-                {0x3F, 0x40, 0x38, 0x40, 0x3F},
-                {0x63, 0x14, 0x08, 0x14, 0x63},
-                {0x07, 0x08, 0x70, 0x08, 0x07},
-                {0x61, 0x51, 0x49, 0x45, 0x43},
-                {0x00, 0x7F, 0x41, 0x41, 0x00},
-                {0x02, 0x04, 0x08, 0x10, 0x20},
-                {0x00, 0x41, 0x41, 0x7F, 0x00},
-                {0x04, 0x02, 0x01, 0x02, 0x04},
-                {0x40, 0x40, 0x40, 0x40, 0x40},
-                {0x00, 0x01, 0x02, 0x04, 0x00},
-                {0x20, 0x54, 0x54, 0x54, 0x78},
-                {0x7F, 0x48, 0x44, 0x44, 0x38},
-                {0x38, 0x44, 0x44, 0x44, 0x20},
-                {0x38, 0x44, 0x44, 0x48, 0x7F},
-                {0x38, 0x54, 0x54, 0x54, 0x18},
-                {0x08, 0x7E, 0x09, 0x01, 0x02},
-                {0x0C, 0x52, 0x52, 0x52, 0x3E},
-                {0x7F, 0x08, 0x04, 0x04, 0x78},
-                {0x00, 0x44, 0x7D, 0x40, 0x00},
-                {0x20, 0x40, 0x44, 0x3D, 0x00},
-                {0x7F, 0x10, 0x28, 0x44, 0x00},
-                {0x00, 0x41, 0x7F, 0x40, 0x00},
-                {0x7C, 0x04, 0x18, 0x04, 0x78},
-                {0x7C, 0x08, 0x04, 0x04, 0x78},
-                {0x38, 0x44, 0x44, 0x44, 0x38},
-                {0x7C, 0x14, 0x14, 0x14, 0x08},
-                {0x08, 0x14, 0x14, 0x18, 0x7C},
-                {0x7C, 0x08, 0x04, 0x04, 0x08},
-                {0x48, 0x54, 0x54, 0x54, 0x20},
-                {0x04, 0x3F, 0x44, 0x40, 0x20},
-                {0x3C, 0x40, 0x40, 0x20, 0x7C},
-                {0x1C, 0x20, 0x40, 0x20, 0x1C},
-                {0x3C, 0x40, 0x30, 0x40, 0x3C},
-                {0x44, 0x28, 0x10, 0x28, 0x44},
-                {0x0C, 0x50, 0x50, 0x50, 0x3C},
-                {0x44, 0x64, 0x54, 0x4C, 0x44},
-                {0x00, 0x08, 0x36, 0x41, 0x00},
-                {0x00, 0x00, 0x7F, 0x00, 0x00},
-                {0x00, 0x41, 0x36, 0x08, 0x00},
-                {0x08, 0x04, 0x08, 0x10, 0x08},
-            };
+            // Police 5x7 partagée avec le HAL (hal/font.cpp, ASCII + Latin-1 composé).
 
-            static int strWidth(const char *s)
+
+            // Échelle de la police : x2 sur les grands écrans (>= 400 px de large), x2 encore pour SIZE_LARGE.
+            static int fontScaleOf(Obj *font)
+            {
+                int base = screenW() >= 400 ? 2 : 1;
+                int size = (font && font->kind == ObjKind::Instance) ? font->cells[F_SIZE].i : 0;
+                return base * (size == 16 ? 2 : 1);
+            }
+            static int strWidth(const char *s, int scale = 1)
             {
                 int w = 0;
                 while (s && *s)
                 {
-                    w += 6;
+                    w += 6 * scale;
                     s++;
                 }
                 return w;
@@ -442,30 +354,41 @@ namespace jvm
                 Obj *s = argRef(ctx, 1);
                 int x = argInt(ctx, 2), y = argInt(ctx, 3), anchor = argInt(ctx, 4);
                 const char *text = (s && s->kind == ObjKind::String) ? s->str.c_str() : "";
-                int wlen = strWidth(text);
+                Obj *font = ctx->thisObj->cells[G_FONT].o;
+                const int sc = fontScaleOf(font);
+                const int style = (font && font->kind == ObjKind::Instance) ? font->cells[F_STYLE].i : 0;
+                const int wlen = strWidth(text, sc);
                 if (anchor & 0x01)
                     x -= wlen / 2; // HCENTER
                 else if (anchor & 0x08)
                     x -= wlen; // RIGHT
                 if (anchor & 0x02)
-                    y -= 3; // VCENTER
-                else if (anchor & 0x20)
-                    y -= 6; // BASELINE
+                    y -= 4 * sc; // VCENTER (non standard pour le texte, toléré)
                 else if (anchor & 0x40)
-                    y -= 7; // BOTTOM
+                    y -= 6 * sc; // BASELINE (0x40) : la ligne de base = ascendante de la police
+                else if (anchor & 0x20)
+                    y -= 8 * sc; // BOTTOM (0x20) : hauteur de la police
+                const int x0 = x;
                 while (*text)
                 {
-                    unsigned char ch = static_cast<unsigned char>(*text);
-                    if (ch < 0x20 || ch > 0x7F)
-                        ch = '?';
-                    const uint8_t *glyph = kFont5x7[ch - 0x20];
+                    const uint8_t *glyph = hal::font_glyph(static_cast<unsigned char>(*text));
                     for (int col = 0; col < 5; col++)
                         for (int row = 0; row < 7; row++)
                             if (glyph[col] & (1 << row))
-                                p.put(x + col, y + row, p.color);
-                    x += 6;
+                                for (int dy = 0; dy < sc; dy++)
+                                    for (int dx = 0; dx < sc; dx++)
+                                    {
+                                        p.put(x + col * sc + dx, y + row * sc + dy, p.color);
+                                        if (style & 1) // STYLE_BOLD : double frappe décalée d'un pixel logique
+                                            p.put(x + col * sc + dx + sc, y + row * sc + dy, p.color);
+                                    }
+                    x += 6 * sc;
                     text++;
                 }
+                if (style & 4) // STYLE_UNDERLINED
+                    for (int ux = x0; ux < x; ux++)
+                        for (int dy = 0; dy < sc; dy++)
+                            p.put(ux, y + 7 * sc + dy, p.color);
             }
             static void g_drawChar(NativeContext *ctx)
             {
@@ -754,34 +677,18 @@ namespace jvm
                 }
                 setRef(ctx, f);
             }
-            static void f_getHeight(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 7);
-            }
-            static void f_getBaseline(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6);
-            }
+            static void f_getHeight(NativeContext *ctx) { setInt(ctx, 8 * fontScaleOf(ctx->thisObj)); }
+            static void f_getBaseline(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj)); }
             static void f_getFace(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_FACE].i); }
             static void f_getStyle(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_STYLE].i); }
             static void f_getSize(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_SIZE].i); }
             static void f_stringWidth(NativeContext *ctx)
             {
-                const std::string &s = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : *new std::string("");
-                setInt(ctx, strWidth(s.c_str()));
+                Obj *so = argRef(ctx, 1);
+                setInt(ctx, strWidth((so && so->kind == ObjKind::String) ? so->str.c_str() : "", fontScaleOf(ctx->thisObj)));
             }
-            static void f_charWidth(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6);
-            }
-            static void f_charsWidth(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6 * argInt(ctx, 3));
-            }
+            static void f_charWidth(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj)); }
+            static void f_charsWidth(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj) * argInt(ctx, 3)); }
 
             // ---------------------------------------------------------------------
             // Image natives
