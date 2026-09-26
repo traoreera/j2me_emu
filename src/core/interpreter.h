@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 
 #include "core/runtime.h"
 #include <functional>
@@ -73,6 +74,15 @@ namespace jvm
         // Alloue n octets depuis l'arène de frames (ring bump), aligné sur 8.
         void *frameAlloc(size_t n);
         void frameFree(size_t mark);
+        // Échange l'arène courante avec (base,size,off) : chaque fibre a SA propre arène de frames. Avec une
+        // arène partagée, deux fibres suspendues en pleine chaîne d'appels se marchaient dessus (frameFree
+        // rembobinait sous les frames vivantes de l'autre : locales corrompues, crash sur `putfield`).
+        void swapArena(uint8_t *&base, size_t &size, size_t &off)
+        {
+            std::swap(arena_, base);
+            std::swap(arenaSize_, size);
+            std::swap(arenaOff_, off);
+        }
 
     private:
         Runtime *rt_;

@@ -316,6 +316,11 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
             fprintf(stderr, "NAT %s.%s:%s%s\n", cls->name.c_str(), m->name.c_str(),
                     m->desc.c_str(), ctx.thisObj && ctx.thisObj->cls ? (std::string(" (caller=") + ctx.thisObj->cls->name + ")").c_str() : "");
         fn(&ctx);
+        if (ctx.exception)
+        {
+            pendingException_ = ctx.exception; // remontera jusqu'au premier `catch` compatible
+            return false;
+        }
         return true;
     }
 }

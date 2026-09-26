@@ -95,6 +95,17 @@ NativeFn findNative(const std::string &key)
 static std::string g_rmsDir;
 void setRmsDir(const std::string &dir) { g_rmsDir = dir; }
 
+void throwJava(NativeContext *ctx, const char *className)
+{
+    if (!ctx || !ctx->rt || ctx->exception)
+        return;
+    ClassInfo *c = ctx->rt->classInfoOfName(className);
+    if (!c)
+        c = ctx->rt->classInfoOfName("java/lang/RuntimeException");
+    if (c)
+        ctx->exception = ctx->rt->heap().newInstance(c);
+}
+
 void registerNative(const std::string &key, NativeFn fn)
 {
     registry()[key] = fn;
@@ -129,6 +140,9 @@ struct JmeFiber
     ucontext_t ctx{};
     ucontext_t callerCtx{};
     std::vector<char> stack;
+    std::vector<uint8_t> arena;        // arène de frames propre à la fibre (cf. Interpreter::swapArena)
+    uint8_t *aBase = nullptr;
+    size_t aSize = 0, aOff = 0;
     bool finished = false;
     Obj *runnable = nullptr;
     ClassInfo *cls = nullptr;
@@ -170,6 +184,10 @@ bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
     {
         f = new JmeFiber();
         f->stack.resize(256 * 1024);
+        f->arena.resize(192 * 1024);
+        f->aBase = f->arena.data();
+        f->aSize = f->arena.size();
+        f->aOff = 0;
         f->runnable = r;
         f->cls = cls;
         f->interp = interp;
@@ -183,7 +201,9 @@ bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls)
     g_currentFiber = f;
     g_startingFiber = f;
     interp->setYieldFn([f]() { swapcontext(&f->ctx, &f->callerCtx); });
+    interp->swapArena(f->aBase, f->aSize, f->aOff); // installe l'arène de la fibre (f->a* = celle de l'appelant)
     swapcontext(&f->callerCtx, &f->ctx);
+    interp->swapArena(f->aBase, f->aSize, f->aOff); // rend l'arène de l'appelant (f->a* = celle de la fibre)
     interp->clearYieldFn();
     g_currentFiber = prevCurrent;
     return f->finished;
@@ -362,7 +382,12 @@ void n_String_charAt(NativeContext *ctx)
 {
     const std::string &s = strOf(argRef(ctx, 0));
     int i = argInt(ctx, 1);
-    setIntResult(ctx, (i >= 0 && i < static_cast<int>(s.size())) ? s[i] : 0);
+    if (i < 0 || i >= static_cast<int>(s.size()))
+    {
+        throwJava(ctx, "java/lang/StringIndexOutOfBoundsException");
+        return;
+    }
+    setIntResult(ctx, static_cast<unsigned char>(s[i]));
 }
 void n_String_toCharArray(NativeContext *ctx)
 {
@@ -394,8 +419,11 @@ void n_String_substring1(NativeContext *ctx)
 {
     const std::string &s = strOf(argRef(ctx, 0));
     int b = argInt(ctx, 1);
-    if (b < 0) b = 0;
-    if (b > static_cast<int>(s.size())) b = static_cast<int>(s.size());
+    if (b < 0 || b > static_cast<int>(s.size()))
+    {
+        throwJava(ctx, "java/lang/StringIndexOutOfBoundsException");
+        return;
+    }
     setRefResult(ctx, ctx->rt->heap().newString(s.substr(b)));
 }
 void n_String_substring2(NativeContext *ctx)
@@ -403,9 +431,11 @@ void n_String_substring2(NativeContext *ctx)
     const std::string &s = strOf(argRef(ctx, 0));
     int b = argInt(ctx, 1);
     int e = argInt(ctx, 2);
-    if (b < 0) b = 0;
-    if (e > static_cast<int>(s.size())) e = static_cast<int>(s.size());
-    if (e < b) e = b;
+    if (b < 0 || e > static_cast<int>(s.size()) || e < b)
+    {
+        throwJava(ctx, "java/lang/StringIndexOutOfBoundsException");
+        return;
+    }
     setRefResult(ctx, ctx->rt->heap().newString(s.substr(b, e - b)));
 }
 void n_String_indexOf(NativeContext *ctx)
@@ -606,10 +636,41 @@ void n_Integer_valueOf(NativeContext *ctx)
     if (o) o->cells[0] = Value::fromInt(argInt(ctx, 0));
     setRefResult(ctx, o);
 }
+// Analyse stricte à la Java : [+-]?chiffres, dans la plage du type, sinon NumberFormatException.
+bool parseJavaInt(const std::string &t, int radix, int64_t lo, int64_t hi, int64_t &out)
+{
+    if (t.empty()) return false;
+    size_t i = 0;
+    bool neg = false;
+    if (t[0] == '-' || t[0] == '+') { neg = (t[0] == '-'); i = 1; }
+    if (i >= t.size()) return false;
+    int64_t v = 0;
+    for (; i < t.size(); i++)
+    {
+        int c = static_cast<unsigned char>(t[i]), d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+        else return false;
+        if (d >= radix) return false;
+        v = v * radix + d;
+        if (v > (static_cast<int64_t>(1) << 62)) return false;
+    }
+    if (neg) v = -v;
+    if (v < lo || v > hi) return false;
+    out = v;
+    return true;
+}
 void n_Integer_parseInt(NativeContext *ctx)
 {
     Obj *s = argRef(ctx, 0);
-    setIntResult(ctx, (s && s->kind == ObjKind::String) ? atoi(s->str.c_str()) : 0);
+    int64_t v;
+    if (!s || s->kind != ObjKind::String || !parseJavaInt(s->str, 10, INT32_MIN, INT32_MAX, v))
+    {
+        throwJava(ctx, "java/lang/NumberFormatException");
+        return;
+    }
+    setIntResult(ctx, static_cast<int32_t>(v));
 }
 void n_Integer_equals(NativeContext *ctx)
 {
@@ -1367,7 +1428,12 @@ void n_Vec_elementAt(NativeContext *ctx)
     int idx = argInt(ctx, 1);
     Obj *d = vecData(ctx);
     int count = vecCount(ctx);
-    setRefResult(ctx, (d && idx >= 0 && idx < count) ? d->cells[idx].o : nullptr);
+    if (!d || idx < 0 || idx >= count)
+    {
+        throwJava(ctx, "java/lang/ArrayIndexOutOfBoundsException");
+        return;
+    }
+    setRefResult(ctx, d->cells[idx].o);
 }
 void n_Vec_setElementAt(NativeContext *ctx)
 {
@@ -1445,13 +1511,15 @@ void n_Vec_firstElement(NativeContext *ctx)
 {
     Obj *d = vecData(ctx);
     int count = vecCount(ctx);
-    setRefResult(ctx, (d && count > 0) ? d->cells[0].o : nullptr);
+    if (!d || count <= 0) { throwJava(ctx, "java/util/NoSuchElementException"); return; }
+    setRefResult(ctx, d->cells[0].o);
 }
 void n_Vec_lastElement(NativeContext *ctx)
 {
     Obj *d = vecData(ctx);
     int count = vecCount(ctx);
-    setRefResult(ctx, (d && count > 0) ? d->cells[count - 1].o : nullptr);
+    if (!d || count <= 0) { throwJava(ctx, "java/util/NoSuchElementException"); return; }
+    setRefResult(ctx, d->cells[count - 1].o);
 }
 
 // --- java.util.Random (LCG 63 bits) ---

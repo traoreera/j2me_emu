@@ -288,6 +288,19 @@ static void native_TimerTask_init(NativeContext *ctx)
                 return in ? streamFill(in, dst, off, len) : -1;
             }
 
+            // DataInputStream.readXxx : EOFException si le flux ne contient plus assez d'octets (les jeux lisent
+            // souvent « jusqu'à l'EOFException »).
+            static bool diNeed(NativeContext *ctx, int n)
+            {
+                Obj *self = ctx->thisObj;
+                Obj *in = self && self->cellCount >= 1 ? self->cells[0].o : nullptr;
+                if (!in || in->cellCount < 3 || in->cells[2].i - in->cells[1].i < n)
+                {
+                    throwJava(ctx, "java/io/EOFException");
+                    return false;
+                }
+                return true;
+            }
             static void di_read(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj)); }
             static void di_readArr(NativeContext *ctx)
             {
@@ -295,9 +308,9 @@ static void native_TimerTask_init(NativeContext *ctx)
                 setInt(ctx, diFill(ctx->thisObj, d, 0, d ? d->arrayLen : 0));
             }
             static void di_readArrII(NativeContext *ctx) { setInt(ctx, diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3))); }
-            static void di_readBoolean(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj) != 0 ? 1 : 0); }
-            static void di_readByte(NativeContext *ctx) { setInt(ctx, static_cast<int8_t>(diByte(ctx->thisObj))); }
-            static void di_readUnsignedByte(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj)); }
+            static void di_readBoolean(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, diByte(ctx->thisObj) != 0 ? 1 : 0); }
+            static void di_readByte(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, static_cast<int8_t>(diByte(ctx->thisObj))); }
+            static void di_readUnsignedByte(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, diByte(ctx->thisObj)); }
 
             static int64_t diReadN(Obj *self, int n)
             {
@@ -311,27 +324,30 @@ static void native_TimerTask_init(NativeContext *ctx)
                 }
                 return static_cast<int64_t>(v);
             }
-            static void di_readShort(NativeContext *ctx) { setInt(ctx, static_cast<int16_t>(diReadN(ctx->thisObj, 2))); }
-            static void di_readUnsignedShort(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
-            static void di_readChar(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
-            static void di_readInt(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 4))); }
-            static void di_readLong(NativeContext *ctx) { setLong(ctx, diReadN(ctx->thisObj, 8)); }
+            static void di_readShort(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int16_t>(diReadN(ctx->thisObj, 2))); }
+            static void di_readUnsignedShort(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
+            static void di_readChar(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
+            static void di_readInt(NativeContext *ctx) { if (diNeed(ctx, 4)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 4))); }
+            static void di_readLong(NativeContext *ctx) { if (diNeed(ctx, 8)) setLong(ctx, diReadN(ctx->thisObj, 8)); }
             static void di_readFully(NativeContext *ctx)
             {
                 Obj *d = argRef(ctx, 1);
-                if (d)
+                if (d && diNeed(ctx, d->arrayLen))
                     diFill(ctx->thisObj, d, 0, d->arrayLen);
             }
-            static void di_readFullyII(NativeContext *ctx) { diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3)); }
+            static void di_readFullyII(NativeContext *ctx)
+            {
+                if (diNeed(ctx, argInt(ctx, 3)))
+                    diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3));
+            }
 
             static void di_readUTF(NativeContext *ctx)
             {
-                int lenH = diByte(ctx->thisObj), lenL = diByte(ctx->thisObj);
-                if (lenH < 0 || lenL < 0)
-                {
-                    setRef(ctx, g_rt->heap().newString(""));
+                if (!diNeed(ctx, 2))
                     return;
-                }
+                int lenH = diByte(ctx->thisObj), lenL = diByte(ctx->thisObj);
+                if (!diNeed(ctx, (lenH << 8) | lenL))
+                    return;
                 int len = (lenH << 8) | lenL;
                 std::string out;
                 out.reserve(static_cast<size_t>(len) * 2);

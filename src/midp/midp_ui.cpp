@@ -89,6 +89,32 @@ namespace jvm
                     return 0;
                 }
             }
+            static void cv_getKeyName(NativeContext *ctx)
+            {
+                int k = argInt(ctx, 1);
+                const char *n = nullptr;
+                char buf[8];
+                if (k >= 48 && k <= 57) { buf[0] = static_cast<char>(k); buf[1] = 0; n = buf; }
+                else if (k == 42) n = "*";
+                else if (k == 35) n = "#";
+                else switch (k)
+                {
+                case -1: n = "UP"; break;
+                case -2: n = "DOWN"; break;
+                case -3: n = "LEFT"; break;
+                case -4: n = "RIGHT"; break;
+                case -5: n = "SELECT"; break;
+                case -6: n = "SOFT1"; break;
+                case -7: n = "SOFT2"; break;
+                case -8: n = "CLEAR"; break;
+                default: n = "UNKNOWN"; break;
+                }
+                setRef(ctx, g_rt->heap().newString(n));
+            }
+            static void ui_vibrate(NativeContext *ctx) { setInt(ctx, 1); }
+            static void ui_displayColor(NativeContext *ctx) { setInt(ctx, argInt(ctx, 1) == 0 ? 0xFFFFFF : 0x000000); }
+            static void ui_platformRequest(NativeContext *ctx) { setInt(ctx, 0); }
+            static void ui_checkPermission(NativeContext *ctx) { setInt(ctx, 1); }
             static void cv_getGameAction(NativeContext *ctx) { setInt(ctx, cv_gameActionFor(argInt(ctx, 1))); }
             // Inverse de cv_gameActionFor : renvoie le keyCode canonique pour une
             // action donnée (même confusion action/keyCode corrigée ici).
@@ -549,6 +575,11 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.hideNotify:()V", cv_hideNotify);
                 regN("javax/microedition/lcdui/Canvas.getGameAction:(I)I", cv_getGameAction);
                 regN("javax/microedition/lcdui/Canvas.getKeyCode:(I)I", cv_getKeyCode);
+                regN("javax/microedition/lcdui/Canvas.getKeyName:(I)Ljava/lang/String;", cv_getKeyName);
+                regN("javax/microedition/lcdui/Display.vibrate:(I)Z", ui_vibrate);
+                regN("javax/microedition/lcdui/Display.getColor:(I)I", ui_displayColor);
+                regN("javax/microedition/midlet/MIDlet.platformRequest:(Ljava/lang/String;)Z", ui_platformRequest);
+                regN("javax/microedition/midlet/MIDlet.checkPermission:(Ljava/lang/String;)I", ui_checkPermission);
                 regN("javax/microedition/lcdui/Canvas.keyPressed:(I)V", ui_noop);
                 regN("javax/microedition/lcdui/Canvas.keyReleased:(I)V", ui_noop);
                 regN("javax/microedition/lcdui/Canvas.keyRepeated:(I)V", ui_noop);

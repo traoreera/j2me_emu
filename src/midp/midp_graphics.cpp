@@ -230,6 +230,12 @@ namespace jvm
             {
                 setInt(ctx, static_cast<int32_t>(static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) & 0xFFFFFF));
             }
+            static void g_getRed(NativeContext *ctx) { setInt(ctx, (static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) >> 16) & 0xFF); }
+            static void g_getGreen(NativeContext *ctx) { setInt(ctx, (static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) >> 8) & 0xFF); }
+            static void g_getBlue(NativeContext *ctx) { setInt(ctx, static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) & 0xFF); }
+            static void g_getDisplayColor(NativeContext *ctx) { setInt(ctx, argInt(ctx, 1) & 0xFFFFFF); } // écran vraies couleurs
+            static void g_strokeGet(NativeContext *ctx) { setInt(ctx, 0); }                                // SOLID
+            static void g_drawSubstring(NativeContext *ctx);
             static void g_setGray(NativeContext *ctx)
             {
                 uint32_t v = static_cast<uint32_t>(argInt(ctx, 1)) & 0xFF;
@@ -390,6 +396,23 @@ namespace jvm
             static void g_setFont(NativeContext *ctx)
             {
                 ctx->thisObj->cells[G_FONT] = Value::fromRef(argRef(ctx, 1));
+            }
+            static void g_drawString(NativeContext *ctx);
+            // drawSubstring(String str, int offset, int len, int x, int y, int anchor)
+            static void g_drawSubstring(NativeContext *ctx)
+            {
+                Obj *s = argRef(ctx, 1);
+                if (!s || s->kind != ObjKind::String)
+                    return;
+                int off = argInt(ctx, 2), len = argInt(ctx, 3);
+                if (off < 0 || len < 0 || (size_t)(off + len) > s->str.size())
+                    return;
+                Obj *sub = g_rt->heap().newString(s->str.substr(off, len));
+                Value a[5] = {Value::fromRef(ctx->thisObj), Value::fromRef(sub), Value::fromInt(argInt(ctx, 4)), Value::fromInt(argInt(ctx, 5)), Value::fromInt(argInt(ctx, 6))};
+                NativeContext c2 = *ctx;
+                c2.args = a;
+                c2.nargs = 5;
+                g_drawString(&c2);
             }
             static void g_getFont(NativeContext *ctx)
             {
@@ -873,6 +896,48 @@ namespace jvm
                     buf->cells[i].u = sb ? sb->cells[i].u : 0;
                 setRef(ctx, makeImage(w, h, true, buf));
             }
+            // Image.createImage(Image src, int x, int y, int w, int h, int transform) : sous-image transformée
+            // (mêmes 8 transformations que drawRegion ; résultat immuable).
+            static void img_createSub(NativeContext *ctx)
+            {
+                Obj *src = argRef(ctx, 0);
+                int x = argInt(ctx, 1), y = argInt(ctx, 2), w = argInt(ctx, 3), h = argInt(ctx, 4), tfm = argInt(ctx, 5);
+                if (!src || src->kind != ObjKind::Instance || w <= 0 || h <= 0 || x < 0 || y < 0 ||
+                    x + w > src->cells[IMG_W].i || y + h > src->cells[IMG_H].i || tfm < 0 || tfm > 7)
+                {
+                    setRef(ctx, nullptr); // (IllegalArgumentException dans une vraie JVM)
+                    return;
+                }
+                bool swap = (tfm >= 4 && tfm <= 7);
+                int Wp = swap ? h : w, Hp = swap ? w : h;
+                int iw = src->cells[IMG_W].i;
+                Obj *sb = src->cells[IMG_BUF].o;
+                Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, Wp * Hp);
+                if (!buf)
+                {
+                    g_rt->reportOom();
+                    setRef(ctx, nullptr);
+                    return;
+                }
+                for (int dy = 0; dy < Hp; dy++)
+                    for (int dx = 0; dx < Wp; dx++)
+                    {
+                        int sx, sy;
+                        switch (tfm)
+                        {
+                        case 1: sx = dx; sy = h - 1 - dy; break;
+                        case 2: sx = w - 1 - dx; sy = dy; break;
+                        case 3: sx = w - 1 - dx; sy = h - 1 - dy; break;
+                        case 4: sx = dy; sy = dx; break;
+                        case 5: sx = dy; sy = h - 1 - dx; break;
+                        case 6: sx = w - 1 - dy; sy = dx; break;
+                        case 7: sx = w - 1 - dy; sy = h - 1 - dx; break;
+                        default: sx = dx; sy = dy; break;
+                        }
+                        buf->cells[dy * Wp + dx].u = sb ? sb->cells[(y + sy) * iw + (x + sx)].u : 0;
+                    }
+                setRef(ctx, makeImage(Wp, Hp, false, buf));
+            }
             static void img_createString(NativeContext *ctx)
             {
                 std::string path = (argRef(ctx, 0) && argRef(ctx, 0)->kind == ObjKind::String) ? argRef(ctx, 0)->str : "";
@@ -1024,12 +1089,12 @@ namespace jvm
                             sx = dyy;
                             sy = dxx;
                             break;
-                        case 5:
+                        case 5: // ROT90 : dest = h x w
                             sx = dyy;
-                            sy = w - 1 - dxx;
+                            sy = h - 1 - dxx;
                             break;
-                        case 6:
-                            sx = h - 1 - dyy;
+                        case 6: // ROT270
+                            sx = w - 1 - dyy;
                             sy = dxx;
                             break;
                         case 7:
@@ -1324,6 +1389,12 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.setColor:(I)V", g_setColorI);
                 regN("javax/microedition/lcdui/Graphics.setColor:(III)V", g_setColorRGB);
                 regN("javax/microedition/lcdui/Graphics.getColor:()I", g_getColor);
+                regN("javax/microedition/lcdui/Graphics.getRedComponent:()I", g_getRed);
+                regN("javax/microedition/lcdui/Graphics.getGreenComponent:()I", g_getGreen);
+                regN("javax/microedition/lcdui/Graphics.getBlueComponent:()I", g_getBlue);
+                regN("javax/microedition/lcdui/Graphics.getDisplayColor:(I)I", g_getDisplayColor);
+                regN("javax/microedition/lcdui/Graphics.getStrokeStyle:()I", g_strokeGet);
+                regN("javax/microedition/lcdui/Graphics.drawSubstring:(Ljava/lang/String;IIIII)V", g_drawSubstring);
                 regN("javax/microedition/lcdui/Graphics.setGrayScale:(I)V", g_setGray);
                 regN("javax/microedition/lcdui/Graphics.getGrayScale:()I", g_getColor);
                 regN("javax/microedition/lcdui/Graphics.fillRect:(IIII)V", g_fillRect);
@@ -1390,6 +1461,7 @@ namespace jvm
                 regN("javax/microedition/lcdui/Image.createImage:(Ljava/io/InputStream;)Ljavax/microedition/lcdui/Image;", img_createStream);
                 regN("javax/microedition/lcdui/Image.createImage:([BII)Ljavax/microedition/lcdui/Image;", img_createBytes);
                 regN("javax/microedition/lcdui/Image.createImage:(Ljavax/microedition/lcdui/Image;)Ljavax/microedition/lcdui/Image;", img_copy);
+                regN("javax/microedition/lcdui/Image.createImage:(Ljavax/microedition/lcdui/Image;IIIII)Ljavax/microedition/lcdui/Image;", img_createSub);
                 regN("javax/microedition/lcdui/Image.createRGBImage:([IIIZ)Ljavax/microedition/lcdui/Image;", img_createRGB);
                 regN("javax/microedition/lcdui/Image.getGraphics:()Ljavax/microedition/lcdui/Graphics;", img_getGraphics);
                 regN("javax/microedition/lcdui/Image.getWidth:()I", img_getWidth);

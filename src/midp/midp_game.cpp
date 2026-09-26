@@ -56,8 +56,82 @@ namespace jvm
                     setInt(ctx, ctx->thisObj->cells[L_H].i);
             }
 
-            // --- Sprite ---
-            // (image) V et (image, fw, fh) V : image=arg1, fw=arg2, fh=arg3.
+            // --- Sprite ---------------------------------------------------------------------------
+            // Modèle MIDP 2.0 : (L_X,L_Y) = coin haut-gauche de la frame TRANSFORMÉE dans le repère
+            // du peintre ; (SPR_RX,SPR_RY) = pixel de référence dans la frame NON transformée ;
+            // sa position transformée est recalculée à chaque transformation, et setTransform garde
+            // le pixel de référence immobile à l'écran (spec : la position du sprite est ajustée).
+            static int sprRawCount(Obj *s)
+            {
+                Obj *img = s->cells[SPR_IMG].o;
+                int fw = s->cells[SPR_FW].i, fh = s->cells[SPR_FH].i;
+                if (!img || fw <= 0 || fh <= 0)
+                    return 1;
+                int n = (img->cells[IMG_W].i / fw) * (img->cells[IMG_H].i / fh);
+                return n > 0 ? n : 1;
+            }
+            static int sprSeqLen(Obj *s)
+            {
+                Obj *seq = s->cells[SPR_SEQ].o;
+                return (seq && seq->kind == ObjKind::IntArray && seq->arrayLen > 0) ? seq->arrayLen : sprRawCount(s);
+            }
+            // Point (px,py) de la frame source (fw x fh) -> position dans la frame transformée.
+            static void tfmPoint(int tfm, int fw, int fh, int px, int py, int &ox, int &oy)
+            {
+                switch (tfm)
+                {
+                case 1: ox = px; oy = fh - 1 - py; break;
+                case 2: ox = fw - 1 - px; oy = py; break;
+                case 3: ox = fw - 1 - px; oy = fh - 1 - py; break;
+                case 4: ox = py; oy = px; break;
+                case 5: ox = fh - 1 - py; oy = px; break;
+                case 6: ox = py; oy = fw - 1 - px; break;
+                case 7: ox = fh - 1 - py; oy = fw - 1 - px; break;
+                default: ox = px; oy = py; break;
+                }
+            }
+            // Inverse : point (lx,ly) de la frame transformée -> pixel de la frame source.
+            static void tfmInverse(int tfm, int fw, int fh, int lx, int ly, int &sx, int &sy)
+            {
+                switch (tfm)
+                {
+                case 1: sx = lx; sy = fh - 1 - ly; break;
+                case 2: sx = fw - 1 - lx; sy = ly; break;
+                case 3: sx = fw - 1 - lx; sy = fh - 1 - ly; break;
+                case 4: sx = ly; sy = lx; break;
+                case 5: sx = ly; sy = fh - 1 - lx; break;
+                case 6: sx = fw - 1 - ly; sy = lx; break;
+                case 7: sx = fw - 1 - ly; sy = fh - 1 - lx; break;
+                default: sx = lx; sy = ly; break;
+                }
+            }
+            // Rectangle (x,y,w,h) de la frame source -> rectangle dans la frame transformée.
+            static void tfmRect(int tfm, int fw, int fh, int x, int y, int w, int h, int &ox, int &oy, int &ow, int &oh)
+            {
+                switch (tfm)
+                {
+                case 1: ox = x; oy = fh - y - h; ow = w; oh = h; break;
+                case 2: ox = fw - x - w; oy = y; ow = w; oh = h; break;
+                case 3: ox = fw - x - w; oy = fh - y - h; ow = w; oh = h; break;
+                case 4: ox = y; oy = x; ow = h; oh = w; break;
+                case 5: ox = fh - y - h; oy = x; ow = h; oh = w; break;
+                case 6: ox = y; oy = fw - x - w; ow = h; oh = w; break;
+                case 7: ox = fh - y - h; oy = fw - x - w; ow = h; oh = w; break;
+                default: ox = x; oy = y; ow = w; oh = h; break;
+                }
+            }
+            static void sprSyncSize(Obj *s)
+            {
+                int tfm = s->cells[SPR_TFM].i;
+                bool swap = (tfm >= 4 && tfm <= 7);
+                s->cells[L_W] = Value::fromInt(swap ? s->cells[SPR_FH].i : s->cells[SPR_FW].i);
+                s->cells[L_H] = Value::fromInt(swap ? s->cells[SPR_FW].i : s->cells[SPR_FH].i);
+            }
+            static void sprRefT(Obj *s, int &rx, int &ry)
+            {
+                tfmPoint(s->cells[SPR_TFM].i, s->cells[SPR_FW].i, s->cells[SPR_FH].i, s->cells[SPR_RX].i, s->cells[SPR_RY].i, rx, ry);
+            }
+            // (image) V, (image, fw, fh) V
             static void spr_init(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
@@ -65,7 +139,12 @@ namespace jvm
                     return;
                 Obj *img = argRef(ctx, 1);
                 int fw = argInt(ctx, 2), fh = argInt(ctx, 3);
-                if (img)
+                if (ctx->nargs <= 2 || (fw <= 0 && fh <= 0))
+                {
+                    fw = img ? img->cells[IMG_W].i : 0;
+                    fh = img ? img->cells[IMG_H].i : 0;
+                }
+                else if (img)
                 {
                     if (fw <= 0)
                         fw = img->cells[IMG_W].i;
@@ -80,16 +159,27 @@ namespace jvm
                 self->cells[SPR_TFM] = Value::fromInt(0);
                 self->cells[SPR_RX] = Value::fromInt(0);
                 self->cells[SPR_RY] = Value::fromInt(0);
+                self->cells[SPR_CSET] = Value::fromInt(0);
                 self->cells[L_X] = Value::fromInt(0);
                 self->cells[L_Y] = Value::fromInt(0);
-                self->cells[L_W] = Value::fromInt(fw);
-                self->cells[L_H] = Value::fromInt(fh);
                 self->cells[L_VIS] = Value::fromInt(1);
+                sprSyncSize(self);
+            }
+            static void spr_initCopy(NativeContext *ctx) // Sprite(Sprite s)
+            {
+                Obj *self = ctx->thisObj, *o = argRef(ctx, 1);
+                if (!self || !o || o->kind != ObjKind::Instance)
+                    return;
+                for (int i = 0; i < 18 && i < self->cellCount && i < o->cellCount; i++)
+                    self->cells[i] = o->cells[i];
             }
             static void spr_setFrame(NativeContext *ctx)
             {
-                if (ctx->thisObj)
-                    ctx->thisObj->cells[SPR_FRAME] = Value::fromInt(argInt(ctx, 1));
+                Obj *s = ctx->thisObj;
+                if (!s)
+                    return;
+                int n = sprSeqLen(s), f = argInt(ctx, 1);
+                s->cells[SPR_FRAME] = Value::fromInt(((f % n) + n) % n);
             }
             static void spr_getFrame(NativeContext *ctx)
             {
@@ -98,30 +188,29 @@ namespace jvm
             }
             static void spr_nextFrame(NativeContext *ctx)
             {
-                if (!ctx->thisObj)
+                Obj *s = ctx->thisObj;
+                if (!s)
                     return;
-                ctx->thisObj->cells[SPR_FRAME].i++;
+                int n = sprSeqLen(s);
+                s->cells[SPR_FRAME] = Value::fromInt((s->cells[SPR_FRAME].i + 1) % n);
             }
             static void spr_prevFrame(NativeContext *ctx)
             {
-                if (!ctx->thisObj)
+                Obj *s = ctx->thisObj;
+                if (!s)
                     return;
-                ctx->thisObj->cells[SPR_FRAME].i--;
+                int n = sprSeqLen(s);
+                s->cells[SPR_FRAME] = Value::fromInt((s->cells[SPR_FRAME].i + n - 1) % n);
             }
             static void spr_getFrameSequenceLength(NativeContext *ctx)
             {
-                if (!ctx->thisObj)
-                    return;
-                Obj *seq = ctx->thisObj->cells[SPR_SEQ].o;
-                if (seq && seq->kind == ObjKind::IntArray)
-                    setInt(ctx, seq->arrayLen);
-                else
-                {
-                    Obj *img = ctx->thisObj->cells[SPR_IMG].o;
-                    int fw = ctx->thisObj->cells[SPR_FW].i, fh = ctx->thisObj->cells[SPR_FH].i;
-                    int rawCount = (img && fw > 0 && fh > 0) ? (img->cells[IMG_W].i / fw) * (img->cells[IMG_H].i / fh) : 1;
-                    setInt(ctx, rawCount > 0 ? rawCount : 1);
-                }
+                if (ctx->thisObj)
+                    setInt(ctx, sprSeqLen(ctx->thisObj));
+            }
+            static void spr_getRawFrameCount(NativeContext *ctx)
+            {
+                if (ctx->thisObj)
+                    setInt(ctx, sprRawCount(ctx->thisObj));
             }
             static void spr_setFrameSequence(NativeContext *ctx)
             {
@@ -135,12 +224,44 @@ namespace jvm
                     self->cells[SPR_FRAME] = Value::fromInt(0);
                 }
                 else
-                    self->cells[SPR_SEQ] = Value::fromRef(nullptr);
+                    self->cells[SPR_SEQ] = Value::fromRef(nullptr); // séquence par défaut, frame courante conservée
+            }
+            static void spr_setImage(NativeContext *ctx)
+            {
+                Obj *s = ctx->thisObj, *img = argRef(ctx, 1);
+                if (!s || !img)
+                    return;
+                int fw = argInt(ctx, 2), fh = argInt(ctx, 3);
+                int oldFw = s->cells[SPR_FW].i, oldFh = s->cells[SPR_FH].i, oldRaw = sprRawCount(s);
+                s->cells[SPR_IMG] = Value::fromRef(img);
+                s->cells[SPR_FW] = Value::fromInt(fw);
+                s->cells[SPR_FH] = Value::fromInt(fh);
+                if (fw != oldFw || fh != oldFh)
+                    s->cells[SPR_CSET] = Value::fromInt(0); // rectangle de collision remis à la frame entière
+                if (sprRawCount(s) < oldRaw)
+                {
+                    s->cells[SPR_FRAME] = Value::fromInt(0);
+                    s->cells[SPR_SEQ] = Value::fromRef(nullptr);
+                }
+                sprSyncSize(s);
             }
             static void spr_setTransform(NativeContext *ctx)
             {
-                if (ctx->thisObj)
-                    ctx->thisObj->cells[SPR_TFM] = Value::fromInt(argInt(ctx, 1));
+                Obj *s = ctx->thisObj;
+                if (!s)
+                    return;
+                int nt = argInt(ctx, 1);
+                if (nt < 0 || nt > 7)
+                    return;
+                int orx, ory;
+                sprRefT(s, orx, ory);
+                int refX = s->cells[L_X].i + orx, refY = s->cells[L_Y].i + ory; // pixel de référence à l'écran
+                s->cells[SPR_TFM] = Value::fromInt(nt);
+                int nrx, nry;
+                sprRefT(s, nrx, nry);
+                s->cells[L_X] = Value::fromInt(refX - nrx);
+                s->cells[L_Y] = Value::fromInt(refY - nry);
+                sprSyncSize(s);
             }
             static void spr_defineRefPixel(NativeContext *ctx)
             {
@@ -155,130 +276,268 @@ namespace jvm
                 Obj *self = ctx->thisObj;
                 if (!self)
                     return;
-                int rx = argInt(ctx, 1), ry = argInt(ctx, 2);
-                self->cells[L_X] = Value::fromInt(rx - self->cells[SPR_RX].i);
-                self->cells[L_Y] = Value::fromInt(ry - self->cells[SPR_RY].i);
+                int rx, ry;
+                sprRefT(self, rx, ry);
+                self->cells[L_X] = Value::fromInt(argInt(ctx, 1) - rx);
+                self->cells[L_Y] = Value::fromInt(argInt(ctx, 2) - ry);
             }
             static void spr_getRefPixelX(NativeContext *ctx)
             {
-                if (ctx->thisObj)
-                    setInt(ctx, ctx->thisObj->cells[L_X].i + ctx->thisObj->cells[SPR_RX].i);
+                if (!ctx->thisObj)
+                    return;
+                int rx, ry;
+                sprRefT(ctx->thisObj, rx, ry);
+                setInt(ctx, ctx->thisObj->cells[L_X].i + rx);
             }
             static void spr_getRefPixelY(NativeContext *ctx)
             {
-                if (ctx->thisObj)
-                    setInt(ctx, ctx->thisObj->cells[L_Y].i + ctx->thisObj->cells[SPR_RY].i);
+                if (!ctx->thisObj)
+                    return;
+                int rx, ry;
+                sprRefT(ctx->thisObj, rx, ry);
+                setInt(ctx, ctx->thisObj->cells[L_Y].i + ry);
             }
-            // Rectangle du sprite dans le monde (top-left de la frame, le pixel
-            // de référence est décalé de SPR_RX/SPR_RY par rapport à ce coin).
-            static void sprFrameRect(Obj *s, int &x0, int &y0, int &w, int &h)
+            static void spr_defineCollisionRectangle(NativeContext *ctx)
             {
-                Obj *img = s->cells[SPR_IMG].o;
-                int fw = s->cells[SPR_FW].i, fh = s->cells[SPR_FH].i;
-                int tfm = s->cells[SPR_TFM].i;
-                if (img && fw <= 0)
-                    fw = img->cells[IMG_W].i;
-                if (img && fh <= 0)
-                    fh = img->cells[IMG_H].i;
-                bool swap = (tfm == 4 || tfm == 5 || tfm == 6 || tfm == 7);
-                w = swap ? fh : fw;
-                h = swap ? fw : fh;
-                x0 = s->cells[L_X].i - s->cells[SPR_RX].i;
-                y0 = s->cells[L_Y].i - s->cells[SPR_RY].i;
+                Obj *s = ctx->thisObj;
+                if (!s)
+                    return;
+                s->cells[SPR_CX] = Value::fromInt(argInt(ctx, 1));
+                s->cells[SPR_CY] = Value::fromInt(argInt(ctx, 2));
+                s->cells[SPR_CW] = Value::fromInt(argInt(ctx, 3));
+                s->cells[SPR_CH] = Value::fromInt(argInt(ctx, 4));
+                s->cells[SPR_CSET] = Value::fromInt(1);
+            }
+            // Rectangle de collision dans le repère du peintre (transformation incluse).
+            static void sprCollRect(Obj *s, int &x, int &y, int &w, int &h)
+            {
+                int fw = s->cells[SPR_FW].i, fh = s->cells[SPR_FH].i, tfm = s->cells[SPR_TFM].i;
+                int cx = 0, cy = 0, cw = fw, ch = fh;
+                if (s->cells[SPR_CSET].i)
+                {
+                    cx = s->cells[SPR_CX].i;
+                    cy = s->cells[SPR_CY].i;
+                    cw = s->cells[SPR_CW].i;
+                    ch = s->cells[SPR_CH].i;
+                }
+                int ox, oy, ow, oh;
+                tfmRect(tfm, fw, fh, cx, cy, cw, ch, ox, oy, ow, oh);
+                x = s->cells[L_X].i + ox;
+                y = s->cells[L_Y].i + oy;
+                w = ow;
+                h = oh;
             }
             static bool rectsOverlap(int x0, int y0, int w0, int h0, int x1, int y1, int w1, int h1)
             {
                 return x0 < x1 + w1 && x0 + w0 > x1 && y0 < y1 + h1 && y0 + h0 > y1;
             }
+            // Pixel non transparent du sprite `s` au point (wx,wy) du repère du peintre (frame courante).
+            static bool sprOpaqueAt(Obj *s, int wx, int wy)
+            {
+                Obj *img = s->cells[SPR_IMG].o;
+                Obj *buf = (img && img->kind == ObjKind::Instance) ? img->cells[IMG_BUF].o : nullptr;
+                int fw = s->cells[SPR_FW].i, fh = s->cells[SPR_FH].i;
+                if (!buf || fw <= 0 || fh <= 0)
+                    return true;
+                int lx = wx - s->cells[L_X].i, ly = wy - s->cells[L_Y].i;
+                int tw = s->cells[L_W].i, th = s->cells[L_H].i;
+                if (lx < 0 || ly < 0 || lx >= tw || ly >= th)
+                    return false;
+                int sx, sy;
+                tfmInverse(s->cells[SPR_TFM].i, fw, fh, lx, ly, sx, sy);
+                int iw = img->cells[IMG_W].i, perRow = iw / fw, raw = sprRawCount(s);
+                int idx = s->cells[SPR_FRAME].i;
+                Obj *seq = s->cells[SPR_SEQ].o;
+                if (seq && seq->kind == ObjKind::IntArray && seq->arrayLen > 0)
+                {
+                    idx = ((idx % seq->arrayLen) + seq->arrayLen) % seq->arrayLen;
+                    idx = seq->cells[idx].i;
+                }
+                idx = ((idx % raw) + raw) % raw;
+                if (perRow <= 0)
+                    return true;
+                int px = (idx % perRow) * fw + sx, py = (idx / perRow) * fh + sy;
+                size_t off = static_cast<size_t>(py) * iw + px;
+                if (px < 0 || py < 0 || off >= static_cast<size_t>(buf->arrayLen))
+                    return false;
+                return ((buf->cells[off].u >> 24) & 0xFF) != 0;
+            }
+            static bool imgOpaqueAt(Obj *img, int ix, int iy, int wx, int wy)
+            {
+                Obj *buf = img->cells[IMG_BUF].o;
+                int iw = img->cells[IMG_W].i, ih = img->cells[IMG_H].i;
+                int px = wx - ix, py = wy - iy;
+                if (!buf || px < 0 || py < 0 || px >= iw || py >= ih)
+                    return false;
+                return ((buf->cells[static_cast<size_t>(py) * iw + px].u >> 24) & 0xFF) != 0;
+            }
             static void spr_collides(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 Obj *other = argRef(ctx, 1);
-                if (!self || !other || other->kind != ObjKind::Instance || !isSubclassOf(other, "javax/microedition/lcdui/game/Sprite"))
+                bool pixel = argInt(ctx, 2) != 0;
+                if (!self || !other || other->kind != ObjKind::Instance || !isSubclassOf(other, "javax/microedition/lcdui/game/Sprite") ||
+                    !self->cells[L_VIS].i || !other->cells[L_VIS].i)
                 {
                     setInt(ctx, 0);
                     return;
                 }
                 int ax, ay, aw, ah, bx, by, bw, bh;
-                sprFrameRect(self, ax, ay, aw, ah);
-                sprFrameRect(other, bx, by, bw, bh);
-                if (jvm::jmeDebug())
-                    fprintf(stderr, "collides self=(%d,%d %dx%d) other=(%d,%d %dx%d) => %d\n",
-                            ax, ay, aw, ah, bx, by, bw, bh,
-                            rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) ? 1 : 0);
-                setInt(ctx, rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) ? 1 : 0);
+                sprCollRect(self, ax, ay, aw, ah);
+                sprCollRect(other, bx, by, bw, bh);
+                if (!rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh))
+                {
+                    setInt(ctx, 0);
+                    return;
+                }
+                if (!pixel)
+                {
+                    setInt(ctx, 1);
+                    return;
+                }
+                int x0 = std::max(ax, bx), y0 = std::max(ay, by), x1 = std::min(ax + aw, bx + bw), y1 = std::min(ay + ah, by + bh);
+                for (int y = y0; y < y1; y++)
+                    for (int x = x0; x < x1; x++)
+                        if (sprOpaqueAt(self, x, y) && sprOpaqueAt(other, x, y))
+                        {
+                            setInt(ctx, 1);
+                            return;
+                        }
+                setInt(ctx, 0);
             }
             static void spr_collidesImage(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 Obj *img = argRef(ctx, 1);
                 int x = argInt(ctx, 2), y = argInt(ctx, 3);
-                if (!self || !img || img->kind != ObjKind::Instance)
+                bool pixel = argInt(ctx, 4) != 0;
+                if (!self || !img || img->kind != ObjKind::Instance || !self->cells[L_VIS].i)
                 {
                     setInt(ctx, 0);
                     return;
                 }
                 int ax, ay, aw, ah;
-                sprFrameRect(self, ax, ay, aw, ah);
+                sprCollRect(self, ax, ay, aw, ah);
                 int iw = img->cells[IMG_W].i, ih = img->cells[IMG_H].i;
-                setInt(ctx, rectsOverlap(ax, ay, aw, ah, x, y, iw, ih) ? 1 : 0);
+                if (!rectsOverlap(ax, ay, aw, ah, x, y, iw, ih))
+                {
+                    setInt(ctx, 0);
+                    return;
+                }
+                if (!pixel)
+                {
+                    setInt(ctx, 1);
+                    return;
+                }
+                int x0 = std::max(ax, x), y0 = std::max(ay, y), x1 = std::min(ax + aw, x + iw), y1 = std::min(ay + ah, y + ih);
+                for (int yy = y0; yy < y1; yy++)
+                    for (int xx = x0; xx < x1; xx++)
+                        if (sprOpaqueAt(self, xx, yy) && imgOpaqueAt(img, x, y, xx, yy))
+                        {
+                            setInt(ctx, 1);
+                            return;
+                        }
+                setInt(ctx, 0);
+            }
+            // Tuile effective (1-based, 0 = vide) d'une cellule, animation résolue.
+            static int tlTileAt(Obj *tl, int c, int r)
+            {
+                Obj *grid = tl->cells[TL_GRID].o;
+                int cols = tl->cells[TL_COLS].i, rows = tl->cells[TL_ROWS].i;
+                if (!grid || grid->kind != ObjKind::IntArray || c < 0 || r < 0 || c >= cols || r >= rows)
+                    return 0;
+                int t = grid->cells[r * cols + c].i;
+                if (t < 0)
+                {
+                    Obj *anim = tl->cells[TL_ANIM].o;
+                    int idx = -t - 1;
+                    t = (anim && anim->kind == ObjKind::IntArray && idx >= 0 && idx < anim->arrayLen) ? anim->cells[idx].i : 0;
+                }
+                return t;
+            }
+            static bool tlOpaqueAt(Obj *tl, int t, int lx, int ly)
+            {
+                Obj *img = tl->cells[TL_IMG].o;
+                Obj *buf = (img && img->kind == ObjKind::Instance) ? img->cells[IMG_BUF].o : nullptr;
+                int tw = tl->cells[TL_TW].i, th = tl->cells[TL_TH].i;
+                if (!buf || tw <= 0 || th <= 0)
+                    return true;
+                int iw = img->cells[IMG_W].i, perRow = iw / tw;
+                if (perRow <= 0)
+                    return true;
+                int px = ((t - 1) % perRow) * tw + lx, py = ((t - 1) / perRow) * th + ly;
+                size_t off = static_cast<size_t>(py) * iw + px;
+                if (px < 0 || py < 0 || off >= static_cast<size_t>(buf->arrayLen))
+                    return false;
+                return ((buf->cells[off].u >> 24) & 0xFF) != 0;
             }
             static void spr_collidesTiled(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 Obj *tl = argRef(ctx, 1);
-                if (!self || !tl || tl->kind != ObjKind::Instance || !isSubclassOf(tl, "javax/microedition/lcdui/game/TiledLayer"))
+                bool pixel = argInt(ctx, 2) != 0;
+                if (!self || !tl || tl->kind != ObjKind::Instance || !isSubclassOf(tl, "javax/microedition/lcdui/game/TiledLayer") ||
+                    !self->cells[L_VIS].i || !tl->cells[L_VIS].i)
                 {
                     setInt(ctx, 0);
                     return;
                 }
                 int ax, ay, aw, ah;
-                sprFrameRect(self, ax, ay, aw, ah);
+                sprCollRect(self, ax, ay, aw, ah);
                 int tw = tl->cells[TL_TW].i, th = tl->cells[TL_TH].i;
                 int cols = tl->cells[TL_COLS].i, rows = tl->cells[TL_ROWS].i;
-                Obj *grid = tl->cells[TL_GRID].o;
                 int bx = tl->cells[L_X].i, by = tl->cells[L_Y].i;
-                bool hit = false;
-                if (grid && grid->kind == ObjKind::IntArray && tw > 0 && th > 0)
+                if (tw <= 0 || th <= 0)
                 {
-                    for (int r = 0; r < rows && !hit; r++)
-                    {
-                        for (int c = 0; c < cols && !hit; c++)
-                        {
-                            if (grid->cells[r * cols + c].i == 0)
-                                continue;
-                            if (rectsOverlap(ax, ay, aw, ah, bx + c * tw, by + r * th, tw, th))
-                                hit = true;
-                        }
-                    }
+                    setInt(ctx, 0);
+                    return;
                 }
-                setInt(ctx, hit ? 1 : 0);
+                int c0 = std::max(0, (ax - bx) / tw), c1 = std::min(cols - 1, (ax + aw - 1 - bx) / tw);
+                int r0 = std::max(0, (ay - by) / th), r1 = std::min(rows - 1, (ay + ah - 1 - by) / th);
+                if (ax - bx < 0) c0 = 0;
+                if (ay - by < 0) r0 = 0;
+                for (int r = r0; r <= r1; r++)
+                    for (int c = c0; c <= c1; c++)
+                    {
+                        int t = tlTileAt(tl, c, r);
+                        if (t == 0)
+                            continue;
+                        int tx = bx + c * tw, ty = by + r * th;
+                        if (!rectsOverlap(ax, ay, aw, ah, tx, ty, tw, th))
+                            continue;
+                        if (!pixel)
+                        {
+                            setInt(ctx, 1);
+                            return;
+                        }
+                        int x0 = std::max(ax, tx), y0 = std::max(ay, ty), x1 = std::min(ax + aw, tx + tw), y1 = std::min(ay + ah, ty + th);
+                        for (int y = y0; y < y1; y++)
+                            for (int x = x0; x < x1; x++)
+                                if (sprOpaqueAt(self, x, y) && tlOpaqueAt(tl, t, x - tx, y - ty))
+                                {
+                                    setInt(ctx, 1);
+                                    return;
+                                }
+                    }
+                setInt(ctx, 0);
             }
             static void spr_paint(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 Obj *g = argRef(ctx, 1);
-                if (jvm::drawDbg())
-                    fprintf(stderr, "SPR self=%p g=%p vis=%d img=%p x=%d y=%d\n", (void *)self, (void *)g,
-                            self ? self->cells[L_VIS].i : -1, (void *)(self ? self->cells[SPR_IMG].o : nullptr),
-                            self ? self->cells[L_X].i : 0, self ? self->cells[L_Y].i : 0);
                 if (!self || !g || !self->cells[L_VIS].i)
                     return;
                 Obj *img = self->cells[SPR_IMG].o;
                 Obj *buf = (img && img->kind == ObjKind::Instance) ? img->cells[IMG_BUF].o : nullptr;
-                if (jvm::drawDbg())
-                    fprintf(stderr, "SPR2 img=%p buf=%p iw=%d ih=%d fw=%d fh=%d frame=%d\n", (void *)img, (void *)buf,
-                            img ? img->cells[IMG_W].i : -1, img ? img->cells[IMG_H].i : -1,
-                            self->cells[SPR_FW].i, self->cells[SPR_FH].i, self->cells[SPR_FRAME].i);
                 if (!buf)
                     return;
-                int iw = img->cells[IMG_W].i, ih = img->cells[IMG_H].i;
+                int iw = img->cells[IMG_W].i;
                 int fw = self->cells[SPR_FW].i, fh = self->cells[SPR_FH].i;
                 if (fw <= 0 || fh <= 0)
                     return;
                 int perRow = iw / fw;
-                int rawCount = (iw / fw) * (ih / fh);
-                if (perRow <= 0 || rawCount <= 0)
+                int rawCount = sprRawCount(self);
+                if (perRow <= 0)
                     return;
                 int idx = self->cells[SPR_FRAME].i;
                 Obj *seq = self->cells[SPR_SEQ].o;
@@ -287,10 +546,8 @@ namespace jvm
                     int sl = seq->arrayLen;
                     idx = ((idx % sl) + sl) % sl;
                     idx = seq->cells[idx].i;
-                    idx = ((idx % rawCount) + rawCount) % rawCount;
                 }
-                else
-                    idx = ((idx % rawCount) + rawCount) % rawCount;
+                idx = ((idx % rawCount) + rawCount) % rawCount;
                 int xs = (idx % perRow) * fw, ys = (idx / perRow) * fh;
                 Pix p(g);
                 drawRegionRaw(p, buf, iw, xs, ys, fw, fh, self->cells[SPR_TFM].i,
@@ -298,7 +555,8 @@ namespace jvm
             }
 
             // --- TiledLayer ---
-            // ctor(int cols, int rows, Image, int tileW, int tileH)
+            // ctor(int cols, int rows, Image, int tileW, int tileH). Indices de tuile 1-based (0 = vide,
+            // négatif = tuile animée) : la tuile t est le sous-rectangle (t-1) de l'image (spec MIDP).
             static void tl_init(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
@@ -319,7 +577,7 @@ namespace jvm
                 self->cells[L_VIS] = Value::fromInt(1);
                 Obj *grid = g_rt ? g_rt->heap().newArray(ObjKind::IntArray, cols * rows) : nullptr;
                 self->cells[TL_GRID] = Value::fromRef(grid);
-                Obj *anim = g_rt ? g_rt->heap().newArray(ObjKind::IntArray, 16) : nullptr;
+                Obj *anim = g_rt ? g_rt->heap().newArray(ObjKind::IntArray, 64) : nullptr;
                 self->cells[TL_ANIM] = Value::fromRef(anim);
             }
             static void tl_setCell(NativeContext *ctx)
@@ -329,62 +587,53 @@ namespace jvm
                     return;
                 int col = argInt(ctx, 1), row = argInt(ctx, 2), t = argInt(ctx, 3);
                 Obj *grid = self->cells[TL_GRID].o;
-                int cols = self->cells[TL_COLS].i;
-                if (!grid || grid->kind != ObjKind::IntArray || col < 0 || row < 0 || col >= cols)
+                int cols = self->cells[TL_COLS].i, rows = self->cells[TL_ROWS].i;
+                if (!grid || grid->kind != ObjKind::IntArray || col < 0 || row < 0 || col >= cols || row >= rows)
                     return;
-                if (row * cols + col < grid->arrayLen)
-                    grid->cells[row * cols + col] = Value::fromInt(t);
+                grid->cells[row * cols + col] = Value::fromInt(t);
             }
             static void tl_getCell(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
-                if (!self)
-                {
-                    setInt(ctx, 0);
-                    return;
-                }
                 int col = argInt(ctx, 1), row = argInt(ctx, 2);
-                Obj *grid = self->cells[TL_GRID].o;
-                int cols = self->cells[TL_COLS].i;
-                if (!grid || grid->kind != ObjKind::IntArray || col < 0 || row < 0 || col >= cols || row * cols + col >= grid->arrayLen)
+                Obj *grid = self ? self->cells[TL_GRID].o : nullptr;
+                int cols = self ? self->cells[TL_COLS].i : 0, rows = self ? self->cells[TL_ROWS].i : 0;
+                if (!grid || grid->kind != ObjKind::IntArray || col < 0 || row < 0 || col >= cols || row >= rows)
                 {
                     setInt(ctx, 0);
                     return;
                 }
                 setInt(ctx, grid->cells[row * cols + col].i);
             }
+            // fillCells(int col, int row, int numCols, int numRows, int tileIndex)
             static void tl_fillCells(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 if (!self)
                     return;
                 int col = argInt(ctx, 1), row = argInt(ctx, 2);
-                int nc = argInt(ctx, 3), nr = argInt(ctx, 4);
+                int nc = argInt(ctx, 3), nr = argInt(ctx, 4), t = argInt(ctx, 5);
                 Obj *grid = self->cells[TL_GRID].o;
                 int cols = self->cells[TL_COLS].i, rows = self->cells[TL_ROWS].i;
                 if (!grid || grid->kind != ObjKind::IntArray)
                     return;
                 for (int r = row; r < row + nr && r < rows; r++)
                     for (int c = col; c < col + nc && c < cols; c++)
-                        if (r >= 0 && c >= 0 && r * cols + c < grid->arrayLen)
-                            grid->cells[r * cols + c] = Value::fromInt(0);
+                        if (r >= 0 && c >= 0)
+                            grid->cells[r * cols + c] = Value::fromInt(t);
             }
             static void tl_createAnimatedTile(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
-                if (!self)
-                {
-                    setInt(ctx, -1);
-                    return;
-                }
-                Obj *anim = self->cells[TL_ANIM].o;
+                Obj *anim = self ? self->cells[TL_ANIM].o : nullptr;
                 int t = argInt(ctx, 1);
                 if (anim && anim->kind == ObjKind::IntArray)
                 {
+                    // Chaque tuile animée occupe un emplacement ; 0 = libre, l'index renvoyé est -(i+1).
                     for (int i = 0; i < anim->arrayLen; i++)
                         if (anim->cells[i].i == 0)
                         {
-                            anim->cells[i] = Value::fromInt(t);
+                            anim->cells[i] = Value::fromInt(t > 0 ? t : 1);
                             setInt(ctx, -(i + 1));
                             return;
                         }
@@ -396,28 +645,60 @@ namespace jvm
                 Obj *self = ctx->thisObj;
                 if (!self)
                     return;
-                int a = argInt(ctx, 1);
-                int idx = -a - 1;
+                int idx = -argInt(ctx, 1) - 1;
                 Obj *anim = self->cells[TL_ANIM].o;
                 if (anim && anim->kind == ObjKind::IntArray && idx >= 0 && idx < anim->arrayLen)
                     anim->cells[idx] = Value::fromInt(argInt(ctx, 2));
+            }
+            static void tl_getAnimatedTile(NativeContext *ctx)
+            {
+                Obj *self = ctx->thisObj;
+                Obj *anim = self ? self->cells[TL_ANIM].o : nullptr;
+                int idx = -argInt(ctx, 1) - 1;
+                setInt(ctx, (anim && anim->kind == ObjKind::IntArray && idx >= 0 && idx < anim->arrayLen) ? anim->cells[idx].i : 0);
+            }
+            static void tl_getCellWidth(NativeContext *ctx) { if (ctx->thisObj) setInt(ctx, ctx->thisObj->cells[TL_TW].i); }
+            static void tl_getCellHeight(NativeContext *ctx) { if (ctx->thisObj) setInt(ctx, ctx->thisObj->cells[TL_TH].i); }
+            static void tl_getColumns(NativeContext *ctx) { if (ctx->thisObj) setInt(ctx, ctx->thisObj->cells[TL_COLS].i); }
+            static void tl_getRows(NativeContext *ctx) { if (ctx->thisObj) setInt(ctx, ctx->thisObj->cells[TL_ROWS].i); }
+            // setStaticTileSet(Image, tileW, tileH) : nouveau jeu de tuiles ; si le nombre de tuiles
+            // diminue, la grille est vidée (spec), la taille de la couche est recalculée.
+            static void tl_setStaticTileSet(NativeContext *ctx)
+            {
+                Obj *self = ctx->thisObj, *img = argRef(ctx, 1);
+                if (!self || !img)
+                    return;
+                int tw = argInt(ctx, 2), th = argInt(ctx, 3);
+                int oldTiles = 0;
+                {
+                    Obj *oi = self->cells[TL_IMG].o;
+                    int otw = self->cells[TL_TW].i, oth = self->cells[TL_TH].i;
+                    if (oi && otw > 0 && oth > 0)
+                        oldTiles = (oi->cells[IMG_W].i / otw) * (oi->cells[IMG_H].i / oth);
+                }
+                int newTiles = (tw > 0 && th > 0) ? (img->cells[IMG_W].i / tw) * (img->cells[IMG_H].i / th) : 0;
+                self->cells[TL_IMG] = Value::fromRef(img);
+                self->cells[TL_TW] = Value::fromInt(tw);
+                self->cells[TL_TH] = Value::fromInt(th);
+                self->cells[L_W] = Value::fromInt(self->cells[TL_COLS].i * tw);
+                self->cells[L_H] = Value::fromInt(self->cells[TL_ROWS].i * th);
+                if (newTiles < oldTiles)
+                {
+                    Obj *grid = self->cells[TL_GRID].o;
+                    if (grid && grid->kind == ObjKind::IntArray)
+                        for (int i = 0; i < grid->arrayLen; i++)
+                            grid->cells[i] = Value::fromInt(0);
+                }
             }
             static void tl_paint(NativeContext *ctx)
             {
                 Obj *self = ctx->thisObj;
                 Obj *g = argRef(ctx, 1);
-                if (jvm::drawDbg())
-                    fprintf(stderr, "TL self=%p vis=%d x=%d y=%d\n", (void *)self,
-                            self ? self->cells[L_VIS].i : -1, self ? self->cells[L_X].i : 0, self ? self->cells[L_Y].i : 0);
                 if (!self || !g || !self->cells[L_VIS].i)
                     return;
                 Obj *img = self->cells[TL_IMG].o;
                 Obj *buf = (img && img->kind == ObjKind::Instance) ? img->cells[IMG_BUF].o : nullptr;
                 Obj *grid = self->cells[TL_GRID].o;
-                Obj *anim = self->cells[TL_ANIM].o;
-                if (jvm::drawDbg())
-                    fprintf(stderr, "TL2 img=%p buf=%p iw=%d grid=%d cells\n", (void *)img, (void *)buf,
-                            img ? img->cells[IMG_W].i : -1, grid && grid->kind == ObjKind::IntArray ? grid->arrayLen : -1);
                 if (!buf || !grid || grid->kind != ObjKind::IntArray)
                     return;
                 int cols = self->cells[TL_COLS].i, rows = self->cells[TL_ROWS].i;
@@ -430,27 +711,30 @@ namespace jvm
                 if (perRow <= 0)
                     return;
                 Pix p(g);
-                for (int r = 0; r < rows; r++)
+                // On ne parcourt que les cellules intersectant la zone de clip courante.
+                int c0 = 0, c1 = cols - 1, r0 = 0, r1 = rows - 1;
                 {
-                    for (int c = 0; c < cols; c++)
-                    {
-                        int t = grid->cells[r * cols + c].i;
-                        if (t == 0)
-                            continue;
-                        if (t < 0)
-                        {
-                            int idx = -t - 1;
-                            if (!anim || anim->kind != ObjKind::IntArray || idx < 0 || idx >= anim->arrayLen)
-                                continue;
-                            t = anim->cells[idx].i;
-                            if (t == 0)
-                                continue;
-                        }
-                        int xs = (t % perRow) * tw, ys = (t / perRow) * th;
-                        drawRegionRaw(p, buf, iw, xs, ys, tw, th, 0,
-                                      bx + c * tw, by + r * th);
-                    }
+                    int cxl = p.clipX - p.tx - bx, cyt = p.clipY - p.ty - by;
+                    int cxr = cxl + p.clipW - 1, cyb = cyt + p.clipH - 1;
+                    c0 = std::max(0, cxl / tw);
+                    r0 = std::max(0, cyt / th);
+                    c1 = std::min(cols - 1, cxr < 0 ? -1 : cxr / tw);
+                    r1 = std::min(rows - 1, cyb < 0 ? -1 : cyb / th);
+                    if (cxl < 0) c0 = 0;
+                    if (cyt < 0) r0 = 0;
                 }
+                for (int r = r0; r <= r1; r++)
+                    for (int c = c0; c <= c1; c++)
+                    {
+                        int t = tlTileAt(self, c, r);
+                        if (t <= 0)
+                            continue;
+                        int tt = t - 1;
+                        int xs = (tt % perRow) * tw, ys = (tt / perRow) * th;
+                        if (ys + th > img->cells[IMG_H].i)
+                            continue;
+                        drawRegionRaw(p, buf, iw, xs, ys, tw, th, 0, bx + c * tw, by + r * th);
+                    }
             }
 
             // --- LayerManager ---
@@ -635,6 +919,10 @@ namespace jvm
                 regN("javax/microedition/lcdui/game/Layer.getHeight:()I", lay_getHeight);
                 regN("javax/microedition/lcdui/game/Sprite.<init>:(Ljavax/microedition/lcdui/Image;)V", spr_init);
                 regN("javax/microedition/lcdui/game/Sprite.<init>:(Ljavax/microedition/lcdui/Image;II)V", spr_init);
+                regN("javax/microedition/lcdui/game/Sprite.<init>:(Ljavax/microedition/lcdui/game/Sprite;)V", spr_initCopy);
+                regN("javax/microedition/lcdui/game/Sprite.getRawFrameCount:()I", spr_getRawFrameCount);
+                regN("javax/microedition/lcdui/game/Sprite.setImage:(Ljavax/microedition/lcdui/Image;II)V", spr_setImage);
+                regN("javax/microedition/lcdui/game/Sprite.defineCollisionRectangle:(IIII)V", spr_defineCollisionRectangle);
                 regN("javax/microedition/lcdui/game/Sprite.paint:(Ljavax/microedition/lcdui/Graphics;)V", spr_paint);
                 regN("javax/microedition/lcdui/game/Sprite.move:(II)V", lay_move);
                 regN("javax/microedition/lcdui/game/Sprite.setPosition:(II)V", lay_setPosition);
@@ -670,7 +958,13 @@ namespace jvm
                 regN("javax/microedition/lcdui/game/TiledLayer.getHeight:()I", lay_getHeight);
                 regN("javax/microedition/lcdui/game/TiledLayer.setCell:(III)V", tl_setCell);
                 regN("javax/microedition/lcdui/game/TiledLayer.getCell:(II)I", tl_getCell);
-                regN("javax/microedition/lcdui/game/TiledLayer.fillCells:(IIII)V", tl_fillCells);
+                regN("javax/microedition/lcdui/game/TiledLayer.fillCells:(IIIII)V", tl_fillCells);
+                regN("javax/microedition/lcdui/game/TiledLayer.getAnimatedTile:(I)I", tl_getAnimatedTile);
+                regN("javax/microedition/lcdui/game/TiledLayer.getCellWidth:()I", tl_getCellWidth);
+                regN("javax/microedition/lcdui/game/TiledLayer.getCellHeight:()I", tl_getCellHeight);
+                regN("javax/microedition/lcdui/game/TiledLayer.getColumns:()I", tl_getColumns);
+                regN("javax/microedition/lcdui/game/TiledLayer.getRows:()I", tl_getRows);
+                regN("javax/microedition/lcdui/game/TiledLayer.setStaticTileSet:(Ljavax/microedition/lcdui/Image;II)V", tl_setStaticTileSet);
                 regN("javax/microedition/lcdui/game/TiledLayer.createAnimatedTile:(I)I", tl_createAnimatedTile);
                 regN("javax/microedition/lcdui/game/TiledLayer.setAnimatedTile:(II)V", tl_setAnimatedTile);
                 regN("javax/microedition/lcdui/game/LayerManager.<init>:()V", lm_init);

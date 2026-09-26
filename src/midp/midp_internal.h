@@ -94,7 +94,7 @@ namespace jvm
                 L_H = 3,
                 L_VIS = 4
             };
-            // Sprite (hérite de Layer) : slots 5..12.
+            // Sprite (hérite de Layer) : slots 5..17.
             enum
             {
                 SPR_IMG = 5,
@@ -104,7 +104,12 @@ namespace jvm
                 SPR_FRAME = 9,
                 SPR_TFM = 10,
                 SPR_RX = 11,
-                SPR_RY = 12
+                SPR_RY = 12,
+                SPR_CX = 13, // rectangle de collision (repère de la frame NON transformée)
+                SPR_CY = 14,
+                SPR_CW = 15,
+                SPR_CH = 16,
+                SPR_CSET = 17 // 1 = rectangle défini par le jeu, 0 = frame entière
             };
             // TiledLayer (hérite de Layer) : slots 5..11.
             enum

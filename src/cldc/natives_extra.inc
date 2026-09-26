@@ -293,10 +293,14 @@ std::string radixStr(uint64_t v, int radix)
 }
 void x_Int_parseIntRadix(NativeContext *ctx)
 {
-    const std::string &s = strOf(argRef(ctx, 0));
-    char *end = nullptr;
-    long v = strtol(s.c_str(), &end, argInt(ctx, 1) < 2 ? 10 : argInt(ctx, 1));
-    setIntResult(ctx, (end && end != s.c_str()) ? static_cast<int32_t>(v) : 0);
+    int64_t v;
+    int r = argInt(ctx, 1);
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), (r < 2 || r > 36) ? 10 : r, INT32_MIN, INT32_MAX, v))
+    {
+        throwJava(ctx, "java/lang/NumberFormatException");
+        return;
+    }
+    setIntResult(ctx, static_cast<int32_t>(v));
 }
 void x_Int_toHex(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, radixStr(static_cast<uint32_t>(argInt(ctx, 0)), 16))); }
 void x_Int_toBin(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, radixStr(static_cast<uint32_t>(argInt(ctx, 0)), 2))); }
@@ -309,7 +313,13 @@ void x_Int_toStringRadix(NativeContext *ctx)
 }
 void x_Int_valueOfStr(NativeContext *ctx)
 {
-    setRefResult(ctx, newBoxed(ctx, "java/lang/Integer", Value::fromInt(atoi(strOf(argRef(ctx, 0)).c_str()))));
+    int64_t v;
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), 10, INT32_MIN, INT32_MAX, v))
+    {
+        throwJava(ctx, "java/lang/NumberFormatException");
+        return;
+    }
+    setRefResult(ctx, newBoxed(ctx, "java/lang/Integer", Value::fromInt(static_cast<int32_t>(v))));
 }
 
 // Long : cells[0].l
@@ -319,9 +329,19 @@ void x_Long_longValue(NativeContext *ctx) { setLongResult(ctx, boxL(ctx->thisObj
 void x_Long_intValue(NativeContext *ctx) { setIntResult(ctx, static_cast<int32_t>(boxL(ctx->thisObj))); }
 void x_Long_toString(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, itos(boxL(ctx->thisObj)))); }
 void x_Long_toStringS(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, itos(argLong(ctx, 0)))); }
-void x_Long_parse(NativeContext *ctx) { setLongResult(ctx, strtoll(strOf(argRef(ctx, 0)).c_str(), nullptr, 10)); }
+void x_Long_parse(NativeContext *ctx)
+{
+    int64_t v;
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), 10, INT64_MIN / 2, INT64_MAX / 2, v)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setLongResult(ctx, v);
+}
 void x_Long_valueOfL(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/lang/Long", Value::fromLong(argLong(ctx, 0)))); }
-void x_Long_valueOfS(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/lang/Long", Value::fromLong(strtoll(strOf(argRef(ctx, 0)).c_str(), nullptr, 10)))); }
+void x_Long_valueOfS(NativeContext *ctx)
+{
+    int64_t v;
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), 10, INT64_MIN / 2, INT64_MAX / 2, v)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setRefResult(ctx, newBoxed(ctx, "java/lang/Long", Value::fromLong(v)));
+}
 void x_Long_hashCode(NativeContext *ctx) { int64_t v = boxL(ctx->thisObj); setIntResult(ctx, static_cast<int32_t>(v ^ (static_cast<uint64_t>(v) >> 32))); }
 void x_Long_equals(NativeContext *ctx)
 {
@@ -333,8 +353,18 @@ void x_Long_equals(NativeContext *ctx)
 void x_Small_init(NativeContext *ctx) { if (ctx->thisObj && ctx->thisObj->cells) ctx->thisObj->cells[0] = Value::fromInt(argInt(ctx, 1)); }
 void x_Small_value(NativeContext *ctx) { setIntResult(ctx, ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[0].i : 0); }
 void x_Small_toString(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, itos(ctx->thisObj && ctx->thisObj->cells ? ctx->thisObj->cells[0].i : 0))); }
-void x_Short_parse(NativeContext *ctx) { setIntResult(ctx, static_cast<int16_t>(atoi(strOf(argRef(ctx, 0)).c_str()))); }
-void x_Byte_parse(NativeContext *ctx) { setIntResult(ctx, static_cast<int8_t>(atoi(strOf(argRef(ctx, 0)).c_str()))); }
+void x_Short_parse(NativeContext *ctx)
+{
+    int64_t v;
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), 10, -32768, 32767, v)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setIntResult(ctx, static_cast<int32_t>(v));
+}
+void x_Byte_parse(NativeContext *ctx)
+{
+    int64_t v;
+    if (!parseJavaInt(strOf(argRef(ctx, 0)), 10, -128, 127, v)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setIntResult(ctx, static_cast<int32_t>(v));
+}
 
 // Character : cells[0].i
 void x_Chr_init(NativeContext *ctx) { if (ctx->thisObj && ctx->thisObj->cells) ctx->thisObj->cells[0] = Value::fromInt(argInt(ctx, 1) & 0xFFFF); }
@@ -379,8 +409,29 @@ void x_Float_doubleValue(NativeContext *ctx) { setDoubleResult(ctx, boxF(ctx->th
 void x_Float_intValue(NativeContext *ctx) { setIntResult(ctx, static_cast<int32_t>(boxF(ctx->thisObj))); }
 void x_Float_toString(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, fmtFloat(boxF(ctx->thisObj)))); }
 void x_Float_toStringS(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, fmtFloat(argFloat(ctx, 0)))); }
-void x_Float_parse(NativeContext *ctx) { setFloatResult(ctx, strtof(strOf(argRef(ctx, 0)).c_str(), nullptr)); }
-void x_Float_valueOfS(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/lang/Float", Value::fromFloat(strtof(strOf(argRef(ctx, 0)).c_str(), nullptr)))); }
+bool parseJavaDouble(const std::string &t0, double &out)
+{
+    std::string t = t0;
+    while (!t.empty() && isspace(static_cast<unsigned char>(t.back()))) t.pop_back();
+    size_t b = t.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return false;
+    t = t.substr(b);
+    char *end = nullptr;
+    out = strtod(t.c_str(), &end);
+    return end && *end == 0;
+}
+void x_Float_parse(NativeContext *ctx)
+{
+    double d;
+    if (!parseJavaDouble(strOf(argRef(ctx, 0)), d)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setFloatResult(ctx, static_cast<float>(d));
+}
+void x_Float_valueOfS(NativeContext *ctx)
+{
+    double d;
+    if (!parseJavaDouble(strOf(argRef(ctx, 0)), d)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setRefResult(ctx, newBoxed(ctx, "java/lang/Float", Value::fromFloat(static_cast<float>(d))));
+}
 void x_Float_valueOfF(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/lang/Float", Value::fromFloat(argFloat(ctx, 0)))); }
 void x_Float_isNaN(NativeContext *ctx) { setIntResult(ctx, std::isnan(argFloat(ctx, 0)) ? 1 : 0); }
 void x_Float_isNaNi(NativeContext *ctx) { setIntResult(ctx, std::isnan(boxF(ctx->thisObj)) ? 1 : 0); }
@@ -393,10 +444,16 @@ void x_Double_floatValue(NativeContext *ctx) { setFloatResult(ctx, static_cast<f
 void x_Double_intValue(NativeContext *ctx) { setIntResult(ctx, static_cast<int32_t>(boxD(ctx->thisObj))); }
 void x_Double_toString(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, fmtDouble(boxD(ctx->thisObj)))); }
 void x_Double_toStringS(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, fmtDouble(argDouble(ctx, 0)))); }
-void x_Double_parse(NativeContext *ctx) { setDoubleResult(ctx, strtod(strOf(argRef(ctx, 0)).c_str(), nullptr)); }
+void x_Double_parse(NativeContext *ctx)
+{
+    double d;
+    if (!parseJavaDouble(strOf(argRef(ctx, 0)), d)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
+    setDoubleResult(ctx, d);
+}
 void x_Double_valueOfS(NativeContext *ctx)
 {
-    double d = strtod(strOf(argRef(ctx, 0)).c_str(), nullptr);
+    double d;
+    if (!parseJavaDouble(strOf(argRef(ctx, 0)), d)) { throwJava(ctx, "java/lang/NumberFormatException"); return; }
     int64_t b; std::memcpy(&b, &d, 8);
     setRefResult(ctx, newBoxed(ctx, "java/lang/Double", Value::fromLong(b)));
 }
@@ -437,7 +494,7 @@ void x_Enum_next(NativeContext *ctx)
         e->cells[1] = Value::fromInt(e->cells[1].i + 1);
         return;
     }
-    setRefResult(ctx, nullptr); // (NoSuchElementException dans une vraie JVM)
+    throwJava(ctx, "java/util/NoSuchElementException");
 }
 void x_Vec_elements(NativeContext *ctx)
 {
@@ -502,7 +559,7 @@ void x_Stack_pop(NativeContext *ctx)
 {
     int n = vecCount(ctx);
     Obj *d = vecData(ctx);
-    if (!d || n <= 0) { setRefResult(ctx, nullptr); return; } // (EmptyStackException dans une vraie JVM)
+    if (!d || n <= 0) { throwJava(ctx, "java/util/EmptyStackException"); return; }
     Obj *top = d->cells[n - 1].o;
     d->cells[n - 1] = Value::fromRef(nullptr);
     vecSetCount(ctx, n - 1);
@@ -512,7 +569,8 @@ void x_Stack_peek(NativeContext *ctx)
 {
     int n = vecCount(ctx);
     Obj *d = vecData(ctx);
-    setRefResult(ctx, (d && n > 0) ? d->cells[n - 1].o : nullptr);
+    if (!d || n <= 0) { throwJava(ctx, "java/util/EmptyStackException"); return; }
+    setRefResult(ctx, d->cells[n - 1].o);
 }
 void x_Stack_empty(NativeContext *ctx) { setIntResult(ctx, vecCount(ctx) == 0 ? 1 : 0); }
 void x_Stack_search(NativeContext *ctx)
@@ -546,6 +604,10 @@ void x_HT_contains(NativeContext *ctx)
     setIntResult(ctx, 0);
 }
 void x_HT_initCap(NativeContext *ctx) { n_HT_init(ctx); }
+
+// javax.microedition.io.Connector : aucun réseau/fichier émulé -> ConnectionNotFoundException (les jeux
+// bien écrits la rattrapent et continuent hors-ligne).
+void x_Connector_open(NativeContext *ctx) { throwJava(ctx, "javax/microedition/io/ConnectionNotFoundException"); }
 
 // ---------------------------------------------------------------------------------------------
 // java.util.Date / Calendar / TimeZone (heure locale = horloge murale + horloge virtuelle du jeu)
@@ -598,6 +660,37 @@ void x_Cal_getTime(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/u
 void x_Cal_setTime(NativeContext *ctx) { if (ctx->thisObj && ctx->thisObj->cells) ctx->thisObj->cells[0] = Value::fromLong(boxL(argRef(ctx, 1))); }
 void x_TZ_getDefault(NativeContext *ctx) { setRefResult(ctx, newBoxed(ctx, "java/util/TimeZone", Value::fromInt(0))); }
 void x_TZ_getID(NativeContext *ctx) { setRefResult(ctx, newStr(ctx, "GMT")); }
+
+// ---------------------------------------------------------------------------------------------
+// java.io.PrintStream (System.out / System.err -> stdout)
+// ---------------------------------------------------------------------------------------------
+std::string psText(NativeContext *ctx, Obj *o)
+{
+    if (!o) return "null";
+    if (o->kind == ObjKind::String) return o->str;
+    if (o->kind == ObjKind::Instance && o->cls && ctx->interp)
+    {
+        Value a[1] = {Value::fromRef(o)}, r;
+        if (ctx->interp->invokeVirtual(o->cls, "toString", "()Ljava/lang/String;", o, a, 1, r) && r.o && r.o->kind == ObjKind::String)
+            return r.o->str;
+    }
+    return o->cls ? o->cls->name : "Object";
+}
+void x_PS_printlnObj(NativeContext *ctx) { printf("%s\n", psText(ctx, argRef(ctx, 1)).c_str()); }
+void x_PS_printObj(NativeContext *ctx) { printf("%s", psText(ctx, argRef(ctx, 1)).c_str()); }
+void x_PS_printlnChar(NativeContext *ctx) { printf("%c\n", static_cast<char>(argInt(ctx, 1))); }
+void x_PS_printChar(NativeContext *ctx) { printf("%c", static_cast<char>(argInt(ctx, 1))); }
+void x_PS_printlnLong(NativeContext *ctx) { printf("%lld\n", static_cast<long long>(argLong(ctx, 1))); }
+void x_PS_printLong(NativeContext *ctx) { printf("%lld", static_cast<long long>(argLong(ctx, 1))); }
+void x_PS_printlnBool(NativeContext *ctx) { printf("%s\n", argInt(ctx, 1) ? "true" : "false"); }
+void x_PS_printBool(NativeContext *ctx) { printf("%s", argInt(ctx, 1) ? "true" : "false"); }
+void x_PS_printlnChars(NativeContext *ctx)
+{
+    Obj *a = argRef(ctx, 1);
+    std::string s;
+    if (a && a->cells) for (int i = 0; i < a->arrayLen; i++) s += static_cast<char>(a->cells[i].u & 0xFF);
+    printf("%s\n", s.c_str());
+}
 
 // ---------------------------------------------------------------------------------------------
 // Enregistrement des natives (les classes + signatures sont déclarées dans midp::init, regClass)
@@ -738,6 +831,21 @@ void registerExtraNatives()
     RN("java/lang/Double.isInfinite:(D)Z", x_Double_isInf);
     RN("java/lang/Double.doubleToLongBits:(D)J", x_Double_toBits);
     RN("java/lang/Double.longBitsToDouble:(J)D", x_Double_fromBits);
+    RN("javax/microedition/io/Connector.open:(Ljava/lang/String;)Ljavax/microedition/io/Connection;", x_Connector_open);
+    RN("javax/microedition/io/Connector.open:(Ljava/lang/String;I)Ljavax/microedition/io/Connection;", x_Connector_open);
+    RN("javax/microedition/io/Connector.open:(Ljava/lang/String;IZ)Ljavax/microedition/io/Connection;", x_Connector_open);
+    RN("javax/microedition/io/Connector.openInputStream:(Ljava/lang/String;)Ljava/io/InputStream;", x_Connector_open);
+    RN("javax/microedition/io/Connector.openDataInputStream:(Ljava/lang/String;)Ljava/io/DataInputStream;", x_Connector_open);
+    // PrintStream
+    RN("java/io/PrintStream.println:(Ljava/lang/Object;)V", x_PS_printlnObj);
+    RN("java/io/PrintStream.print:(Ljava/lang/Object;)V", x_PS_printObj);
+    RN("java/io/PrintStream.println:(C)V", x_PS_printlnChar);
+    RN("java/io/PrintStream.print:(C)V", x_PS_printChar);
+    RN("java/io/PrintStream.println:(J)V", x_PS_printlnLong);
+    RN("java/io/PrintStream.print:(J)V", x_PS_printLong);
+    RN("java/io/PrintStream.println:(Z)V", x_PS_printlnBool);
+    RN("java/io/PrintStream.print:(Z)V", x_PS_printBool);
+    RN("java/io/PrintStream.println:([C)V", x_PS_printlnChars);
     // java.util
     RN("java/util/ArrayEnumeration.hasMoreElements:()Z", x_Enum_hasMore);
     RN("java/util/ArrayEnumeration.nextElement:()Ljava/lang/Object;", x_Enum_next);

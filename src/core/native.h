@@ -18,9 +18,14 @@ namespace jvm
         int nargs = 0;
         Obj *thisObj = nullptr;
         Value *result = nullptr; // à écrire si la méthode est non-void
+        Obj *exception = nullptr; // renseigné par throwJava() : l'appel échoue et l'exception se propage (rattrapable par un `catch`)
     };
 
     using NativeFn = std::function<void(NativeContext *)>;
+
+    // Lève une exception Java depuis une native (`java/io/EOFException`, `java/lang/NumberFormatException`...).
+    // No-op silencieux si la classe n'est pas enregistrée. À appeler puis `return` (le résultat est ignoré).
+    void throwJava(NativeContext *ctx, const char *className);
 
     // Table des natives : clé "nomClasse.nomMethode:desc"
     NativeFn findNative(const std::string &key);
