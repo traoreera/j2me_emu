@@ -943,8 +943,12 @@ namespace jvm
 
             static void gc_init(NativeContext *ctx)
             {
+                // GameCanvas(boolean suppressKeyEvents) : l'argument n'a RIEN à voir avec le plein écran (il était
+                // rangé dans GC_FULLSCREEN : tout GameCanvas(true) perdait sa barre de commandes -- SnakeWar
+                // affichait son écran d'accueil sans jamais pouvoir ouvrir le menu). Les évènements touches restent
+                // livrés dans tous les cas.
                 if (ctx->thisObj)
-                    ctx->thisObj->cells[GC_FULLSCREEN] = Value::fromInt(argInt(ctx, 1));
+                    ctx->thisObj->cells[GC_FULLSCREEN] = Value::fromInt(0);
             }
             static void gc_setFullScreen(NativeContext *ctx)
             {
