@@ -29,6 +29,7 @@ namespace jvm
 
     // Table des natives : clé "nomClasse.nomMethode:desc"
     NativeFn findNative(const std::string &key);
+    const NativeFn *findNativePtr(const std::string &key); // pointeur stable (nœud de la table)
     void registerNative(const std::string &key, NativeFn fn);
 
     // Dossier de persistance du RecordStore ("" = en mémoire seulement).
@@ -37,8 +38,15 @@ namespace jvm
     // Enregistrement de toutes les natives (CLDC + MIDP). À appeler une fois.
     void initNatives();
 
-    // Horloge virtuelle (ms) simulée, avancée à chaque frame (déterministe).
+    // Horloge du jeu : avancée à chaque trame de la durée réelle écoulée (ou d'un pas fixe, JME_FRAME_TIME).
     int64_t virtualMillis();
+    int64_t virtualMicros();
+    void setVirtualMicros(int64_t us); // monotone : ignoré si en arrière
     void advanceVirtualMillis(int64_t ms);
+
+    // GC : sommet de la pile C++ de la fibre ACTIVE, s'il y en a une (voir le commentaire complet dans
+    // natives.cpp, à côté de sa définition). Utilisée par src/app/main.cpp pour savoir QUELLE pile scanner
+    // conservativement (celle d'une fibre en cours, sinon celle du fil principal).
+    bool jme_currentFiberStackTop(uint8_t *&top);
 
 } // namespace jvm

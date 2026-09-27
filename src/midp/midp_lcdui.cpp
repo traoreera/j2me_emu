@@ -2059,6 +2059,46 @@ namespace jvm
                 R("javax/microedition/lcdui/CustomItem.invalidate:()V", ci_repaint);
 #undef R
             }
+
+            void gcMarkLcduiRoots(Heap::Marker &m)
+            {
+                auto markChc = [&](const Chc &c) { for (Obj *im : c.img) m.markObj(im); };
+                for (auto &kv : g_cmdMap)
+                    m.markObj(kv.first); // Cmd (valeur) n'a aucun champ Obj* : seule la clé (le Command lui-même) compte
+                for (auto &kv : g_itemMap)
+                {
+                    m.markObj(kv.first);
+                    const It &it = kv.second;
+                    m.markObj(it.img);
+                    m.markObj(it.owner);
+                    m.markObj(it.cmdListener);
+                    m.markObj(it.defCmd);
+                    for (Obj *c : it.cmds)
+                        m.markObj(c);
+                    markChc(it.ch);
+                }
+                for (auto &kv : g_scrMap)
+                {
+                    m.markObj(kv.first);
+                    const Scr &s = kv.second;
+                    m.markObj(s.listener);
+                    m.markObj(s.ticker);
+                    for (Obj *c : s.cmds)
+                        m.markObj(c);
+                    for (Obj *item : s.items)
+                        m.markObj(item);
+                    m.markObj(s.itemListener);
+                    m.markObj(s.enteredItem);
+                    m.markObj(s.selectCmd);
+                    m.markObj(s.next);
+                    m.markObj(s.prev);
+                    m.markObj(s.indicator);
+                    markChc(s.ch);
+                }
+                m.markObj(g_listSelectCommand);
+                m.markObj(g_alertDismissCommand);
+                m.markObj(g_customPressed);
+            }
         } // namespace detail
     } // namespace midp
 } // namespace jvm

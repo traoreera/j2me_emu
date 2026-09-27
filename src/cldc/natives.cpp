@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <map>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -93,6 +94,12 @@ NativeFn findNative(const std::string &key)
     return nullptr;
 }
 
+const NativeFn *findNativePtr(const std::string &key)
+{
+    auto it = registry().find(key);
+    return it != registry().end() ? &it->second : nullptr;
+}
+
 static std::string g_rmsDir;
 void setRmsDir(const std::string &dir) { g_rmsDir = dir; }
 
@@ -154,6 +161,32 @@ std::unordered_map<Obj *, JmeFiber *> &fiberMap()
 {
     static std::unordered_map<Obj *, JmeFiber *> m;
     return m;
+}
+
+// État d'ordonnancement d'un thread (clé : son Runnable). wakeUs : instant (horloge du jeu) avant lequel il ne doit
+// pas être repris (0 = prêt à la prochaine trame). Thread.sleep(ms) / Object.wait(ms) le posent puis suspendent la fibre.
+struct SchedState
+{
+    int64_t wakeUs = 0;
+    Obj *waitObj = nullptr; // objet sur lequel le thread fait wait(ms) : notify() le réveille
+    bool sleptSinceFlush = false; // un sleep() a eu lieu depuis le dernier flushGraphics() : la boucle se cadence seule
+    int64_t lastFlushUs = -1;
+    int tickSeen = -1;
+    int runs = 0;           // reprises pendant la trame courante
+    bool ranImmediate = false;
+};
+std::unordered_map<Obj *, SchedState> &schedMap()
+{
+    static std::unordered_map<Obj *, SchedState> m;
+    return m;
+}
+int g_schedTick = 0;
+int64_t g_schedEndUs = 0;
+// JME_SLEEP=frame : ancien comportement (sleep = céder jusqu'à la trame suivante, durée ignorée).
+bool sleepIsFrame()
+{
+    static const bool v = []() { const char *e = getenv("JME_SLEEP"); return e && strcmp(e, "frame") == 0; }();
+    return v;
 }
 
 JmeFiber *g_startingFiber = nullptr; // passage d'argument au trampoline (makecontext ne
@@ -222,8 +255,87 @@ void jme_yieldNow()
         swapcontext(&g_currentFiber->ctx, &g_currentFiber->callerCtx);
 }
 
+// Ordonnanceur par événements d'une trame : la trame couvre [début, endUs] de l'horloge du jeu. Un thread qui dort
+// jusqu'à un instant DANS la trame est repris à cet instant (l'horloge que voit le jeu vaut alors cet instant), donc
+// sleep(20) donne 50 itérations/s même avec des trames de 16,7 ms. Les threads « immédiats » (yield, flushGraphics,
+// budget épuisé) sont repris une seule fois par trame, à la fin de celle-ci.
+void jme_schedBegin(int tickN, int64_t endUs)
+{
+    g_schedTick = tickN;
+    g_schedEndUs = endUs;
+}
+
+Obj *jme_schedNext(const std::vector<Obj *> &threads)
+{
+    Obj *best = nullptr;
+    int64_t bestEff = 0;
+    for (Obj *r : threads)
+    {
+        auto fit = fiberMap().find(r);
+        if (fit != fiberMap().end() && fit->second->finished)
+            continue;
+        SchedState &st = schedMap()[r];
+        if (st.tickSeen != g_schedTick)
+        {
+            st.tickSeen = g_schedTick;
+            st.runs = 0;
+            st.ranImmediate = false;
+        }
+        const bool immediate = st.wakeUs <= 0;
+        if (immediate && st.ranImmediate)
+            continue;
+        const int64_t eff = immediate ? g_schedEndUs : st.wakeUs;
+        if (eff > g_schedEndUs || st.runs >= 6)
+            continue;
+        if (!best || eff < bestEff)
+        {
+            best = r;
+            bestEff = eff;
+        }
+    }
+    if (!best)
+        return nullptr;
+    SchedState &st = schedMap()[best];
+    if (st.wakeUs <= 0)
+        st.ranImmediate = true;
+    st.runs++;
+    st.wakeUs = 0;
+    st.waitObj = nullptr;
+    setVirtualMicros(bestEff);
+    return best;
+}
+
+// flushGraphics() : sur un vrai téléphone il est synchronisé sur l'affichage, et les boucles de jeu SANS sleep() s'y
+// cadencent (Stalker : 300 images/s sans cela). On cède donc la main, avec au moins 33 ms (30 images/s) entre deux
+// flush du même thread. Si la boucle dort déjà (sleep/wait entre deux flush), elle est cadencée par ses propres délais :
+// aucune attente en plus.
+void jme_flushYield()
+{
+    if (!g_currentFiber)
+        return;
+    if (sleepIsFrame())
+    {
+        jme_yieldNow();
+        return;
+    }
+    SchedState &st = schedMap()[g_currentFiber->runnable];
+    if (st.sleptSinceFlush)
+    {
+        st.sleptSinceFlush = false;
+        st.lastFlushUs = virtualMicros();
+        return;
+    }
+    const int64_t now = virtualMicros();
+    constexpr int64_t kMinFlushPeriodUs = 33333;
+    if (st.lastFlushUs >= 0 && now < st.lastFlushUs + kMinFlushPeriodUs)
+        st.wakeUs = st.lastFlushUs + kMinFlushPeriodUs;
+    st.lastFlushUs = st.wakeUs > now ? st.wakeUs : now;
+    jme_yieldNow();
+}
+
 void jme_threadForget(Obj *r)
 {
+    schedMap().erase(r);
     for (size_t i = 0; i < g_threads.size(); i++)
         if (g_threads[i] == r) { g_threads.erase(g_threads.begin() + (ptrdiff_t)i); break; }
     auto it = fiberMap().find(r);
@@ -231,6 +343,45 @@ void jme_threadForget(Obj *r)
     {
         delete it->second;
         fiberMap().erase(it);
+    }
+}
+
+// GC : borne HAUTE de la pile C++ RÉELLEMENT active en ce moment -- celle de la fibre en cours si une fibre
+// tourne (son `ucontext` a littéralement échangé le registre SP dessus), sinon aucune (le fil principal est
+// couvert séparément par src/app/main.cpp, qui connaît sa propre pile). Indispensable : un handler natif
+// (ex. img_createWH) qui alloue un objet, le garde un instant dans une variable C++ LOCALE (avant de
+// l'écrire dans un champ/tableau Java), puis alloue ENCORE avant de s'en servir, expose cette variable à
+// AUCUNE racine Java -- seul un balayage conservateur de la pile C++ elle-même la voit. Sans ça, un cycle GC
+// déclenché par cette deuxième allocation pouvait libérer puis RÉUTILISER la mémoire du premier objet
+// pendant que le handler s'apprêtait encore à écrire dedans -- corruption du tas (repéré avec
+// JME_GC_STRESS=1 : `arrayLen` d'un bloc libre devenu un entier négatif, interprété en taille énorme).
+bool jme_currentFiberStackTop(uint8_t *&top)
+{
+    if (!g_currentFiber)
+        return false;
+    top = reinterpret_cast<uint8_t *>(g_currentFiber->stack.data() + g_currentFiber->stack.size());
+    return true;
+}
+
+void jme_gcScanThreadingRoots(Heap::Marker &m)
+{
+    for (Obj *r : g_threads)
+        m.markObj(r);
+    for (auto &kv : schedMap())
+    {
+        m.markObj(kv.first);
+        m.markObj(kv.second.waitObj);
+    }
+    // Fibres SUSPENDUES : leur arène (`aBase`/`aOff`) contient alors leurs VRAIES locales+pile Java figées.
+    // La fibre ACTIVE (g_currentFiber) est exclue -- pendant qu'elle tourne, `swapArena` a échangé ses champs
+    // avec ceux de l'appelant (typiquement une arène "à vide", rien à perdre à l'ignorer ici) ; sa vraie
+    // arène active est déjà scannée via `Interpreter::scanActiveFrames` par l'appelant de cette fonction.
+    for (auto &kv : fiberMap())
+    {
+        JmeFiber *f = kv.second;
+        if (!f || f == g_currentFiber)
+            continue;
+        m.scan(f->aBase, f->aOff);
     }
 }
 
@@ -276,6 +427,53 @@ void n_Object_toString(NativeContext *ctx)
     snprintf(buf, sizeof(buf), "%s@%p", o && o->cls ? o->cls->name.c_str() : "null", (void *)o);
     setRefResult(ctx, ctx->rt->heap().newString(buf));
 }
+// Thread.sleep(ms) : la fibre ne reprend qu'une fois l'horloge du jeu à +ms (cf. jme_schedNext). Hors fibre
+// (startApp/paint/keyPressed appelés directement) rien à suspendre : sans effet, comme avant.
+void sleepFiber(int64_t ms, Obj *waitObj)
+{
+    if (!g_currentFiber)
+        return;
+    static const bool dbg = getenv("JME_SLEEPDBG") != nullptr;
+    if (dbg)
+    {
+        // Diagnostic : nombre de sleep()/wait(ms) par seconde de temps de JEU et de temps RÉEL.
+        static int64_t lastGameUs = 0;
+        static auto lastReal = std::chrono::steady_clock::now();
+        static int n = 0;
+        static int64_t sumMs = 0;
+        n++;
+        sumMs += ms;
+        if (virtualMicros() - lastGameUs >= 1000000)
+        {
+            auto nr = std::chrono::steady_clock::now();
+            fprintf(stderr, "[sleepdbg] %d sleep en %.2fs de jeu / %.2fs reels (arg moyen %lld ms)\n", n,
+                    (virtualMicros() - lastGameUs) / 1e6, std::chrono::duration<double>(nr - lastReal).count(),
+                    (long long)(sumMs / n));
+            lastGameUs = virtualMicros();
+            lastReal = nr;
+            n = 0;
+            sumMs = 0;
+        }
+    }
+    if (ms > 0 && !sleepIsFrame())
+    {
+        // Plancher : beaucoup de boucles de jeu font sleep(5)/sleep(10) parce que leur travail par image occupait
+        // déjà l'essentiel des ~33 ms d'un téléphone. Ici ce travail ne coûte presque rien : honorer ces délais
+        // à la lettre ferait tourner le jeu 5 à 10 fois trop vite. On ne descend donc pas sous ~30 itérations/s
+        // (JME_MIN_SLEEP=ms pour changer, 0 = à la lettre). Les délais plus longs sont respectés exactement.
+        static const int64_t minSleepMs = []() {
+            const char *e = getenv("JME_MIN_SLEEP");
+            return e ? static_cast<int64_t>(atoi(e)) : 33;
+        }();
+        if (ms < minSleepMs)
+            ms = minSleepMs;
+        SchedState &st = schedMap()[g_currentFiber->runnable];
+        st.wakeUs = virtualMicros() + ms * 1000;
+        st.waitObj = waitObj;
+        st.sleptSinceFlush = true;
+    }
+    jme_yieldNow();
+}
 // Object.wait()/wait(long)/notify()/notifyAll() : l'émulateur n'a pas de
 // moniteur réel. Pacing de boucle de jeu = reposer la fibre jusqu'à la
 // prochaine trame (cf. Thread.sleep), notify/notifyAll = no-op. Sans ces
@@ -283,9 +481,21 @@ void n_Object_toString(NativeContext *ctx)
 // par les handlers `catch (Exception)` (NoSuchMethodError est un Error), ce
 // qui tuait silencieusement les fibres des jeux dont le thread principal
 // rythme sa boucle à l'aide de wait(long) (ex. games/jump.jar : scène figée).
+// wait() sans délai : reprise à la prochaine trame (l'appelant reteste sa condition). wait(ms) : dort ms, sauf si
+// un notify()/notifyAll() sur le même objet le réveille avant.
 void n_Object_wait(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
-void n_Object_notify(NativeContext *ctx) { (void)ctx; }
-void n_Object_notifyAll(NativeContext *ctx) { (void)ctx; }
+void n_Object_waitL(NativeContext *ctx) { sleepFiber(argLong(ctx, 1), ctx->thisObj); }
+void n_Object_waitI(NativeContext *ctx) { sleepFiber(argInt(ctx, 1), ctx->thisObj); }
+void n_Object_notify(NativeContext *ctx)
+{
+    for (auto &kv : schedMap())
+        if (kv.second.waitObj && kv.second.waitObj == ctx->thisObj)
+        {
+            kv.second.wakeUs = 0;
+            kv.second.waitObj = nullptr;
+        }
+}
+void n_Object_notifyAll(NativeContext *ctx) { n_Object_notify(ctx); }
 
 // java.lang.Throwable : seule la racine déclare ses natives/son champ
 // message (cells[0]) -- Exception/RuntimeException et toutes les
@@ -882,7 +1092,7 @@ void n_Thread_start(NativeContext *ctx)
                 r && r->cls ? r->cls->name.c_str() : "-");
     jme_threadStart(r);
 }
-void n_Thread_sleep(NativeContext *ctx) { (void)ctx; jme_yieldNow(); }
+void n_Thread_sleep(NativeContext *ctx) { sleepFiber(argLong(ctx, 0), nullptr); }
 // Contrairement à sleep(), yield() n'est qu'une suggestion à l'ordonnanceur
 // -- rien ne garantit, sur un vrai appareil, qu'un cycle de repaint complet
 // s'intercale avant que le thread ne reprenne. Le traiter comme sleep()
@@ -1935,9 +2145,13 @@ void n_Class_newInstance(NativeContext *ctx)
 
 } // namespace
 
-static int64_t g_virtualMillis = 0;
-int64_t virtualMillis() { return g_virtualMillis; }
-void advanceVirtualMillis(int64_t ms) { g_virtualMillis += ms; }
+// Horloge du JEU (currentTimeMillis, Timer, Thread.sleep...) en microsecondes. Elle avance à chaque trame de la
+// durée RÉELLE écoulée (midp::tick), ou d'un pas fixe si JME_FRAME_TIME est posé (runs déterministes).
+static int64_t g_virtualUs = 0;
+int64_t virtualMicros() { return g_virtualUs; }
+void setVirtualMicros(int64_t us) { if (us > g_virtualUs) g_virtualUs = us; }
+int64_t virtualMillis() { return g_virtualUs / 1000; }
+void advanceVirtualMillis(int64_t ms) { g_virtualUs += ms * 1000; }
 
 void initNatives()
 {
@@ -1951,8 +2165,8 @@ void initNatives()
     registerNative("java/lang/Object.hashCode:()I", n_Object_hashCode);
     registerNative("java/lang/Object.toString:()Ljava/lang/String;", n_Object_toString);
     registerNative("java/lang/Object.wait:()V", n_Object_wait);
-    registerNative("java/lang/Object.wait:(I)V", n_Object_wait);
-    registerNative("java/lang/Object.wait:(J)V", n_Object_wait);
+    registerNative("java/lang/Object.wait:(I)V", n_Object_waitI);
+    registerNative("java/lang/Object.wait:(J)V", n_Object_waitL);
     registerNative("java/lang/Object.notify:()V", n_Object_notify);
     registerNative("java/lang/Object.notifyAll:()V", n_Object_notifyAll);
 

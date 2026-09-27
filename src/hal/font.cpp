@@ -152,10 +152,17 @@ void compose(unsigned char dst, char base, Mark m)
 void init()
 {
     std::memset(g_glyph, 0, sizeof g_glyph);
-    for (int c = 0; c < 256; c++)
-        copyOf(static_cast<unsigned char>(c), '?'); // défaut : « ? »
+    // La table ASCII doit être chargée AVANT le remplissage par défaut ci-dessous : `copyOf(c, '?')` copie le
+    // glyphe ACTUEL de '?' (0x3F), qui n'a de forme reconnaissable qu'une fois `kAscii` chargé. Dans l'ordre
+    // inverse (bug trouvé en auditant la police), '?' est encore entièrement vide au moment de la copie : tout
+    // caractère jamais explicitement composé plus bas (¶, ¼, ½, ¾ compris, avant l'ajout de leurs glyphes
+    // dédiés ci-dessous, et le reste de la plage C0 0x80-0x9F) reste INVISIBLE au lieu d'afficher « ? » comme
+    // prévu -- pire qu'un caractère inconnu visible : du texte qui semble juste amputé de certaines lettres.
     for (int i = 0; i < 95; i++)
         std::memcpy(g_glyph[0x20 + i], kAscii[i], 5);
+    for (int c = 0; c < 256; c++)
+        if (c < 0x20 || c > 0x7E) // ne pas écraser l'ASCII imprimable qu'on vient de charger
+            copyOf(static_cast<unsigned char>(c), '?'); // défaut : « ? » (désormais un VRAI « ? »)
     std::memset(g_glyph[0x7F], 0x7F, 5); // DEL : bloc plein
     copyOf(0xA0, ' ');
 
@@ -181,6 +188,15 @@ void init()
     static const char *const thorn[7] = {"#....", "#....", "###..", "#..#.", "#..#.", "###..", "#...."};
     static const char *const Thorn[7] = {"#....", "###..", "#..#.", "#..#.", "###..", "#....", "#...."};
     static const char *const Dbar[7] = {"###..", "#..#.", "###.#", "#..#.", "#..#.", "#..#.", "###.."};
+    // ¶ (pilcrow) et les fractions ¼ ½ ¾ n'avaient AUCUN glyphe dédié : avant la correction de l'ordre
+    // d'initialisation ci-dessus, elles héritaient d'un « ? » encore vide (invisibles) ; même corrigé, un
+    // simple « ? » les rendrait indiscernables d'un caractère réellement inconnu. Approximations dessinées à
+    // la main comme le reste des symboles de cette table (chiffre-barre-chiffre pour les fractions, trop
+    // serré à 5 colonnes pour une vraie barre de fraction diagonale nette).
+    static const char *const pilcrow[7] = {".####", ".##.#", ".##.#", ".##.#", "...#.", "...#.", "...#."};
+    static const char *const quarter[7] = {"#....", "##...", "..#..", ".#...", "#.#.#", "#.###", "...#."};
+    static const char *const half[7] = {"#....", "##...", "..#..", ".#...", "..##.", ".#...", "####."};
+    static const char *const threeq[7] = {".##..", "..#..", ".##..", ".#...", "#.#.#", "#.###", "...#."};
     setRows(0xA1, inv_excl);
     setRows(0xBF, inv_q);
     setRows(0xB0, degree);
@@ -204,6 +220,10 @@ void init()
     setRows(0xFE, thorn);
     setRows(0xDE, Thorn);
     setRows(0xD0, Dbar);
+    setRows(0xB6, pilcrow);
+    setRows(0xBC, quarter);
+    setRows(0xBD, half);
+    setRows(0xBE, threeq);
     copyOf(0xA2, 'c');
     copyOf(0xA4, 'o');
     copyOf(0xA6, '|');
@@ -212,11 +232,14 @@ void init()
     copyOf(0xAF, '-');
     copyOf(0xAA, 'a');
     copyOf(0xBA, 'o');
-    applyMark(0xB4, ACUTE);
+    // Marques isolées (´ ¨ ¸, sans lettre de base) : on repart d'un glyphe VIDE (pas de la lettre encore
+    // dessus depuis le remplissage par défaut) puis on pose juste la marque.
     std::memset(g_glyph[0xB4], 0, 5);
     applyMark(0xB4, ACUTE);
     std::memset(g_glyph[0xA8], 0, 5);
     applyMark(0xA8, DIAER);
+    std::memset(g_glyph[0xB8], 0, 5);
+    applyMark(0xB8, CEDIL);
     // Lettres accentuées majuscules / minuscules
     struct Row { unsigned char lo; char base; Mark m; };
     static const Row up[] = {

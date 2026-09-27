@@ -7,6 +7,122 @@
 #include <cstdlib>
 #include <cmath>
 
+// ---------------------------------------------------------------------------------------------
+// JME_PROFILE=1 : profil d'échantillonnage des méthodes Java (SIGPROF toutes les ms, temps CPU « propre » :
+// les natives sont comptées chez la méthode qui les appelle). Résultat sur stderr en fin de run.
+// ---------------------------------------------------------------------------------------------
+#include <csignal>
+#include <ucontext.h>
+#include <dlfcn.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <vector>
+#include <atomic>
+namespace
+{
+struct ProfSlot
+{
+    std::atomic<const void *> key{nullptr};
+    const jvm::ClassInfo *cls = nullptr;
+    const jvm::MethodRecord *m = nullptr;
+    std::atomic<uint32_t> n{0};
+};
+constexpr int kProfSlots = 8192;
+ProfSlot g_profTab[kProfSlots];
+std::atomic<uint32_t> g_profIdle{0};
+} // namespace
+namespace jvm
+{
+bool g_profOn = false;
+const ClassInfo *g_profCls = nullptr;
+const MethodRecord *g_profM = nullptr;
+// JME_PROFILE=rip : histogramme des ADRESSES d'instruction (à traduire avec addr2line sur un binaire -no-pie -g).
+static bool g_profRip = false;
+static std::atomic<uintptr_t> g_ripKey[4096];
+static std::atomic<uint32_t> g_ripN[4096];
+static void profSignal(int, siginfo_t *, void *uc)
+{
+    if (g_profRip)
+    {
+        uintptr_t rip = static_cast<uintptr_t>(static_cast<ucontext_t *>(uc)->uc_mcontext.gregs[REG_RIP]);
+        size_t h = (rip >> 2) % 4096;
+        for (int i = 0; i < 4096; i++, h = (h + 1) % 4096)
+        {
+            uintptr_t k = g_ripKey[h].load();
+            if (k == rip) { g_ripN[h]++; break; }
+            if (!k)
+            {
+                uintptr_t exp = 0;
+                if (g_ripKey[h].compare_exchange_strong(exp, rip) || g_ripKey[h].load() == rip) { g_ripN[h]++; break; }
+            }
+        }
+    }
+    const MethodRecord *m = g_profM;
+    if (!m) { g_profIdle++; return; }
+    size_t h = (reinterpret_cast<uintptr_t>(m) >> 4) % kProfSlots;
+    for (int i = 0; i < kProfSlots; i++, h = (h + 1) % kProfSlots)
+    {
+        const void *k = g_profTab[h].key.load();
+        if (k == m) { g_profTab[h].n++; return; }
+        if (!k)
+        {
+            const void *exp = nullptr;
+            if (g_profTab[h].key.compare_exchange_strong(exp, m))
+            {
+                g_profTab[h].cls = g_profCls;
+                g_profTab[h].m = m;
+                g_profTab[h].n++;
+                return;
+            }
+            if (g_profTab[h].key.load() == m) { g_profTab[h].n++; return; }
+        }
+    }
+}
+void profileReport()
+{
+    if (!g_profOn) return;
+    g_profOn = false;
+    std::vector<std::pair<uint32_t, int>> v;
+    uint32_t total = g_profIdle;
+    for (int i = 0; i < kProfSlots; i++)
+        if (g_profTab[i].key.load()) { v.push_back({g_profTab[i].n.load(), i}); total += g_profTab[i].n.load(); }
+    std::sort(v.rbegin(), v.rend());
+    if (g_profRip)
+    {
+        std::vector<std::pair<uint32_t, uintptr_t>> rv;
+        for (int i = 0; i < 4096; i++)
+            if (g_ripKey[i].load()) rv.push_back({g_ripN[i].load(), g_ripKey[i].load()});
+        std::sort(rv.rbegin(), rv.rend());
+        for (size_t i = 0; i < rv.size() && i < 60; i++)
+        {
+            Dl_info di;
+            const char *nm = (dladdr(reinterpret_cast<void *>(rv[i].second), &di) && di.dli_sname) ? di.dli_sname : "";
+            fprintf(stderr, "[rip] %u 0x%lx %s\n", rv[i].first, (unsigned long)rv[i].second, nm);
+        }
+    }
+    fprintf(stderr, "[profile] %u echantillons (1 ms) dont %u hors bytecode (natives/rendu/boucle principale)\n", total, g_profIdle.load());
+    for (size_t i = 0; i < v.size() && i < 30; i++)
+    {
+        const ProfSlot &p = g_profTab[v[i].second];
+        fprintf(stderr, "[profile] %6u %5.1f%%  %s.%s%s\n", v[i].first, 100.0 * v[i].first / (total ? total : 1),
+                p.cls ? p.cls->name.c_str() : "?", p.m ? p.m->name.c_str() : "?", p.m ? p.m->desc.c_str() : "");
+    }
+}
+void profileInit()
+{
+    if (!getenv("JME_PROFILE")) return;
+    g_profOn = true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = profSignal;
+    sa.sa_flags = SA_RESTART | SA_SIGINFO;
+    { const char *pe = getenv("JME_PROFILE"); g_profRip = pe && strcmp(pe, "rip") == 0; }
+    sigaction(SIGPROF, &sa, nullptr);
+    itimerval it = {{0, 1000}, {0, 1000}};
+    setitimer(ITIMER_PROF, &it, nullptr);
+}
+} // namespace jvm
+
 namespace jvm
 {
 
@@ -288,15 +404,21 @@ bool Interpreter::dispatch(ClassInfo *cls, const MethodRecord *m, Obj *thisObj,
     }
     else
     {
-        std::string key = cls->name + "." + m->name + ":" + m->desc;
-        NativeFn fn = findNative(key);
-        if (!fn)
+        const NativeFn *fnp = static_cast<const NativeFn *>(m->nativeFn);
+        if (!fnp)
         {
-            if (stubMissing(cls, m->name, m->desc, result))
-                return true;
-            fprintf(stderr, "JVM: native manquante: %s\n", key.c_str());
-            return false;
+            std::string key = cls->name + "." + m->name + ":" + m->desc;
+            fnp = findNativePtr(key);
+            if (!fnp || !*fnp)
+            {
+                if (stubMissing(cls, m->name, m->desc, result))
+                    return true;
+                fprintf(stderr, "JVM: native manquante: %s\n", key.c_str());
+                return false;
+            }
+            m->nativeFn = fnp;
         }
+        const NativeFn &fn = *fnp;
         NativeContext ctx;
         ctx.rt = rt_;
         ctx.interp = this;
@@ -484,7 +606,10 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     void *chunk = frameAlloc(nframes);
     if (!chunk)
         return false;
-    std::memset(chunk, 0, nframes);
+    std::memset(chunk, 0, nLocals * sizeof(Value)); // la pile d'opérandes n'a pas besoin d'être remise à zéro
+    const ClassInfo *profPrevCls = g_profCls;
+    const MethodRecord *profPrevM = g_profM;
+    if (g_profOn) { g_profCls = cls; g_profM = m; }
 
     Frame f;
     f.cls = cls;
@@ -515,8 +640,8 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
     }();
     static bool trace = traceOnce;
 
-    int &pc = f.pc;
-    int &sp = f.sp;
+    int pc = 0; // locales (registres) : pas de référence vers Frame
+    int sp = 0;
     Value *st = f.stack;
     uint8_t *ct = f.stackCat;
     Value *lv = f.locals;
@@ -625,10 +750,70 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         return false;
     };
 
+    // Entrée du cache de références de classe pour l'index `idx` du pool (créée à la demande ; taille fixée une fois).
+    auto classRef = [&](uint16_t idx) -> ClassInfo::ClassRefEntry &
+    {
+        if (cls->classRefCache.empty())
+            cls->classRefCache.resize(cp.entries.size());
+        ClassInfo::ClassRefEntry &e = cls->classRefCache[idx < cls->classRefCache.size() ? idx : 0];
+        if (!e.valid)
+        {
+            e.name = cp.getClassName(idx);
+            e.isArray = !e.name.empty() && e.name[0] == '[';
+            e.valid = true;
+        }
+        return e;
+    };
+
+    // ---- Dispatch « threaded » : chaque instruction fréquente se termine par NEXT() qui saute directement vers
+    // le case suivant (un saut indirect par opcode au lieu d'un seul point partagé : bien meilleure prédiction de
+    // branchement). Les cas rares / les fins de méthode reviennent au switch classique (do_switch).
+    static const void *const jt[256] = {
+        &&L_00, &&L_01, &&L_02, &&L_03, &&L_04, &&L_05, &&L_06, &&L_07,
+        &&L_08, &&L_09, &&L_0a, &&L_0b, &&L_0c, &&L_0d, &&L_0e, &&L_0f,
+        &&L_10, &&L_11, &&L_12, &&L_12, &&L_14, &&L_15, &&L_15, &&L_15,
+        &&L_15, &&L_15, &&L_1a, &&L_1a, &&L_1a, &&L_1a, &&L_1e, &&L_1e,
+        &&L_1e, &&L_1e, &&L_22, &&L_22, &&L_22, &&L_22, &&L_26, &&L_26,
+        &&L_26, &&L_26, &&L_2a, &&L_2a, &&L_2a, &&L_2a, &&L_2e, &&L_2f,
+        &&L_30, &&L_31, &&L_32, &&L_33, &&L_33, &&L_33, &&L_36, &&L_36,
+        &&L_36, &&L_36, &&L_36, &&L_3b, &&L_3b, &&L_3b, &&L_3b, &&L_3f,
+        &&L_3f, &&L_3f, &&L_3f, &&L_43, &&L_43, &&L_43, &&L_43, &&L_47,
+        &&L_47, &&L_47, &&L_47, &&L_4b, &&L_4b, &&L_4b, &&L_4b, &&L_4f,
+        &&L_50, &&L_4f, &&L_50, &&L_4f, &&L_54, &&L_54, &&L_54, &&L_57,
+        &&do_switch, &&L_59, &&L_5a, &&L_5b, &&L_5c, &&L_5d, &&L_5d, &&L_5f,
+        &&L_60, &&L_61, &&L_62, &&L_63, &&L_64, &&L_65, &&L_66, &&L_63,
+        &&L_68, &&L_69, &&L_6a, &&L_63, &&L_6c, &&L_6d, &&L_6e, &&L_63,
+        &&L_70, &&L_71, &&L_72, &&L_63, &&L_74, &&L_75, &&L_76, &&L_77,
+        &&L_78, &&L_79, &&L_7a, &&L_7b, &&L_7c, &&L_7d, &&L_7e, &&L_7f,
+        &&L_80, &&L_81, &&L_82, &&L_83, &&L_84, &&L_85, &&L_86, &&L_87,
+        &&L_88, &&L_89, &&L_8a, &&L_8b, &&L_8c, &&L_8d, &&L_8e, &&L_8f,
+        &&L_90, &&L_91, &&L_92, &&L_93, &&L_94, &&L_95, &&L_95, &&L_97,
+        &&L_97, &&L_99, &&L_99, &&L_99, &&L_99, &&L_99, &&L_99, &&L_9f,
+        &&L_9f, &&L_9f, &&L_9f, &&L_9f, &&L_9f, &&L_a5, &&L_a5, &&L_a7,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&L_b2, &&L_b2, &&L_b4, &&L_b4, &&L_b6, &&L_b6,
+        &&L_b6, &&L_b6, &&do_switch, &&L_bb, &&L_bc, &&L_bd, &&L_be, &&do_switch,
+        &&L_c0, &&L_c0, &&L_c2, &&L_c2, &&do_switch, &&do_switch, &&L_c6, &&L_c6,
+        &&L_c8, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch,
+        &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch, &&do_switch
+    };
+#define NEXT() do { \
+        if (__builtin_expect(done || pc < 0 || pc >= codeLen || trace, 0)) goto loop_head; \
+        if (instrBudget_ >= 0 && --instrBudget_ < 0) goto budget_out; \
+        op = c[pc++]; \
+        goto *jt[op]; \
+    } while (0)
+    loop_head:
     while (!done && pc >= 0 && pc < codeLen)
     {
         if (instrBudget_ >= 0 && --instrBudget_ < 0)
         {
+            budget_out:
             if (yieldFn_)
             {
                 // Suspend la fibre courante ; ne revient que réveillé par le
@@ -650,31 +835,32 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             fprintf(stderr, "  [%s.%s pc=%d] op=0x%02x sp=%d local0=%p\n",
                     cls->name.c_str(), m->name.c_str(), pc, op, sp,
                     (f.localsCount > 0) ? (void *)f.locals[0].o : (void *)0);
+        do_switch:
         switch (op)
         {
-        case 0x00: break;
-        case 0x01: pushRef(nullptr); break;
-        case 0x02: pushInt(-1); break;
-        case 0x03: pushInt(0); break;
-        case 0x04: pushInt(1); break;
-        case 0x05: pushInt(2); break;
-        case 0x06: pushInt(3); break;
-        case 0x07: pushInt(4); break;
-        case 0x08: pushInt(5); break;
-        case 0x09: pushLong(0); break;
-        case 0x0a: pushLong(1); break;
-        case 0x0b:
-        { int32_t bits = 0x3f000000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); break; }
-        case 0x0c:
-        { int32_t bits = 0x3f800000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); break; }
-        case 0x0d:
-        { int32_t bits = 0x40000000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); break; }
-        case 0x0e: pushLong(0); break;
-        case 0x0f: pushLong(0x3ff0000000000000LL); break;
-        case 0x10: pushInt(static_cast<int8_t>(rb(c, pc))); break;
-        case 0x11: pushInt(rb16(c, pc)); break;
+        case 0x00: L_00: NEXT();
+        case 0x01: L_01: pushRef(nullptr); NEXT();
+        case 0x02: L_02: pushInt(-1); NEXT();
+        case 0x03: L_03: pushInt(0); NEXT();
+        case 0x04: L_04: pushInt(1); NEXT();
+        case 0x05: L_05: pushInt(2); NEXT();
+        case 0x06: L_06: pushInt(3); NEXT();
+        case 0x07: L_07: pushInt(4); NEXT();
+        case 0x08: L_08: pushInt(5); NEXT();
+        case 0x09: L_09: pushLong(0); NEXT();
+        case 0x0a: L_0a: pushLong(1); NEXT();
+        case 0x0b: L_0b:
+        { int32_t bits = 0x3f000000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); NEXT(); }
+        case 0x0c: L_0c:
+        { int32_t bits = 0x3f800000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); NEXT(); }
+        case 0x0d: L_0d:
+        { int32_t bits = 0x40000000; Value v; v.f = *reinterpret_cast<float *>(&bits); push(v, 1); NEXT(); }
+        case 0x0e: L_0e: pushLong(0); NEXT();
+        case 0x0f: L_0f: pushLong(0x3ff0000000000000LL); NEXT();
+        case 0x10: L_10: pushInt(static_cast<int8_t>(rb(c, pc))); NEXT();
+        case 0x11: L_11: pushInt(rb16(c, pc)); NEXT();
         case 0x12:
-        case 0x13:
+        case 0x13: L_12:
         {
             uint16_t idx = (op == 0x12) ? rb(c, pc) : rbu16(c, pc);
             const CpEntry *e = cp.get(idx);
@@ -682,8 +868,15 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             switch (e->tag)
             {
             case CONSTANT_STRING:
-                pushRef(rt_->heap().internString(cp.getUtf8(e->nameIndex)));
+            {
+                if (cls->ldcCache.empty())
+                    cls->ldcCache.resize(cp.entries.size(), nullptr);
+                Obj *&slot = cls->ldcCache[idx < cls->ldcCache.size() ? idx : 0];
+                if (!slot)
+                    slot = rt_->heap().internString(cp.getUtf8(e->nameIndex));
+                pushRef(slot);
                 break;
+            }
             case CONSTANT_INTEGER:
                 pushInt(e->intVal);
                 break;
@@ -695,9 +888,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             default:
                 okResult = false; done = true; break;
             }
-            break;
+            NEXT();
         }
-        case 0x14:
+        case 0x14: L_14:
         {
             uint16_t idx = rbu16(c, pc);
             const CpEntry *e = cp.get(idx);
@@ -709,30 +902,30 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 double d = e->doubleVal; int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits);
             }
             else { okResult = false; done = true; }
-            break;
+            NEXT();
         }
 
-        case 0x15: case 0x16: case 0x17: case 0x18: case 0x19:
+        case 0x15: case 0x16: case 0x17: case 0x18: case 0x19: L_15:
         {
             uint8_t idx = rb(c, pc);
             if (op == 0x16 || op == 0x18)
                 pushLong(lv[idx].l);
             else
                 push(lv[idx], 1);
-            break;
+            NEXT();
         }
-        case 0x1a: case 0x1b: case 0x1c: case 0x1d:
-            push(lv[op - 0x1a], 1); break;
-        case 0x1e: case 0x1f: case 0x20: case 0x21:
-            pushLong(lv[op - 0x1e].l); break;
-        case 0x22: case 0x23: case 0x24: case 0x25:
-            push(lv[op - 0x22], 1); break;
-        case 0x26: case 0x27: case 0x28: case 0x29:
-            pushLong(lv[op - 0x26].l); break;
-        case 0x2a: case 0x2b: case 0x2c: case 0x2d:
-            push(lv[op - 0x2a], 1); break;
+        case 0x1a: case 0x1b: case 0x1c: case 0x1d: L_1a:
+            push(lv[op - 0x1a], 1); NEXT();
+        case 0x1e: case 0x1f: case 0x20: case 0x21: L_1e:
+            pushLong(lv[op - 0x1e].l); NEXT();
+        case 0x22: case 0x23: case 0x24: case 0x25: L_22:
+            push(lv[op - 0x22], 1); NEXT();
+        case 0x26: case 0x27: case 0x28: case 0x29: L_26:
+            pushLong(lv[op - 0x26].l); NEXT();
+        case 0x2a: case 0x2b: case 0x2c: case 0x2d: L_2a:
+            push(lv[op - 0x2a], 1); NEXT();
 
-        case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a:
+        case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a: L_36:
         {
             uint8_t idx = rb(c, pc);
             if (op == 0x37 || op == 0x39)
@@ -744,84 +937,84 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             {
                 lv[idx] = pop();
             }
-            break;
+            NEXT();
         }
-        case 0x3b: case 0x3c: case 0x3d: case 0x3e: lv[op - 0x3b] = pop(); break;
-        case 0x3f: case 0x40: case 0x41: case 0x42:
+        case 0x3b: case 0x3c: case 0x3d: case 0x3e: L_3b: lv[op - 0x3b] = pop(); NEXT();
+        case 0x3f: case 0x40: case 0x41: case 0x42: L_3f:
         {
-            int64_t v = popLong(); int i = op - 0x3f; lv[i].l = v; lv[i + 1].l = 0; break;
+            int64_t v = popLong(); int i = op - 0x3f; lv[i].l = v; lv[i + 1].l = 0; NEXT();
         }
-        case 0x43: case 0x44: case 0x45: case 0x46: lv[op - 0x43] = pop(); break;
-        case 0x47: case 0x48: case 0x49: case 0x4a:
+        case 0x43: case 0x44: case 0x45: case 0x46: L_43: lv[op - 0x43] = pop(); NEXT();
+        case 0x47: case 0x48: case 0x49: case 0x4a: L_47:
         {
-            int64_t v = popLong(); int i = op - 0x47; lv[i].l = v; lv[i + 1].l = 0; break;
+            int64_t v = popLong(); int i = op - 0x47; lv[i].l = v; lv[i + 1].l = 0; NEXT();
         }
-        case 0x4b: case 0x4c: case 0x4d: case 0x4e: lv[op - 0x4b] = pop(); break;
+        case 0x4b: case 0x4c: case 0x4d: case 0x4e: L_4b: lv[op - 0x4b] = pop(); NEXT();
 
-        case 0x50: case 0x52: // lastore, dastore : valeur sur 2 slots (catégorie 2)
+        case 0x50: case 0x52: L_50: // lastore, dastore : valeur sur 2 slots (catégorie 2)
         {
             Value v = Value::fromLong(popLong());
             int idx = popInt();
             Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             arr->cells[idx] = v;
-            break;
+            NEXT();
         }
-        case 0x4f: case 0x51: case 0x53:
+        case 0x4f: case 0x51: case 0x53: L_4f:
         {
             Value v = pop();
             int idx = popInt();
             Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             arr->cells[idx] = v;
-            break;
+            NEXT();
         }
-        case 0x54: case 0x55: case 0x56:
+        case 0x54: case 0x55: case 0x56: L_54:
         {
             Value v = pop();
             int idx = popInt();
             Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             arr->cells[idx] = v;
-            break;
+            NEXT();
         }
 
-        case 0x2e:
+        case 0x2e: L_2e:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             push(arr->cells[idx], 1);
-            break;
+            NEXT();
         }
-        case 0x2f:
+        case 0x2f: L_2f:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             pushLong(arr->cells[idx].l);
-            break;
+            NEXT();
         }
-        case 0x30:
+        case 0x30: L_30:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             push(arr->cells[idx], 1);
-            break;
+            NEXT();
         }
-        case 0x31:
+        case 0x31: L_31:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             pushLong(arr->cells[idx].l);
-            break;
+            NEXT();
         }
-        case 0x32:
+        case 0x32: L_32:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
             push(arr->cells[idx], 1);
-            break;
+            NEXT();
         }
-        case 0x33: case 0x34: case 0x35:
+        case 0x33: case 0x34: case 0x35: L_33:
         {
             int idx = popInt(); Obj *arr = popRef();
             if (raiseIfBadArray(arr, idx, pc - 1)) break;
@@ -832,17 +1025,17 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 else v = static_cast<int16_t>(v);
                 pushInt(v);
             }
-            break;
+            NEXT();
         }
 
-        case 0x57: if (sp > 0) sp--; break;
+        case 0x57: L_57: if (sp > 0) sp--; NEXT();
         case 0x58: if (sp >= 2) sp -= 2; else sp = 0; break; // pop2 : TOUJOURS 2 slots (deux int, ou un long/double sur 2 slots)
-        case 0x59:
+        case 0x59: L_59:
         {
             if (sp >= 1) { st[sp] = st[sp - 1]; ct[sp] = ct[sp - 1]; sp++; }
-            break;
+            NEXT();
         }
-        case 0x5a:
+        case 0x5a: L_5a:
         {
             if (sp >= 2)
             {
@@ -853,9 +1046,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 st[sp] = a; ct[sp] = ca;
                 sp++;
             }
-            break;
+            NEXT();
         }
-        case 0x5b:
+        case 0x5b: L_5b:
         {
             if (sp >= 3)
             {
@@ -867,26 +1060,26 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 st[sp] = a; ct[sp] = ca;
                 sp++;
             }
-            break;
+            NEXT();
         }
-        case 0x5c:
+        case 0x5c: L_5c:
         {
             if (sp >= 2)
             {
                 if (ct[sp - 2] == 2) { st[sp] = st[sp - 2]; ct[sp] = 2; ct[sp + 1] = 2; sp += 2; }
                 else { st[sp] = st[sp - 2]; st[sp + 1] = st[sp - 1]; ct[sp] = ct[sp - 2]; ct[sp + 1] = ct[sp - 1]; sp += 2; }
             }
-            break;
+            NEXT();
         }
-        case 0x5f:
+        case 0x5f: L_5f:
         {
             if (sp >= 2) { Value a = st[sp - 1]; st[sp - 1] = st[sp - 2]; st[sp - 2] = a; uint8_t ca = ct[sp - 1]; ct[sp - 1] = ct[sp - 2]; ct[sp - 2] = ca; }
-            break;
+            NEXT();
         }
 
         // dup2_x1 / dup2_x2 : au niveau des SLOTS (un long/double = 2 slots), les 4 formes de la JVMS
         // se réduisent à "recopier les 2 slots du dessus sous les 1 (x1) ou 2 (x2) slots suivants".
-        case 0x5d: case 0x5e:
+        case 0x5d: case 0x5e: L_5d:
         {
             const int under = (op == 0x5d) ? 1 : 2;
             const int n = under + 2;
@@ -904,17 +1097,17 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 st[d + 3 + under] = tv[under + 1];     ct[d + 3 + under] = tc[under + 1];
                 sp += 2;
             }
-            break;
+            NEXT();
         }
 
         // ---- arithmétique flottante (float = 1 slot .f, double = 2 slots bits IEEE) ----
-        case 0x62: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a + b), 1); break; }
-        case 0x66: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a - b), 1); break; }
-        case 0x6a: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a * b), 1); break; }
-        case 0x6e: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a / b), 1); break; }
-        case 0x72: { float b = pop().f; float a = pop().f; push(Value::fromFloat(std::fmod(a, b)), 1); break; }
-        case 0x76: { float a = pop().f; push(Value::fromFloat(-a), 1); break; }
-        case 0x63: case 0x67: case 0x6b: case 0x6f: case 0x73:
+        case 0x62: L_62: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a + b), 1); NEXT(); }
+        case 0x66: L_66: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a - b), 1); NEXT(); }
+        case 0x6a: L_6a: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a * b), 1); NEXT(); }
+        case 0x6e: L_6e: { float b = pop().f; float a = pop().f; push(Value::fromFloat(a / b), 1); NEXT(); }
+        case 0x72: L_72: { float b = pop().f; float a = pop().f; push(Value::fromFloat(std::fmod(a, b)), 1); NEXT(); }
+        case 0x76: L_76: { float a = pop().f; push(Value::fromFloat(-a), 1); NEXT(); }
+        case 0x63: case 0x67: case 0x6b: case 0x6f: case 0x73: L_63:
         {
             int64_t bb = popLong(); int64_t ab = popLong();
             double a, b, r;
@@ -928,9 +1121,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             default: r = std::fmod(a, b); break;
             }
             int64_t rb_; std::memcpy(&rb_, &r, 8); pushLong(rb_);
-            break;
+            NEXT();
         }
-        case 0x77: { int64_t ab = popLong(); double a; std::memcpy(&a, &ab, 8); a = -a; int64_t r; std::memcpy(&r, &a, 8); pushLong(r); break; }
+        case 0x77: L_77: { int64_t ab = popLong(); double a; std::memcpy(&a, &ab, 8); a = -a; int64_t r; std::memcpy(&r, &a, 8); pushLong(r); NEXT(); }
 
         // jsr/ret (finally compilé par les vieux javac, cible <= 1.4) : l'adresse de retour est un int.
         case 0xa8:
@@ -954,75 +1147,75 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             break;
         }
 
-        case 0x60: { int b = popInt(); int a = popInt(); pushInt(a + b); break; }
-        case 0x64: { int b = popInt(); int a = popInt(); pushInt(a - b); break; }
-        case 0x68: { int b = popInt(); int a = popInt(); pushInt(a * b); break; }
-        case 0x6c: { int b = popInt(); int a = popInt(); if (b == 0) { okResult = false; done = true; } else pushInt(a / b); break; }
-        case 0x70: { int b = popInt(); int a = popInt(); if (b == 0) { okResult = false; done = true; } else pushInt(a % b); break; }
-        case 0x74: { int a = popInt(); pushInt(-a); break; }
-        case 0x78: { int b = popInt(); int a = popInt(); pushInt(a << (b & 31)); break; }
-        case 0x7a: { int b = popInt(); int a = popInt(); pushInt(a >> (b & 31)); break; }
-        case 0x7c: { int b = popInt(); int a = popInt(); pushInt(static_cast<int>(static_cast<uint32_t>(a) >> (b & 31))); break; }
-        case 0x7e: { int b = popInt(); int a = popInt(); pushInt(a & b); break; }
-        case 0x80: { int b = popInt(); int a = popInt(); pushInt(a | b); break; }
-        case 0x82: { int b = popInt(); int a = popInt(); pushInt(a ^ b); break; }
-        case 0x84:
+        case 0x60: L_60: { int b = popInt(); int a = popInt(); pushInt(a + b); NEXT(); }
+        case 0x64: L_64: { int b = popInt(); int a = popInt(); pushInt(a - b); NEXT(); }
+        case 0x68: L_68: { int b = popInt(); int a = popInt(); pushInt(a * b); NEXT(); }
+        case 0x6c: L_6c: { int b = popInt(); int a = popInt(); if (b == 0) { okResult = false; done = true; } else pushInt(a / b); NEXT(); }
+        case 0x70: L_70: { int b = popInt(); int a = popInt(); if (b == 0) { okResult = false; done = true; } else pushInt(a % b); NEXT(); }
+        case 0x74: L_74: { int a = popInt(); pushInt(-a); NEXT(); }
+        case 0x78: L_78: { int b = popInt(); int a = popInt(); pushInt(a << (b & 31)); NEXT(); }
+        case 0x7a: L_7a: { int b = popInt(); int a = popInt(); pushInt(a >> (b & 31)); NEXT(); }
+        case 0x7c: L_7c: { int b = popInt(); int a = popInt(); pushInt(static_cast<int>(static_cast<uint32_t>(a) >> (b & 31))); NEXT(); }
+        case 0x7e: L_7e: { int b = popInt(); int a = popInt(); pushInt(a & b); NEXT(); }
+        case 0x80: L_80: { int b = popInt(); int a = popInt(); pushInt(a | b); NEXT(); }
+        case 0x82: L_82: { int b = popInt(); int a = popInt(); pushInt(a ^ b); NEXT(); }
+        case 0x84: L_84:
         {
             uint8_t idx = rb(c, pc);
             int8_t cst = static_cast<int8_t>(rb(c, pc));
             lv[idx].i += cst;
-            break;
+            NEXT();
         }
 
-        case 0x85: { pushLong(popInt()); break; }
-        case 0x86: { Value v; v.f = static_cast<float>(popInt()); push(v, 1); break; }
-        case 0x87: { double d = popInt(); int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); break; }
-        case 0x88: { pushInt(static_cast<int32_t>(popLong())); break; }
-        case 0x89: { Value v; v.f = static_cast<float>(popLong()); push(v, 1); break; }
-        case 0x8a: { double d = static_cast<double>(popLong()); int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); break; }
-        case 0x8b: { int32_t a = popInt(); Value v; v.f = *reinterpret_cast<float *>(&a); pushInt(static_cast<int32_t>(v.f)); break; }
-        case 0x8c: { int32_t a = popInt(); float v = *reinterpret_cast<float *>(&a); pushLong(static_cast<int64_t>(v)); break; }
-        case 0x8d: { int32_t a = popInt(); float v = *reinterpret_cast<float *>(&a); double d = v; int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); break; }
-        case 0x8e: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); pushInt(static_cast<int32_t>(d)); break; }
-        case 0x8f: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); pushLong(static_cast<int64_t>(d)); break; }
-        case 0x90: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); Value v; v.f = static_cast<float>(d); push(v, 1); break; }
-        case 0x91: pushInt(static_cast<int8_t>(popInt())); break;
-        case 0x92: pushInt(static_cast<uint16_t>(popInt())); break;
-        case 0x93: pushInt(static_cast<int16_t>(popInt())); break;
+        case 0x85: L_85: { pushLong(popInt()); NEXT(); }
+        case 0x86: L_86: { Value v; v.f = static_cast<float>(popInt()); push(v, 1); NEXT(); }
+        case 0x87: L_87: { double d = popInt(); int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); NEXT(); }
+        case 0x88: L_88: { pushInt(static_cast<int32_t>(popLong())); NEXT(); }
+        case 0x89: L_89: { Value v; v.f = static_cast<float>(popLong()); push(v, 1); NEXT(); }
+        case 0x8a: L_8a: { double d = static_cast<double>(popLong()); int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); NEXT(); }
+        case 0x8b: L_8b: { int32_t a = popInt(); Value v; v.f = *reinterpret_cast<float *>(&a); pushInt(static_cast<int32_t>(v.f)); NEXT(); }
+        case 0x8c: L_8c: { int32_t a = popInt(); float v = *reinterpret_cast<float *>(&a); pushLong(static_cast<int64_t>(v)); NEXT(); }
+        case 0x8d: L_8d: { int32_t a = popInt(); float v = *reinterpret_cast<float *>(&a); double d = v; int64_t bits; std::memcpy(&bits, &d, 8); pushLong(bits); NEXT(); }
+        case 0x8e: L_8e: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); pushInt(static_cast<int32_t>(d)); NEXT(); }
+        case 0x8f: L_8f: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); pushLong(static_cast<int64_t>(d)); NEXT(); }
+        case 0x90: L_90: { int64_t a = popLong(); double d; std::memcpy(&d, &a, 8); Value v; v.f = static_cast<float>(d); push(v, 1); NEXT(); }
+        case 0x91: L_91: pushInt(static_cast<int8_t>(popInt())); NEXT();
+        case 0x92: L_92: pushInt(static_cast<uint16_t>(popInt())); NEXT();
+        case 0x93: L_93: pushInt(static_cast<int16_t>(popInt())); NEXT();
 
-        case 0x61: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a + b); break; }
-        case 0x65: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a - b); break; }
-        case 0x69: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a * b); break; }
-        case 0x6d: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a / b); break; }
-        case 0x71: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a % b); break; }
-        case 0x75: { pushLong(-popLong()); break; }
-        case 0x79: { int b = popInt(); int64_t a = popLong(); pushLong(a << (b & 63)); break; }
-        case 0x7b: { int b = popInt(); int64_t a = popLong(); pushLong(a >> (b & 63)); break; }
-        case 0x7d: { int b = popInt(); int64_t a = popLong(); pushLong(static_cast<int64_t>(static_cast<uint64_t>(a) >> (b & 63))); break; }
-        case 0x7f: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a & b); break; }
-        case 0x81: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a | b); break; }
-        case 0x83: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a ^ b); break; }
+        case 0x61: L_61: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a + b); NEXT(); }
+        case 0x65: L_65: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a - b); NEXT(); }
+        case 0x69: L_69: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a * b); NEXT(); }
+        case 0x6d: L_6d: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a / b); NEXT(); }
+        case 0x71: L_71: { int64_t b = popLong(); int64_t a = popLong(); if (b == 0) { okResult = false; done = true; } else pushLong(a % b); NEXT(); }
+        case 0x75: L_75: { pushLong(-popLong()); NEXT(); }
+        case 0x79: L_79: { int b = popInt(); int64_t a = popLong(); pushLong(a << (b & 63)); NEXT(); }
+        case 0x7b: L_7b: { int b = popInt(); int64_t a = popLong(); pushLong(a >> (b & 63)); NEXT(); }
+        case 0x7d: L_7d: { int b = popInt(); int64_t a = popLong(); pushLong(static_cast<int64_t>(static_cast<uint64_t>(a) >> (b & 63))); NEXT(); }
+        case 0x7f: L_7f: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a & b); NEXT(); }
+        case 0x81: L_81: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a | b); NEXT(); }
+        case 0x83: L_83: { int64_t b = popLong(); int64_t a = popLong(); pushLong(a ^ b); NEXT(); }
 
-        case 0x94: { int64_t b = popLong(); int64_t a = popLong(); pushInt(a < b ? -1 : (a > b ? 1 : 0)); break; }
-        case 0x95: case 0x96:
+        case 0x94: L_94: { int64_t b = popLong(); int64_t a = popLong(); pushInt(a < b ? -1 : (a > b ? 1 : 0)); NEXT(); }
+        case 0x95: case 0x96: L_95:
         {
             int32_t bbits = popInt(); int32_t abits = popInt();
             float b = *reinterpret_cast<float *>(&bbits);
             float a = *reinterpret_cast<float *>(&abits);
             int r = (std::isnan(a) || std::isnan(b)) ? (op == 0x95 ? -1 : 1) : (a < b ? -1 : (a > b ? 1 : 0));
             pushInt(r);
-            break;
+            NEXT();
         }
-        case 0x97: case 0x98:
+        case 0x97: case 0x98: L_97:
         {
             int64_t bb = popLong(); int64_t ab = popLong();
             double a, b; std::memcpy(&a, &ab, 8); std::memcpy(&b, &bb, 8);
             int r = (std::isnan(a) || std::isnan(b)) ? (op == 0x97 ? -1 : 1) : (a < b ? -1 : (a > b ? 1 : 0));
             pushInt(r);
-            break;
+            NEXT();
         }
 
-        case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e:
+        case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: L_99:
         {
             int16_t off = rb16(c, pc);
             int v = popInt();
@@ -1034,9 +1227,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             case 0x9d: t = (v > 0); break; default: t = (v <= 0); break;
             }
             if (t) pc = (pc - 3) + off;
-            break;
+            NEXT();
         }
-        case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:
+        case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: L_9f:
         {
             int16_t off = rb16(c, pc);
             int b = popInt(), a = popInt();
@@ -1048,33 +1241,33 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             case 0xa3: t = (a > b); break; default: t = (a <= b); break;
             }
             if (t) pc = (pc - 3) + off;
-            break;
+            NEXT();
         }
-        case 0xa5: case 0xa6:
+        case 0xa5: case 0xa6: L_a5:
         {
             int16_t off = rb16(c, pc);
             Obj *b = popRef(); Obj *a = popRef();
             if ((op == 0xa5 ? (a == b) : (a != b))) pc = (pc - 3) + off;
-            break;
+            NEXT();
         }
-        case 0xc6: case 0xc7:
+        case 0xc6: case 0xc7: L_c6:
         {
             int16_t off = rb16(c, pc);
             Obj *a = popRef();
             if ((op == 0xc6 ? (a == nullptr) : (a != nullptr))) pc = (pc - 3) + off;
-            break;
+            NEXT();
         }
-        case 0xa7:
+        case 0xa7: L_a7:
         {
             int16_t off = rb16(c, pc);
             pc = (pc - 3) + off;
-            break;
+            NEXT();
         }
-        case 0xc8:
+        case 0xc8: L_c8:
         {
             int32_t off = rb32(c, pc);
             pc = (pc - 5) + off;
-            break;
+            NEXT();
         }
         case 0xaa:
         {
@@ -1166,7 +1359,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         case 0xb0: { resultVal = pop(); done = true; break; }
         case 0xb1: { resultVal = Value(); done = true; break; }
 
-        case 0xb2: case 0xb3:
+        case 0xb2: case 0xb3: L_b2:
         {
             uint16_t idx = rbu16(c, pc);
             ClassInfo *tc = nullptr;
@@ -1237,9 +1430,9 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 Value v = (w == 2) ? Value::fromLong(popLong()) : pop();
                 owner->statics[f->slot] = v;
             }
-            break;
+            NEXT();
         }
-        case 0xb4: case 0xb5:
+        case 0xb4: case 0xb5: L_b4:
         {
             uint16_t idx = rbu16(c, pc);
             // Cache de résolution (cf. ClassInfo::fieldRefCache) : évite de
@@ -1308,10 +1501,10 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             }
             if (w == 2) pushLong(o->cells[ff->slot].l);
             else push(o->cells[ff->slot], 1);
-            break;
+            NEXT();
         }
 
-        case 0xb6: case 0xb7: case 0xb8: case 0xb9:
+        case 0xb6: case 0xb7: case 0xb8: case 0xb9: L_b6:
         {
             int opcodePc = pc - 1;
             uint16_t idx = rbu16(c, pc);
@@ -1376,7 +1569,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 if (e.staticM)
                 {
                     ClassInfo *owner = e.staticM->owner;
-                    ok = ensureInit(owner) && dispatch(owner, e.staticM, nullptr, &st[sp - nslots], nslots, mres);
+                    ok = (owner->clinitDone || ensureInit(owner)) && dispatch(owner, e.staticM, nullptr, &st[sp - nslots], nslots, mres);
                 }
                 else
                     ok = stubMissing(tc, mname, mdesc, mres);
@@ -1417,7 +1610,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                     else if (rc)
                     {
                         const MethodRecord *vm_ = rc->findMethodVirtual(mname, mdesc);
-                        if (vm_ && ensureInit(rc))
+                        if (vm_ && (rc->clinitDone || ensureInit(rc)))
                         {
                             e.lastRecv = rc;
                             e.lastM = vm_;
@@ -1472,29 +1665,40 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                             cls->name.c_str(), m->name.c_str(), pc);
                 okResult = false; done = true;
             }
-            break;
+            NEXT();
         }
 
-        case 0xbb:
+        case 0xbb: L_bb:
         {
             uint16_t idx = rbu16(c, pc);
-            std::string classRef = cp.getClassName(idx);
-            ClassInfo *tc = rt_->classInfoOfName(classRef);
-            if (!tc && rt_->jar()) tc = rt_->loadFromJar(classRef);
-            if (!tc) { if (envDebug()) fprintf(stderr, "new: class %s introuvable\n", classRef.c_str()); okResult = false; done = true; break; }
-            if (!ensureInit(tc)) { if (envDebug()) fprintf(stderr, "new: ensureInit echec pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
+            ClassInfo::ClassRefEntry &cre = classRef(idx);
+            const std::string &classRefName = cre.name;
+            ClassInfo *tc = cre.tc;
+            if (!tc)
+            {
+                tc = rt_->classInfoOfName(classRefName);
+                if (!tc && rt_->jar()) tc = rt_->loadFromJar(classRefName);
+                if (!tc) { if (envDebug()) fprintf(stderr, "new: class %s introuvable\n", classRefName.c_str()); okResult = false; done = true; break; }
+                cre.tc = tc;
+            }
+            if (!tc->clinitDone && !ensureInit(tc)) { if (envDebug()) fprintf(stderr, "new: ensureInit echec pour %s\n", classRefName.c_str()); okResult = false; done = true; break; }
             Obj *o = rt_->heap().newInstance(tc);
-            if (!o) { rt_->reportOom(); if (envDebug()) fprintf(stderr, "new: OOM pour %s\n", classRef.c_str()); okResult = false; done = true; break; }
+            if (!o) { rt_->reportOom(); if (envDebug()) fprintf(stderr, "new: OOM pour %s\n", classRefName.c_str()); okResult = false; done = true; break; }
             pushRef(o);
-            break;
+            NEXT();
         }
-        case 0xbc:
+        case 0xbc: L_bc:
         {
             uint8_t atype = rb(c, pc);
             int count = popInt();
-            if (envDebug() && count < 0)
-                fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
-                        count, atype, cls->name.c_str(), m->name.c_str());
+            if (count < 0)
+            {
+                if (envDebug())
+                    fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
+                            count, atype, cls->name.c_str(), m->name.c_str());
+                if (raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 2)) NEXT();
+                okResult = false; done = true; break;
+            }
             ObjKind k;
             switch (atype)
             {
@@ -1511,29 +1715,37 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             Obj *a = rt_->heap().newArray(k, count);
             if (!a) { rt_->reportOom(); okResult = false; done = true; break; }
             pushRef(a);
-            break;
+            NEXT();
         }
-        case 0xbd:
+        case 0xbd: L_bd:
         {
             rbu16(c, pc);
             int count = popInt();
+            if (count < 0)
+            {
+                if (raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 3)) NEXT();
+                okResult = false; done = true; break;
+            }
             Obj *a = rt_->heap().newArray(ObjKind::ObjArray, count);
             if (!a) { rt_->reportOom(); okResult = false; done = true; break; }
             pushRef(a);
-            break;
+            NEXT();
         }
-        case 0xc0: case 0xc1:
+        case 0xc0: case 0xc1: L_c0:
         {
             uint16_t idx = rbu16(c, pc);
-            std::string classRef = cp.getClassName(idx);
+            ClassInfo::ClassRefEntry &cre = classRef(idx);
+            const std::string &classRefName = cre.name;
             Obj *o = (sp >= 1) ? st[sp - 1].o : nullptr;
             bool is = false;
-            if (o && !classRef.empty() && classRef[0] == '[')
+            if (o && o->kind == ObjKind::Instance && cre.lastCls == o->cls && cre.lastCls)
+                is = cre.lastIs; // même type de receveur que la fois précédente : résultat mémorisé
+            else if (o && cre.isArray)
             {
                 // Cast/instanceof vers un type tableau (ex. "[I", "[[B") :
                 // pas de ClassInfo pour ces descripteurs, on compare le ObjKind.
-                size_t p = classRef.find_first_not_of('[');
-                char base = (p != std::string::npos) ? classRef[p] : 'I';
+                size_t p = classRefName.find_first_not_of('[');
+                char base = (p != std::string::npos) ? classRefName[p] : 'I';
                 if (p >= 2)
                     is = (o->kind == ObjKind::ObjArray);
                 else
@@ -1545,23 +1757,24 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 // pas forcément déjà chargée (chargement paresseux) -- l'ancien code répondait « oui » à
                 // tout `instanceof` dont la cible n'était pas encore chargée (bug d'aliasing sur des
                 // hiérarchies obfusquées : `o instanceof k` vrai pour un `o` pur, puis champ introuvable).
-                if (classRef == "java/lang/Object")
+                if (classRefName == "java/lang/Object")
                     is = true;
                 else if (o->kind == ObjKind::Instance)
-                    is = classIsA(rt_, o->cls, classRef);
+                    is = classIsA(rt_, o->cls, classRefName);
                 else if (o->kind == ObjKind::String)
-                    is = (classRef == "java/lang/String" || classRef == "java/lang/CharSequence" || classRef == "java/lang/Comparable");
+                    is = (classRefName == "java/lang/String" || classRefName == "java/lang/CharSequence" || classRefName == "java/lang/Comparable");
                 else if (o->kind == ObjKind::Class)
-                    is = (classRef == "java/lang/Class");
+                    is = (classRefName == "java/lang/Class");
                 if (!is && op == 0xc0 && o->kind == ObjKind::Instance)
                 {
                     // checkcast vers un type introuvable (interface native non déclarée, classe absente
                     // du JAR) : permissif comme avant plutôt que d'avorter l'appel.
-                    ClassInfo *tc = rt_->classInfoOfName(classRef);
-                    if (!tc) tc = loadClassCached(rt_, classRef);
+                    ClassInfo *tc = rt_->classInfoOfName(classRefName);
+                    if (!tc) tc = loadClassCached(rt_, classRefName);
                     if (!tc) is = true;
                 }
             }
+            if (o && o->kind == ObjKind::Instance) { cre.lastCls = o->cls; cre.lastIs = is; }
             if (op == 0xc1)
                 st[sp - 1].i = is ? 1 : 0;
             else if (o && !is)
@@ -1569,15 +1782,15 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 if (envDebug())
                 {
                     fprintf(stderr, "JVM: checkcast fail vers %s (objet kind=%d cls=%s len=%d ref=%p) in %s.%s pc=%d sp=%d\n",
-                            classRef.c_str(), (int)o->kind,
+                            classRefName.c_str(), (int)o->kind,
                             o->cls ? o->cls->name.c_str() : "-",
                             o->arrayLen, (void *)o, cls->name.c_str(), m->name.c_str(), pc, sp);
                 }
                 okResult = false; done = true;
             }
-            break;
+            NEXT();
         }
-        case 0xbe:
+        case 0xbe: L_be:
         {
             Obj *a = popRef();
             if (!a)
@@ -1587,7 +1800,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
                 okResult = false; done = true;
             }
             else pushInt(a->arrayLen);
-            break;
+            NEXT();
         }
         case 0xbf:
         {
@@ -1608,7 +1821,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             okResult = false; done = true;
             break;
         }
-        case 0xc2: case 0xc3:
+        case 0xc2: case 0xc3: L_c2:
         {
             // monitorenter/monitorexit : pas de moniteur réel, mais JVMS les
             // fait POINTER l'objectref de la pile d'opérandes. Un no-op sans
@@ -1618,7 +1831,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             // le garde-fou d'overflow fixes then pc = codeLen, le run() était
             // tué silencieusement).
             if (sp >= 1) st[--sp].o = nullptr;
-            break;
+            NEXT();
         }
 
         case 0xc4: // wide
@@ -1644,6 +1857,18 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             std::vector<int32_t> sizes(dims);
             for (int i = dims - 1; i >= 0; i--)
                 sizes[i] = popInt();
+            bool negSize = false;
+            for (int32_t sz : sizes)
+                if (sz < 0) { negSize = true; break; }
+            if (negSize)
+            {
+                if (!raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 4))
+                {
+                    okResult = false;
+                    done = true;
+                }
+                break;
+            }
             std::string arrDesc = cp.getClassName(clsIdx); // ex: "[[I", "[[Ljava/lang/String;"
             size_t brackets = arrDesc.find_first_not_of('[');
             char baseChar = (brackets != std::string::npos) ? arrDesc[brackets] : 'I';
@@ -1678,6 +1903,7 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         }
     }
     frameFree(mark);
+    if (g_profOn) { g_profCls = profPrevCls; g_profM = profPrevM; }
     return okResult;
 }
 

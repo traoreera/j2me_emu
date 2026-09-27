@@ -57,7 +57,7 @@ Useful env vars (read in `src/app/main.cpp`):
 - `JME_AUTOKEY=5|0|*|#|FIRE|SOFT1|SOFT2|LEFT|RIGHT|UP|DOWN` — hold a key from frame 0 (for scripted smoke tests)
 - `JME_AUTOKEYFRAME=n` — with `JME_AUTOKEY`: send a one-frame tap of that key on frame n instead of holding from 0 (to interact once the game has reached a given state).
 - `JME_DUMP=path.ppm` — dump the final framebuffer as a PPM image on exit
-- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`. Some Gameloft titles instead require **landscape** (`width > height`) and print a static, non-interactive "please switch to landscape mode" screen at the default portrait 240x320 — not a bug, no key does anything on that screen because it isn't a menu. Example: `games/assasin.jar` (Assassin's Creed 2) needs `JME_WIDTH=800 JME_HEIGHT=480` to reach real, navigable UI. `games/gangstar_rio_city_o_260851.jar` is a **480x800 portrait** build (`JME_WIDTH=480 JME_HEIGHT=800`): at other sizes it still runs but lays its Gameloft splash out for a 480-wide screen (three image tiles at absolute coordinates, so the logo appears cropped in a corner at 240x320). It runs its whole loading sequence and shows the Gameloft logo, then loads ~140 resources (`a.c(I)[B` level unpack, ~100 s of CPU at a fixed 100 M-instruction budget) and reaches its main-menu state (state 3: `paint()` -> `s(2)` -> `aA()` touch hit-tests on the menu rects) — but from there `paint()` issues **no draw call at all**, so the screen stays on the last logo frame. Root cause not found (the menu-draw branch of state 3 is gated by game flags we haven't identified; the old `paint() -> NullPointerException` at frame ~5 is a benign first-paint race, not the cause). Not playable yet.
+- `JME_WIDTH=n` / `JME_HEIGHT=n` — override the emulated screen resolution (default 240x320, matching the RP2040 target). Some MIDlets hardcode a `getWidth()`/`getHeight()` check against a specific device resolution (e.g. 800x480 WVGA feature phones) and refuse to render on a mismatch — use these to match the JAR's expected profile for testing. Example: `games/jump.jar` requires `width∈[150,250]` and `height∈[170,250]` (throws and falls back to an error `Alert` outside that range) — run it with `JME_WIDTH=176 JME_HEIGHT=220`. Some Gameloft titles instead require **landscape** (`width > height`) and print a static, non-interactive "please switch to landscape mode" screen at the default portrait 240x320 — not a bug, no key does anything on that screen because it isn't a menu. Example: `games/assasin.jar` (Assassin's Creed 2) needs `JME_WIDTH=800 JME_HEIGHT=480` to reach real, navigable UI. `games/gangstar_rio_city_o_260851.jar` is a **480x800 portrait** build (`JME_WIDTH=480 JME_HEIGHT=800`): at other sizes it still runs but lays its Gameloft splash out for a 480-wide screen (three image tiles at absolute coordinates, so the logo appears cropped in a corner at 240x320). It runs its whole loading sequence and shows the Gameloft logo, then loads ~140 resources (`a.c(I)[B` level unpack, ~100 s of CPU at a fixed 100 M-instruction budget) and reaches its main-menu state (state 3: `paint()` -> `s(2)` -> `aA()` touch hit-tests on the menu rects) — but from there `paint()` issues **no draw call at all**, so the screen stays on the last logo frame. **Now works** (since `Canvas.showNotify()` is called — the game only draws once its canvas has been notified as shown): "Do you want sound?" → main menu (Instant Play / New Game / Options), reached after ~2500 frames at `JME_FRAME_TIME=33`.
 - `JME_RMS=0` / `JME_RMSDIR=path` — `RecordStore` est **persistant** par défaut : un fichier par magasin dans `<jeu>.rms/` à côté du `.jar` (format : `u32 nbRecords`, puis `u32 taille + octets` par enregistrement, little-endian ; réécrit à chaque `addRecord`/`setRecord`, supprimé par `deleteRecordStore`). `JME_RMS=0` reste purement en mémoire (runs reproductibles) ; `JME_RMSDIR` change le dossier. Un fichier corrompu/tronqué est ignoré (magasin vide), jamais fatal.
 - `JME_FRAME_TIME=ms` — durée **virtuelle** d'une trame en millisecondes (défaut 16), pas de temps réel. Une valeur ≥ 1000 est convertie de µs en ms avec un avertissement : `JME_FRAME_TIME=33333` avait pour effet de faire avancer l'horloge du jeu de 33 *secondes* par trame, ce qui figeait le dialogue "Sound Set" d'Assassin's Creed 2 (touches et clics ignorés — les minuteries du jeu débordaient).
 - `JME_TRACEM=Classe.methode` (ou `*`) — trace générique des appels d'une méthode bytecode : arguments (8 premiers) et valeur retournée. `JME_AUTOTOUCH=x,y` + `JME_AUTOTOUCHFRAME=n` — clic simulé (appui à n, relâchement à n+3).
@@ -733,3 +733,195 @@ Jeux de test supplémentaires : `games/os2_*.jar` (19 JAR publiés par leurs aut
 - **`pop2` ne retirait qu'un slot** quand le sommet n'était pas un long/double : `pop2` sur deux `int` (motif `dup2_x1; pop2; iastore` de Yet Another Snake) perdait le tableau visé → NPE. Test de régression `interpreter_pop2_pops_two_slots_for_ints_and_one_long`.
 - **`Class.getResourceAsStream("images/x.png")` sans `/` initial est relatif au paquetage de la classe** (2048 : `game2048/scene/images/logo.png`). On essaie le chemin de paquetage puis la racine du JAR (indulgence).
 - **`midp::tick()` itère sur une COPIE de la liste des threads** : un `Thread.start()` fait pendant `run()`/`showNotify()` invalidait les itérateurs (plantage dans `tick`).
+
+## Cadence et horloge du jeu (session du 26/09, « saccades, tantôt rapide tantôt lent »)
+
+Cause : `Thread.sleep(ms)` ignorait `ms` (une trame par itération) et l'horloge du jeu avançait de 16 ms fixes par trame de 33 ms réelles. Les jeux rythmés par `sleep` tournaient trop vite, ceux rythmés par `currentTimeMillis` deux fois trop lentement, et toute trame lente ralentissait tout.
+- **Horloge du jeu = temps RÉEL** (`midp::tick`, µs, `virtualMicros()`), bornée à 100 ms par trame. `JME_FRAME_TIME=ms` garde un pas FIXE déterministe (CI, comparaisons pixel-à-pixel : à poser pour les tests).
+- **`Thread.sleep(ms)` / `Object.wait(ms)` honorés** (`sleepFiber`, `SchedState` dans `natives.cpp`) : ordonnanceur par événements (`jme_schedNext`), un thread endormi est repris à son instant exact dans la trame (max 6 reprises/trame). `notify` réveille un `wait(ms)`. Plancher `JME_MIN_SLEEP` (défaut 33 ms) : les `sleep(5)` des jeux réglés pour des téléphones lents ne les font pas tourner 6x trop vite. `JME_SLEEP=frame` = ancien comportement (vérifié pixel-identique sur 50 jeux).
+- **`flushGraphics()`** (`jme_flushYield`) : cède la main avec ≥ 33 ms entre deux flush, sauf si la boucle dort déjà entre deux flush.
+- **Cadence de la boucle principale** : 16 ms (~60 trames/s) ; si le vsync est actif (`display_vsync_active()`), aucune attente ajoutée (elle donnait 33/50 ms en alternance). `JME_FRAME_BUDGET` force une période.
+- Outils : `JME_RENDER_STATS=1` (durées de trame p50/p95/max, trames lentes), `JME_PROFILE=1` (profil d'échantillonnage des méthodes Java), `JME_SLEEPDBG=1` (sleeps/s en temps de jeu vs réel). Les mesures de temps sont très bruitées si le PC est chargé (VS Code, navigateur).
+
+## Vitesse de l'interpréteur (session du 26/09, 2 à 4x plus rapide)
+
+Mesuré sur `prince_of_persia_th` (100 trames, budget d'instructions fixe, temps CPU utilisateur) : 2,7 s → ~1,0 s. Sortie **pixel-identique sur les 50 jeux**. Les gains, par ordre d'importance :
+- **Natives : clé string + hachage à chaque appel.** `dispatch()` construisait `"classe.méthode:desc"` (3 concaténations) et cherchait dans la table à CHAQUE appel natif (~25 M fois en 150 trames). La fonction résolue est maintenant mémorisée dans `MethodRecord::nativeFn` (pointeur stable vers le nœud de la table, `findNativePtr`). Vaut aussi pour les natives enregistrées après coup : toutes le sont avant la première exécution.
+- **Caches par index de pool** (`ClassInfo::classRefCache`, `ldcCache`) : `new`, `checkcast`, `instanceof` (dernier type de receveur → résultat mémorisé) et `ldc` String ne refont plus de `std::string` par valeur + recherche par nom à chaque exécution.
+- `execBytecode` ne remet plus à zéro la pile d'opérandes (seulement les locales) ; `ensureInit` n'est plus appelé quand `clinitDone` (invokestatic/invokevirtual/new).
+- **Dispatch « threaded »** (`NEXT()` + table `jt`, GCC labels-as-values) : ~114 blocs d'opcodes fréquents se terminent par un saut indirect direct au lieu de repasser par le `switch` central. Gain modeste (~4 %) : le vrai coût est réparti (push/pop avec vérification de bornes, appels). Les opcodes non listés (retours, athrow, wide, switch…) reviennent au `switch` classique via `do_switch`. Ajouter un opcode : mettre `NEXT();` à la place du `break;` final de son `case` et l'ajouter à la table (`jt`).
+- **Profilage** : `JME_PROFILE=1` (méthodes Java) ; `JME_PROFILE=rip` (adresses d'instruction C++, à traduire avec `addr2line -f -C -e binaire` sur un binaire `-g -no-pie`). Les mesures CPU sont bruitées quand le PC est chargé : comparer des binaires A/B **entrelacés**, minimum de plusieurs passes.
+- Reste (si besoin de plus) : vérifications de bornes dans `push`/`pop`, budget d'instructions gardé en registre, superinstructions (iload+getfield…), tableaux d'octets stockés en `Value` de 8 octets.
+
+## Jeux qui ne marchaient pas et marchent maintenant (27/09)
+
+- **Gangstar Rio** (`gangstar_rio_city_o_260851.jar`) : « Do you want sound? » → menu → **Instant Play jouable** (HUD, minicarte, joystick tactile). La cause du menu jamais dessiné était `Canvas.showNotify()` jamais appelé (voir plus haut). Séquence de test (rotation 90° : coordonnées du framebuffer 480x800) : `JME_FRAME_TIME=33 JME_AUTOTOUCHES="99,320,1300;99,320,1500;99,320,1700;99,320,1900;99,320,2100;239,250,2700;239,250,2900" JME_MAXFRAMES=4500` (~5 min de CPU, la majorité pour décompresser les niveaux).
+- **`GameCanvas(boolean suppressKeyEvents)`** rangeait son argument dans `GC_FULLSCREEN` : tout `GameCanvas(true)` perdait sa barre de commandes (SnakeWar : écran d'accueil sans moyen d'ouvrir le menu, touche programmable gauche = « Menu »). L'argument n'est plus utilisé pour le plein écran.
+- Gangstar 2 (menu + « Do you want sound? »), SnakeWar (formulaire de configuration), BluWar, 2048, Yas : jouables. `checkers.jar` : JAR incomplet (`images/blackCrown.png` absent), l'`IOException` est légitime.
+- **`nmania` n'était PAS bloqué par `FileConnection`** (correction de la note précédente) : il était juste
+  impossible à faire avancer en headless au-delà de l'écran « What's your name? » (aucun outil pour taper
+  du texte dans un `TextField`/`TextBox` scripté). `JME_AUTOTEXT="texte"` + `JME_AUTOTEXTFRAME=n`
+  (`src/app/main.cpp`) injectent le texte comme si tapé au clavier (`midp::setTextInput`) à la trame `n` — le
+  jeu atteint ensuite son menu principal (Play solo/Skinning/About). Au-delà, il essaie bien de scanner un
+  dossier réel (`Connector.open("file://...")`, `javax.microedition.io.file.FileConnection`, non émulé) pour
+  lister ses chansons/charts — mais le gère PROPREMENT : `ConnectionNotFoundException` est rattrapée et
+  affiche un écran « Failed to load charts! ... Visit settings section... », pas un plantage. Émuler
+  `FileConnection` (lister un vrai dossier de morceaux) resterait à faire si on veut du contenu jouable, mais
+  ce n'est plus un blocage silencieux.
+- Restent : AC III (texte thaï), texte hors Latin-1 (affiché « ? »), pas de GC.
+
+## `newarray`/`anewarray`/`multianewarray` avec une taille NÉGATIVE (27/09)
+
+`newarray`/`anewarray` passaient une taille d'array **négative** directement à `Heap::newArray` sans passer
+par la spec JVM (`NegativeArraySizeException`) : le `int32_t` négatif, réinterprété comme taille, déclenchait
+une tentative d'allocation énorme (gaspille/épuise le tas en essayant de grossir avant d'échouer), PUIS
+échouait « en dur » (`okResult=false`) sans jamais passer par le `catch` de l'appelant — alors que du vrai
+bytecode Java gère couramment ce cas (`try { ... new int[n] ...} catch (NegativeArraySizeException e) {}`)
+pour une taille calculée à partir d'une ressource corrompue/tronquée. Trouvé sur
+`games/ferrari_world_champi_137653_2195.jar` : `CAR.pak` (254 octets, visiblement un modèle de voiture
+tronqué/factice) fait calculer une taille négative, et le jeu s'arrêtait au splash au lieu d'atteindre son
+écran « Enable Sound? ». Corrigé dans `interpreter.cpp` (0xbc/0xbd/0xc5) : une taille négative (n'importe
+laquelle des dimensions pour 0xc5) lève maintenant une vraie `NegativeArraySizeException` via `raiseJava`,
+rattrapable. Test de régression :
+`interpreter_newarray_negative_size_throws_catchable_exception`.
+
+## `JME_AUTOTEXT`/`JME_AUTOTEXTFRAME` (27/09)
+
+`JME_AUTOTEXT="texte"` + `JME_AUTOTEXTFRAME=n` (`src/app/main.cpp`) injectent du texte tapé (comme
+`SDL_TEXTINPUT`, via `midp::setTextInput`) à la trame `n` : permet de traverser en headless les écrans de
+saisie (nom de joueur...) qu'aucun softkey/clic scripté ne peut remplir. Sans effet quand la variable est
+absente (comportement inchangé sur les 50 jeux de test).
+
+## Ramasse-miettes (session du 27/09) — marquage-balayage conservateur, sans compaction
+
+Le tas était un allocateur bump PUR : `reset()` (jamais appelé par l'app réelle, seulement par les tests)
+était la SEULE récupération. Un GC réel est maintenant en place (`src/core/runtime.h`/`.cpp`, classe `Heap`).
+
+- **Principe** : marquage-balayage NON DÉPLAÇANT (pas de compaction — un `Obj` embarque un `std::string` non
+  relocalisable par `memcpy`, et de très nombreux `Obj*` bruts vivent côté C++ natif : caches lcdui, fibres,
+  threads, sons... les déplacer casserait tout sans réécrire chaque référence). Les objets morts rejoignent
+  une **liste de blocs libres** (premier ajustement, fusion des blocs adjacents à chaque cycle) réutilisée par
+  `allocObj` avant de faire grossir le tas.
+- **Marquage CONSERVATEUR** : les `Value` n'ont pas de tag de type (un `long`/`double` partage le même mot
+  qu'une référence), donc impossible de savoir avec certitude, en regardant une pile Java ou une structure C++
+  native, quels mots sont de VRAIES références. Chaque mot de 8 octets d'une région scannée est testé comme
+  candidat contre `liveSet_` (l'ensemble des adresses d'objets ACTUELLEMENT alloués, reconstruit au début de
+  chaque cycle en parcourant les segments par en-têtes) : un entier qui coïncide par hasard avec une adresse
+  réelle ne fait que le garder vivant un cycle de trop (fuite bénigne) — **jamais** de corruption, puisqu'un
+  mot n'est déréférencé QUE s'il correspond à une entrée de `liveSet_` (l'ordre de la vérification est
+  crucial : membership AVANT tout déréférencement, pas l'inverse — un buggy `Value::fromInt(42)` scanné et
+  interprété comme `Obj* 0x2a` déréférencé en premier plantait immédiatement).
+- **Racines** : piles/locales Java de l'exécution active (`Interpreter::scanActiveFrames`, arène courante),
+  celles de CHAQUE fibre suspendue (`jme_gcScanThreadingRoots`, natives.cpp — la fibre ACTIVE est couverte
+  autrement, voir plus bas), `statics` de chaque classe chargée (`Runtime::forEachClass`), tout ce que retient
+  nativement la couche MIDP (écrans lcdui, caches d'images, sons, minuteries — un `gcMark<Module>Roots` par
+  fichier `midp_*.cpp`, orchestrés par `midp::gcMarkRoots`), et les caches internes du `Heap` lui-même
+  (`internTable_`/`classCache_`, marqués directement dans `collectGarbage()`).
+- **Piège trouvé et corrigé en cours de route (le plus important)** : un handler natif qui alloue un objet, le
+  garde un instant dans une variable C++ **locale** (avant de l'écrire dans un champ/tableau Java), puis
+  alloue ENCORE avant de s'en servir (ex. `img_createWH` : `Obj *buf = newArray(...)` puis d'autres allocations
+  avant que `buf` ne soit rattaché à l'Image) n'exposait cette variable à AUCUNE racine — seul un balayage de
+  la pile C++ elle-même la voit. Sans ça, un cycle GC déclenché par la deuxième allocation pouvait libérer PUIS
+  RÉUTILISER la mémoire du premier objet pendant que le handler s'apprêtait encore à écrire dedans (repéré avec
+  `JME_GC_STRESS=1` : corruption silencieuse du tas, `free(): invalid pointer` ou segfault bien plus tard,
+  loin du vrai site fautif — la signature classique documentée plus haut dans ce fichier pour d'autres bugs).
+  Corrigé en scannant conservativement la pile C++ RÉELLEMENT active (celle de la fibre en cours si une fibre
+  tourne — son `ucontext` a littéralement échangé le registre SP dessus, voir `jme_currentFiberStackTop` — sinon
+  celle du fil principal), mais **bornée à 256 Ko** (`kStackScanWindow`, `src/app/main.cpp`) plutôt que de
+  remonter jusqu'au sommet réel (8 Mo) : une fenêtre trop large contient de vieilles cases de pile ABANDONNÉES
+  par des appels déjà retournés (jamais réécrites depuis) qui gardent le bit à bit d'un ANCIEN `Obj*` — mesuré
+  sur `games/os_pacman.jar`, ça faisait quasiment tout garder vivant pour toujours (0 octet récupéré par
+  cycle) malgré un tas exigu qui finissait quand même par s'épuiser. 256 Ko (des centaines d'appels C++
+  imbriqués, bien plus que la profondeur d'un handler natif) restitue une vraie collecte.
+- **Second piège corrigé** : `allocFromFreeList` découpait un bloc libre trop généreusement — quand le
+  reliquat après découpe était trop petit pour héberger lui-même un en-tête `Obj` valide, il était donné "en
+  plus" à l'objet alloué SANS agrandir sa taille déclarée (`cellCount`) : l'objet occupait alors physiquement
+  plus d'octets que ce que `sizeof(Obj) + cellCount*sizeof(Value)` rapportait, désynchronisant le parcours du
+  tas par en-têtes (le cycle suivant retombait au milieu du reliquat non comptabilisé au lieu du prochain
+  en-tête réel → lecture d'un `std::string` composé d'octets de bourrage → SIGSEGV dans le hachage de la table
+  d'internement). Corrigé : un bloc dont le reliquat serait `> 0` et `< sizeof(Obj)` est simplement IGNORÉ
+  (bloc gardé intact, recherche du suivant) plutôt que de casser l'invariant taille-déclarée == taille-occupée.
+- **Validation** : `JME_GC_STRESS=1` force un cycle GC complet à CHAQUE allocation (le pire cas possible —
+  fait apparaître en quelques trames un marquage incomplet qui, en fonctionnement normal, ne se manifesterait
+  qu'après un long moment de jeu) ; `JME_GC_DEBUG=1` (avec `JME_GC_STRESS`) ajoute des vérifications de bornes
+  (objet/bloc libre qui déborderait de son segment → `abort()` immédiat avec diagnostic, au lieu d'une
+  corruption qui ne se manifeste que bien plus tard). Testé sous stress sur 9 jeux variés (dont Prince of
+  Persia, Assassin's Creed 2, Gangstar 2, Đột Kích) : plus aucun crash après les deux corrections ci-dessus.
+  Sortie **pixel-identique aux 50 jeux de test** en fonctionnement normal (défaut : le GC déclenche rarement
+  sous un tas non plafonné). Efficacité démontrée sous tas plafonné (`JME_HEAP=512 JME_HEAP_MAX=768`, 8000
+  trames) : `games/mission.jar` récupère 80-190 Ko de VRAIES ordures par cycle (StringBuffer/concaténations
+  de score, petits tableaux temporaires...) et tient largement plus longtemps qu'avant. Un jeu dont le tas
+  s'épuise malgré le GC (ex. `prince.jar`, quasi rien à récupérer) a un working-set réellement trop gros pour
+  le plafond — aucun GC ne peut inventer de la mémoire pour de l'état légitimement vivant (images mises en
+  cache, notamment).
+- **`JME_GC=0`** désactive le GC entièrement (comportement d'avant son introduction : le tas ne fait plus
+  jamais que grossir) — filet de sécurité si un jeu se comporte mal après coup.
+- 4 nouveaux tests unitaires (`tests/test_runtime.cpp`) : GC sans racines enregistrées = no-op, récupération +
+  réutilisation d'espace, marquage transitif à travers le graphe d'objets, marquage conservateur retrouvant un
+  pointeur enfoui dans des entiers quelconques.
+
+## Police 5x7 : audit Latin-1 (session du 27/09) — repli « ? » réellement cassé
+
+En auditant la table de la police à la demande de l'utilisateur (rendu de tous les glyphes 0x00-0xFF dans une
+image pour inspection visuelle), deux bugs réels trouvés dans `src/hal/font.cpp` :
+- **Le repli par défaut vers « ? » ne marchait pas** : `init()` faisait `copyOf(c, '?')` pour les 256 octets
+  AVANT de charger la vraie table ASCII (`kAscii`) dans `g_glyph[0x3F]` -- le « ? » copié était donc encore
+  entièrement VIDE à ce moment-là. Tout caractère jamais explicitement composé (toute la plage C1 0x80-0x9F,
+  et en Latin-1 : ¶ 0xB6, ¼ 0xBC, ½ 0xBD, ¾ 0xBE) restait **invisible** au lieu d'afficher « ? » comme
+  documenté et voulu -- pire qu'un caractère inconnu visible : du texte qui semble amputé de certaines
+  lettres. Confirmé concrètement sur `games/os_retrosnake.jar` (menu polonais, « Prędkość » etc. : les ą ę ć
+  ś ż ź ó ł ń polonais sont hors Latin-1/Latin-2 vs la table ici) -- avant : mots à trous ("PrÄ dkoÅ Ä") ;
+  après : "?" visible à la bonne place ("PrÄ?dkoÅ?Ä?"). Corrigé en chargeant `kAscii` AVANT la boucle de
+  repli (qui saute maintenant volontairement 0x20-0x7E pour ne pas écraser l'ASCII qu'elle vient de charger).
+- **¶ (pilcrow) et les fractions ¼ ½ ¾ n'avaient aucun glyphe dédié** (tombaient dans le même bug ci-dessus) :
+  ajoutés (approximations dessinées à la main, dans le style du reste du fichier -- chiffre/barre/chiffre pour
+  les fractions, trop serré à 5 colonnes pour une vraie diagonale). ¸ (cédille isolée, 0xB8) avait le même
+  trou (jamais gérée) : ajoutée sur le même principe que ´/¨ isolés déjà présents (0xB4/0xA8).
+- Le reste de la table (lettres accentuées composées, marques grave/aigu/circonflexe/tréma/tilde/rond/cédille,
+  Ø/ø, Ð/ð, Þ/þ, ß) a été vérifié un par un contre la vraie table ISO-8859-1 : aucune autre erreur de mapping
+  trouvée. Æ/æ (0xC6/0xE6) restent une simple copie de A/a (perte de la ligature, connu, accepté -- 5 colonnes
+  ne permettent pas grand-chose de mieux).
+- Outil de vérification (non versionné, scratchpad) : petit programme qui appelle `hal::font_glyph()` pour
+  0x00-0xFF et dessine une planche PNG -- à refaire si la police est retouchée à nouveau.
+- Sortie **pixel-identique aux 50 jeux de test**, sauf `os2_retrosnake` (l'amélioration ci-dessus, attendue).
+
+## Session « 30 jeux Gameloft/tir culte » (27/09) — DataInputStream.skip(J)J manquant
+
+Jeux de test supplémentaires : `games/os3_*.jar` (30 JAR de titres commerciaux Gameloft/Ubisoft/EA/Glu, tous
+téléchargés depuis dedomil.net -- licences non précisées, usage de test local uniquement, dossier `games/`
+non versionné). Assassin's Creed : les 4 titres Gameloft J2ME existants sont déjà dans le dépôt (II, Brotherhood,
+III, Revelations) ; les autres résultats de recherche pour « Assassin's Creed » (Unity, Identity, Altaïr's
+Chronicles HD) se sont révélés être des jeux Android/Symbian, pas J2ME (aucun lien JAR réel sur le site source,
+ou une image `.sisx` Symbian déguisée en `.jar`). Mission Impossible : un seul titre J2ME existe
+(`Mission Impossible III`, déjà `mission.jar`) — pas de « série » à compléter. Le reste du lot est du tir culte :
+Modern Combat 2/4, N.O.V.A. 3, Duke Nukem Mobile 3D, Doom RPG/Doom II RPG, Terminator Salvation/Revenge,
+Predator: The Duel, Alien vs Predator: Requiem, 4 Splinter Cell, 2 Brothers in Arms, 3 Rainbow Six, 3 Call of
+Duty, 2 Medal of Honor, James Bond: Casino Royale, Delta Force, Far Cry 2, Ghost Recon: Future Soldier, Metal
+Gear Acid, Resident Evil: Degeneration.
+
+- **`DataInputStream.skip(long)` et `.available()` n'étaient jamais enregistrés** (`midp_io.cpp`) :
+  `InputStream.skip(J)J`/`available()` existent bien (`is_skip`/`is_available`), mais `DataInputStream` est un
+  simple ENROBAGE (`cells[0]` = le flux réel) — appeler `skip`/`available` directement dessus (hérités
+  d'`InputStream`, jamais redéclarés dans la sous-classe côté API MIDP réelle, donc du bytecode Java légitime
+  les appelle sur l'instance `DataInputStream`) tombait sur le `[stub]` générique : no-op, renvoie toujours 0.
+  Pour `skip()`, ça désynchronise silencieusement la position de lecture — le flux ne saute PAS les octets que
+  l'appelant croit avoir sautés, donc les lectures suivantes tombent sur les mauvais octets. Trouvé sur
+  `games/os3_call_of_duty_4_modern_warfare.jar` : `Game_COD4.<init>` fait `skip()` sur une ressource avant un
+  `Image.createImage([BII)`, qui échouait alors sur des données mal alignées → **l'instanciation du MIDlet
+  échouait entièrement** (écran noir permanent). Corrigé (`di_skip`/`di_available`, même principe de délégation
+  vers le flux enrobé que `di_skipBytes` déjà existant) : COD4 démarre maintenant directement sur son menu
+  principal (Nouvelle partie/Meilleurs scores/Réglages/Instructions/À propos/Quitter). Effet de bord positif
+  sur `games/gangstar_rio_city_o_260851.jar` : atteint son logo Gameloft nettement plus tôt (même nombre de
+  trames) — son chargement de ressources utilisait aussi ce chemin et n'était plus artificiellement ralenti.
+- Test de fumée sur les 30 : tous produisent un rendu non-noir dès les premières trames. Menus/écrans déjà
+  pleinement affichés sans aucune correction : N.O.V.A. 3 (Quick Play/Story Mode/Options), Modern Combat 4
+  ("Press 5 to continue"), Duke Nukem Mobile 3D (écran de chargement), Rainbow Six: Raven Shield (titre),
+  Delta Force (artwork), Resident Evil: Degeneration (logo éditeur Glu), Assassin's... pardon, AVP-Requiem
+  (semble déjà en jeu/HUD). Le reste (Brothers in Arms x2, Call of Duty: Black Ops/World at War, James Bond,
+  Medal of Honor x2, Modern Combat 2, Predator, Rainbow Six Lockdown/Vegas, Splinter Cell x4, Terminator x2)
+  reste bloqué sur un écran noir/splash après les touches simulées génériques — pas creusé au-delà pour ce lot
+  (pas de nouveau bug systémique trouvé en dehors du `DataInputStream` ci-dessus ; probablement des écrans
+  d'accueil qui attendent une touche précise ou un temps de chargement plus long que les 400 trames testées).
+- Sortie **pixel-identique aux 50 jeux de test précédents** en fonctionnement isolé/série (les divergences vues
+  sous forte charge concurrente dans le script de comparaison étaient du bruit de contention machine, pas des
+  régressions — confirmé en rejouant chaque cas signalé seul).

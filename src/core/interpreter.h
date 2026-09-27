@@ -7,6 +7,9 @@
 namespace jvm
 {
 
+    void profileReport(); // affiche le rapport (à appeler tant que le Runtime est vivant)
+    void profileInit(); // JME_PROFILE=1 : profil d'échantillonnage des méthodes Java (rapport sur stderr en fin de run)
+
     // Frame d'exécution
     struct Frame
     {
@@ -87,6 +90,13 @@ namespace jvm
         // lieu de laisser une récursion Java infinie faire déborder la pile (SEGV, surtout dans une fibre de 512 Ko).
         void setStackLow(const char *low) { stackLow_ = low; }
         const char *stackLow() const { return stackLow_; }
+
+        // GC : scanne conservativement l'arène ACTIVE de cette Interpreter -- les locales+pile Java de TOUS
+        // les appels actuellement imbriqués sur l'exécution en cours (fil principal, OU la fibre en train de
+        // tourner : `natives.cpp::jme_threadResume` échange arena_/arenaOff_ avec ceux de la fibre pendant
+        // qu'elle s'exécute, donc ce sont toujours les bonnes données pour "ce qui tourne là, maintenant").
+        // Les fibres SUSPENDUES ont leur propre copie figée (voir `jme_gcScanSuspendedFibers` dans natives.cpp).
+        void scanActiveFrames(Heap::Marker &m) const { m.scan(arena_, arenaOff_); }
 
     private:
         Runtime *rt_;

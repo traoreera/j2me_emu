@@ -449,6 +449,40 @@ TEST(interpreter_dup2_x1_inserts_pair_under_third_slot)
     ASSERT_EQ(runInt({0x04, 0x05, 0x06, 0x5d, 0x60, 0x64, 0x64, 0x64, 0xac}, 6, 1, nullptr, 0), -5);
 }
 
+TEST(interpreter_newarray_negative_size_throws_catchable_exception)
+{
+    // Régression (Ferrari World Championship) : `newarray` (int[]) avec une taille NÉGATIVE (résultat d'une
+    // ressource corrompue/tronquée -- CAR.pak ne fait que 254 octets) tentait une allocation avec un size_t
+    // gigantesque (le -1 signé réinterprété non-signé) au lieu de lever NegativeArraySizeException -- gaspillait
+    // le tas puis échouait "en dur" (okResult=false), sans passer par le catch de l'appelant qui gère pourtant
+    // ce cas explicitement en Java réel.
+    // static int m() { try { int c = -1; int[] a = new int[c]; } catch (NegativeArraySizeException e) { return 7; } return 0; }
+    std::vector<uint8_t> code = {
+        0x02,       // [0] iconst_m1 (-1)
+        0xbc, 0x0a, // [1,2] newarray int (atype=10)
+        0x57,       // [3] handler: pop (jette la ref d'exception)
+        0x10, 0x07, // [4,5] bipush 7
+        0xac,       // [6] ireturn
+        0x03,       // [7] iconst_0 (chemin normal, non exercé ici)
+        0xac,       // [8] ireturn
+    };
+    CodeAttribute::ExceptionHandler h{0, 3, 3, 2}; // couvre [0,3) ; catchType=#2
+
+    ClassFile cf;
+    setSingleClassConstantPool(cf, "java/lang/NegativeArraySizeException");
+    ClassInfo ci;
+    MethodRecord mr;
+    wireMethod(cf, ci, mr, code, /*maxStack*/ 1, /*maxLocals*/ 0, {h});
+
+    Runtime rt(64 * 1024);
+    rt.registerNativeClass("java/lang/NegativeArraySizeException", "", {}, {});
+
+    Interpreter interp(&rt);
+    Value result;
+    ASSERT_TRUE(interp.invoke(&ci, &mr, nullptr, nullptr, 0, result));
+    ASSERT_EQ(result.i, 7);
+}
+
 TEST(interpreter_pop2_pops_two_slots_for_ints_and_one_long)
 {
     // Régression (Yet Another Snake) : pop2 sur DEUX int ne retirait qu'un slot -> le tableau visé par

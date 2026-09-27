@@ -976,6 +976,11 @@ namespace jvm
                 regN("javax/microedition/lcdui/game/LayerManager.setViewWindow:(IIII)V", lm_setViewWindow);
                 regN("javax/microedition/lcdui/game/LayerManager.paint:(Ljavax/microedition/lcdui/Graphics;II)V", lm_paint);
             }
+
+            // GC : Sprite/TiledLayer/LayerManager gardent TOUT leur état dans les cellules des objets Java
+            // eux-mêmes (SPR_IMG, TL_*...) -- déjà scannées via les statics/frames qui les référencent. Aucun
+            // Obj* natif persistant à marquer ici.
+            void gcMarkGameRoots(Heap::Marker &) {}
         } // namespace detail
     } // namespace midp
 } // namespace jvm

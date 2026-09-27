@@ -4,6 +4,7 @@
 // display (SDL2 côté PC, écran RGB565 côté RP2040).
 
 #include <vector>
+#include <ctime>
 #include <algorithm>
 #include "hal/jar_reader.h"
 #include "hal/display.h"
@@ -92,6 +93,13 @@ static void reexec(const char *jar)
 
 int main(int argc, char **argv)
 {
+    // GC : borne HAUTE de la pile C++ du fil PRINCIPAL (les piles grandissent vers le bas -- une variable
+    // locale prise ici, tout au début, est à l'adresse la plus haute que le programme utilisera sur ce fil).
+    // Voir le commentaire de jvm::jme_currentFiberStackTop : quand aucune fibre ne tourne, c'est cette borne
+    // qui sert à scanner conservativement la pile C++ active (locales de handlers natifs, etc.) pendant un GC.
+    uint8_t mainStackTopProbe;
+    uint8_t *const mainStackTop = &mainStackTopProbe;
+    jvm::profileInit();
     // Sans argument : launcher (JME_LAUNCHER=0 pour l'ancien défaut games/assasin.jar).
     const bool launcherOff = getenv("JME_LAUNCHER") && atoi(getenv("JME_LAUNCHER")) == 0;
     if (argc <= 1 && !launcherOff)
@@ -292,6 +300,48 @@ int main(int argc, char **argv)
         }
     }
     jvm::midp::init(&rt, &interp);
+    // Ramasse-miettes : marquage-balayage conservateur (voir Heap::collectGarbage dans core/runtime.cpp).
+    // Racines : piles/locales de l'exécution Java active (interp.scanActiveFrames -- fil principal ou fibre en
+    // cours), `statics` de chaque classe chargée, et tout ce que retient nativement la couche MIDP (écrans
+    // lcdui, threads, sons, minuteries -- jvm::midp::gcMarkRoots). JME_GC=0 le désactive (comportement
+    // d'avant l'introduction du GC : le tas ne fait plus jamais que grossir) -- filet de sécurité.
+    if (!getenv("JME_GC") || atoi(getenv("JME_GC")) != 0)
+    {
+        rt.heap().setRootScanner([&rt, &interp, mainStackTop](jvm::Heap::Marker &m) {
+            interp.scanActiveFrames(m);
+            rt.forEachClass([&m](jvm::ClassInfo *ci) {
+                if (!ci->statics.empty())
+                    m.scan(ci->statics.data(), ci->statics.size() * sizeof(jvm::Value));
+            });
+            jvm::midp::gcMarkRoots(m);
+            // Pile C++ RÉELLEMENT active à cet instant (fibre en cours, sinon le fil principal) : couvre les
+            // variables locales des handlers natifs (ex. un `Obj*` fraîchement alloué pas encore écrit dans
+            // un champ Java -- voir le commentaire complet dans natives.cpp). Bornée à kStackScanWindow
+            // (généreux : des centaines d'appels C++ imbriqués) plutôt que de remonter jusqu'au sommet réel
+            // de la pile (8 Mo) : plus la fenêtre est large, plus elle contient de vieilles cases de pile
+            // ABANDONNÉES par des appels déjà retournés (jamais réécrites depuis, car un appel plus récent au
+            // même niveau n'a pas eu besoin d'autant de place) qui gardent encore le bit à bit d'un ANCIEN
+            // `Obj*` -- ces cases sont scannées comme n'importe quelle autre et gardent alors l'objet vivant
+            // pour toujours, même longtemps après que plus rien (Java ou C++) ne le référence réellement.
+            // Mesuré sur games/os_pacman.jar : sans cette borne, le GC ne récupérait quasiment plus rien après
+            // quelques cycles (0 octet récupéré) malgré un tas exigu qui finissait quand même par s'épuiser --
+            // une fenêtre de 256 Ko (des centaines de frames C++, bien plus que la profondeur d'un handler
+            // natif) restitue une vraie collecte tout en couvrant tous les cas réels observés.
+            static constexpr size_t kStackScanWindow = 256 * 1024;
+            uint8_t *stackTop = mainStackTop;
+            jvm::jme_currentFiberStackTop(stackTop);
+            uint8_t currentSpProbe;
+            uint8_t *sp = &currentSpProbe;
+            if (stackTop > sp && static_cast<size_t>(stackTop - sp) > kStackScanWindow)
+                stackTop = sp + kStackScanWindow;
+            // Alignement sur 8 octets (Marker::scan lit des mots de 8 octets) : arrondi vers le haut, en
+            // perdant au plus 7 octets tout en bas de la région -- négligeable, une vraie référence stockée
+            // dans une variable C++ y est de toute façon naturellement alignée.
+            sp = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(sp) + 7) & ~uintptr_t(7));
+            if (sp < stackTop)
+                m.scan(sp, static_cast<size_t>(stackTop - sp));
+        });
+    }
     jvm::midp::setAppProperty("MIDlet-Name", manifest.midletName);
     jvm::midp::setAppProperty("MIDlet-Version", manifest.midletVersion);
     jvm::midp::setAppProperty("MIDlet-Vendor", manifest.midletVendor);
@@ -445,6 +495,14 @@ int main(int argc, char **argv)
     if (const char *akf = getenv("JME_AUTOKEYFRAME"))
         autoKeyFrame = atoi(akf);
 
+    // JME_AUTOTEXT="texte" + JME_AUTOTEXTFRAME=n : injecte du texte tapé (comme SDL_TEXTINPUT) dans le
+    // TextField/TextBox actif à la trame n -- utile pour traverser en headless les écrans de saisie
+    // (nom de joueur...) qu'aucun softkey/clic ne peut remplir.
+    const char *autoText = getenv("JME_AUTOTEXT");
+    int autoTextFrame = 0;
+    if (const char *atf = getenv("JME_AUTOTEXTFRAME"))
+        autoTextFrame = atoi(atf);
+
     uint32_t holdKey = 0;
     int holdKeyFrame = -1;
     if (const char *hk = getenv("JME_AUTOHOLD"))
@@ -583,12 +641,33 @@ int main(int argc, char **argv)
 
     // Budget RÉEL d'une trame (ms). JME_FRAME_BUDGET ; ne pas confondre avec
     // JME_FRAME_TIME (durée VIRTUELLE vue par l'horloge du jeu).
-    uint32_t kFrameBudgetMs = 33; // ~30 fps cible
+    // Cadence : l'horloge du jeu suit le temps réel (cf. midp::tick), la fréquence de trame ne change donc pas la
+    // vitesse du jeu, seulement la finesse (les sleep() sont honorés à leur instant exact dans la trame). Défaut 16 ms
+    // (~60 trames/s). Avec le vsync actif, le flip bloque déjà ~1/60 s : aucune attente en plus (elle décalerait
+    // l'image d'un vsync et donnerait 33/50 ms en alternance) ; seule une garde de 4 ms évite l'emballement si le
+    // vsync ne bloque pas (fenêtre cachée).
+    uint32_t kFrameBudgetMs = 16;
+    bool frameBudgetForced = false;
     if (const char *fb = getenv("JME_FRAME_BUDGET"))
         if (atoi(fb) > 0)
+        {
             kFrameBudgetMs = static_cast<uint32_t>(atoi(fb));
+            frameBudgetForced = true;
+        }
+    const bool vsyncPacing = !frameBudgetForced && hal::display_vsync_active();
     uint32_t lateFrames = 0;
     uint32_t frameStart = SDL_GetTicks();
+    // JME_RENDER_STATS : durée de traitement de chaque trame (hors attente) pour repérer les à-coups.
+    std::vector<uint16_t> workMs;   // temps de traitement (entrée + JVM + rendu + flip)
+    std::vector<uint16_t> cpuMs;    // idem en temps CPU du processus (insensible à la charge de la machine)
+    std::vector<uint16_t> periodMs; // intervalle réel entre deux débuts de trame
+    auto cpuNowUs = []() -> int64_t {
+        timespec ts;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+    };
+    int64_t cpuFrameStart = cpuNowUs();
+    uint32_t prevStart = frameStart;
 
     while (running)
     {
@@ -661,7 +740,10 @@ int main(int argc, char **argv)
         for (int i = 0; i < input.pointerCount; i++)
             jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
-        jvm::midp::setTextInput(input.text, input.backspaces);
+        if (autoText && frame == autoTextFrame)
+            jvm::midp::setTextInput(autoText, 0);
+        else
+            jvm::midp::setTextInput(input.text, input.backspaces);
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 
         if (jvm::midp::midletDestroyed())
@@ -699,6 +781,8 @@ int main(int argc, char **argv)
             }
         }
 
+        const uint32_t beforeFlip = SDL_GetTicks() - frameStart;
+        cpuMs.push_back(static_cast<uint16_t>(std::min<int64_t>((cpuNowUs() - cpuFrameStart) / 1000, 65535)));
         hal::display_flip();
 
         // Rythme de trame adaptatif : on ne dort que le temps restant du
@@ -711,11 +795,18 @@ int main(int argc, char **argv)
         // déjà dépassé le budget, on ne dort pas du tout (rattrapage) plutôt
         // que d'accumuler du retard trame après trame.
         uint32_t elapsed = SDL_GetTicks() - frameStart;
-        if (elapsed < kFrameBudgetMs)
-            SDL_Delay(kFrameBudgetMs - elapsed);
-        else
+        workMs.push_back(static_cast<uint16_t>(std::min<uint32_t>(beforeFlip, 65535))); // hors attente du vsync
+        if (beforeFlip > 60 && getenv("JME_RENDER_STATS"))
+            fprintf(stderr, "[stats] trame %d lente : %u ms\n", frame, beforeFlip);
+        const uint32_t target = vsyncPacing ? 4 : kFrameBudgetMs;
+        if (elapsed < target)
+            SDL_Delay(target - elapsed);
+        else if (elapsed > kFrameBudgetMs * 2)
             lateFrames++;
         frameStart = SDL_GetTicks();
+        cpuFrameStart = cpuNowUs();
+        periodMs.push_back(static_cast<uint16_t>(std::min<uint32_t>(frameStart - prevStart, 65535)));
+        prevStart = frameStart;
     }
 
     if (const char *dump = getenv("JME_DUMP"))
@@ -747,6 +838,7 @@ int main(int argc, char **argv)
     kernel::kernelShutdown(0);
     hal::input_shutdown();
     hal::display_shutdown();
+    jvm::profileReport();
     printf("Emulation terminee apres %d frames\n", frame);
     // Lancé depuis le launcher : fin de jeu (F12, notifyDestroyed) -> retour au menu.
     if (fromLauncher && !leaveByQuit && !getenv("JME_MAXFRAMES"))
@@ -772,6 +864,25 @@ int main(int argc, char **argv)
             printf("[stats] frames=%d en_retard=%u (budget %u ms) heap=%zu/%zu KiB RSS=%ld KiB pic=%ld KiB\n",
                    frame, lateFrames, kFrameBudgetMs, rt.heap().used() / 1024,
                    rt.heap().capacity() / 1024, rssKb, hwmKb);
+            auto pct = [](std::vector<uint16_t> v, double q) -> unsigned {
+                if (v.empty()) return 0;
+                std::sort(v.begin(), v.end());
+                return v[std::min(v.size() - 1, static_cast<size_t>(q * v.size()))];
+            };
+            if (!workMs.empty())
+            {
+                double sum = 0;
+                for (uint16_t w : workMs) sum += w;
+                unsigned over66 = 0, over100 = 0;
+                for (uint16_t w : workMs) { over66 += w > 66; over100 += w > 100; }
+                printf("[stats] traitement/trame ms : moy=%.1f p50=%u p95=%u p99=%u max=%u ; >66ms:%u >100ms:%u\n",
+                       sum / workMs.size(), pct(workMs, 0.5), pct(workMs, 0.95), pct(workMs, 0.99), pct(workMs, 1.0), over66, over100);
+                printf("[stats] CPU/trame ms (processus entier) : moy=%.1f p50=%u p95=%u p99=%u max=%u\n",
+                       [&]() { double t = 0; for (uint16_t c : cpuMs) t += c; return cpuMs.empty() ? 0.0 : t / cpuMs.size(); }(),
+                       pct(cpuMs, 0.5), pct(cpuMs, 0.95), pct(cpuMs, 0.99), pct(cpuMs, 1.0));
+                printf("[stats] intervalle reel entre trames ms : p50=%u p95=%u max=%u\n",
+                       pct(periodMs, 0.5), pct(periodMs, 0.95), pct(periodMs, 1.0));
+            }
             if (hwmKb > 256 * 1024)
                 printf("[stats] ATTENTION: pic RSS > 256 MiB (seuil d'alerte Pi Zero 2)\n");
         }

@@ -943,8 +943,12 @@ namespace jvm
 
             static void gc_init(NativeContext *ctx)
             {
+                // GameCanvas(boolean suppressKeyEvents) : l'argument n'a RIEN à voir avec le plein écran (il était
+                // rangé dans GC_FULLSCREEN : tout GameCanvas(true) perdait sa barre de commandes -- SnakeWar
+                // affichait son écran d'accueil sans jamais pouvoir ouvrir le menu). Les évènements touches restent
+                // livrés dans tous les cas.
                 if (ctx->thisObj)
-                    ctx->thisObj->cells[GC_FULLSCREEN] = Value::fromInt(argInt(ctx, 1));
+                    ctx->thisObj->cells[GC_FULLSCREEN] = Value::fromInt(0);
             }
             static void gc_setFullScreen(NativeContext *ctx)
             {
@@ -974,7 +978,7 @@ namespace jvm
                 // Sur un vrai téléphone flushGraphics() est synchronisé sur l'affichage : beaucoup de boucles de jeu
                 // n'ont AUCUN Thread.sleep et comptent sur lui pour se cadencer. Ici on cède la main jusqu'à la trame
                 // suivante (une image par trame et par thread, sans brûler tout le budget de CPU en dessins inutiles).
-                jvm::jme_yieldNow();
+                jvm::jme_flushYield();
             }
             static void gc_flushRegion(NativeContext *ctx)
             {
@@ -1429,6 +1433,17 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.flushGraphics:()V", gc_flushGraphics);
                 regN("javax/microedition/lcdui/Canvas.flushGraphics:(IIII)V", gc_flushRegion);
                 regN("javax/microedition/lcdui/Canvas.getKeyStates:()I", gc_getKeyStates);
+            }
+
+            void gcMarkGraphicsRoots(Heap::Marker &m)
+            {
+                for (auto &kv : g_subCache)
+                {
+                    m.markObj(std::get<0>(kv.first)); // l'image SOURCE de la sous-image (clé du cache)
+                    m.markObj(kv.second);              // la sous-image mémorisée elle-même
+                }
+                for (auto &kv : g_pathCache)
+                    m.markObj(kv.second);
             }
         } // namespace detail
     } // namespace midp

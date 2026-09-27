@@ -27,6 +27,17 @@ namespace jvm
     void jme_threadForget(Obj *r);
     bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls);
     void jme_yieldNow(); // suspend la fibre courante jusqu'à la prochaine trame (no-op hors fibre)
+    void jme_flushYield(); // flushGraphics() : cède la main (>= 33 ms entre deux flush d'un thread qui ne dort pas)
+    // GC : marque les racines détenues par l'ordonnancement de threads -- le Runnable de chaque thread actif
+    // (g_threads), l'objet en cours de wait(ms) de chacun (SchedState::waitObj), et les locales+pile Java de
+    // chaque fibre SUSPENDUE (la fibre ACTIVE, elle, est déjà couverte par Interpreter::scanActiveFrames).
+    void jme_gcScanThreadingRoots(Heap::Marker &m);
+    // GC : sommet de la pile C++ de la fibre ACTIVE (si une fibre tourne). Voir le commentaire complet dans
+    // natives.cpp -- indispensable pour ne pas collecter un objet qu'un handler natif garde encore dans une
+    // variable C++ locale, pas (encore) écrit dans un champ/tableau Java.
+    bool jme_currentFiberStackTop(uint8_t *&top);
+    void jme_schedBegin(int tickN, int64_t endUs);            // début d'une trame : elle couvre l'horloge jusqu'à endUs
+    Obj *jme_schedNext(const std::vector<Obj *> &threads);    // prochain thread à reprendre dans la trame (nullptr = fini)
 
 
     namespace midp
@@ -325,9 +336,12 @@ namespace jvm
             // un FIRE softkey dispatch commandAction(Command, Displayable) sur le
             // CommandListener enregistré (comparaison par identité d'objet avec
             // List.SELECT_COMMAND). L'état est stocké dans un registre C++ côté
-            // émulateur indexé par Obj* (heap bump-only, pas de GC : les pointeurs
-            // restent stables) -- on n'ajoute AUCUN champ d'instance à Displayable,
-            // car Canvas réserve cells[0]/cells[1] (GC_FULLSCREEN/GC_GFX) sur lui.
+            // émulateur indexé par Obj* (le GC ne déplace jamais les objets -- pas
+            // de compaction -- donc ces pointeurs restent stables tant que l'objet
+            // est vivant ; voir gcMarkLcduiRoots pour comment ces mêmes registres
+            // sont marqués comme racines) -- on n'ajoute AUCUN champ d'instance à
+            // Displayable, car Canvas réserve cells[0]/cells[1] (GC_FULLSCREEN/GC_GFX)
+            // sur lui.
             // ---------------------------------------------------------------------
 
             void registerCoreNatives();
@@ -336,6 +350,19 @@ namespace jvm
             void registerUiNatives();
             void registerIoNatives();
             void registerMediaNatives();
+
+            // GC : chaque module marque ses PROPRES caches natifs qui détiennent des Obj* (écrans lcdui,
+            // images mémorisées, sons, minuteries...) -- miroir du découpage register<Module>Natives() ci-
+            // dessus. Appelées depuis midp::gcMarkRoots() (midp_natives.cpp), lui-même le RootScanner
+            // enregistré sur le Heap. Un module qui n'a AUCUN Obj* natif à retenir (aucun aujourd'hui) peut
+            // simplement ne pas en définir.
+            void gcMarkCoreRoots(Heap::Marker &m);
+            void gcMarkGraphicsRoots(Heap::Marker &m);
+            void gcMarkGameRoots(Heap::Marker &m);
+            void gcMarkUiRoots(Heap::Marker &m);
+            void gcMarkLcduiRoots(Heap::Marker &m);
+            void gcMarkIoRoots(Heap::Marker &m);
+            void gcMarkMediaRoots(Heap::Marker &m);
         } // namespace detail
     } // namespace midp
 } // namespace jvm

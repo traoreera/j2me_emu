@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <string>
 
+#include "core/runtime.h" // Heap::Marker (gcMarkRoots)
+
 namespace jvm
 {
 
@@ -52,6 +54,11 @@ namespace jvm
         int jme_screenPix();
         int jme_canvasPix();
         int jme_flushCalls();
+
+        // GC : marque toutes les racines détenues côté natif MIDP (écrans lcdui, caches d'images, sons,
+        // minuteries, System.out/AlertType via ClassInfo::statics -- déjà couvert ailleurs). Appelée par le
+        // RootScanner enregistré sur le Heap (voir src/app/main.cpp).
+        void gcMarkRoots(Heap::Marker &m);
 
     } // namespace midp
 } // namespace jvm
