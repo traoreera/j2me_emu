@@ -18,4 +18,4 @@ CMakeCache.*
 /Makefile
 
 j2me_emu*.rms/
-j2me_emu
+j2me*
