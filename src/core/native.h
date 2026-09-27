@@ -44,4 +44,9 @@ namespace jvm
     void setVirtualMicros(int64_t us); // monotone : ignoré si en arrière
     void advanceVirtualMillis(int64_t ms);
 
+    // GC : sommet de la pile C++ de la fibre ACTIVE, s'il y en a une (voir le commentaire complet dans
+    // natives.cpp, à côté de sa définition). Utilisée par src/app/main.cpp pour savoir QUELLE pile scanner
+    // conservativement (celle d'une fibre en cours, sinon celle du fil principal).
+    bool jme_currentFiberStackTop(uint8_t *&top);
+
 } // namespace jvm

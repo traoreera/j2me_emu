@@ -477,6 +477,22 @@ namespace jvm
             }
         }
 
+        // GC : orchestre le marquage de TOUTES les racines détenues côté MIDP -- miroir du découpage
+        // register<Module>Natives() de init() ci-dessous. Enregistrée (avec l'arène active de l'interpréteur,
+        // les fibres/threads, et les `statics` de chaque classe chargée) comme RootScanner du Heap par
+        // src/app/main.cpp ; ne fait rien tant que rien ne l'appelle (les tests unitaires n'en ont pas besoin).
+        void gcMarkRoots(Heap::Marker &m)
+        {
+            jvm::jme_gcScanThreadingRoots(m); // Runnable de chaque thread, wait(ms) en cours, fibres suspendues
+            detail::gcMarkCoreRoots(m);
+            detail::gcMarkGraphicsRoots(m);
+            detail::gcMarkGameRoots(m);
+            detail::gcMarkUiRoots(m);
+            detail::gcMarkLcduiRoots(m);
+            detail::gcMarkIoRoots(m);
+            detail::gcMarkMediaRoots(m);
+        }
+
         void init(Runtime *rt, Interpreter *interp)
         {
             detail::registerCoreNatives();

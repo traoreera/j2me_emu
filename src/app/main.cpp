@@ -93,6 +93,12 @@ static void reexec(const char *jar)
 
 int main(int argc, char **argv)
 {
+    // GC : borne HAUTE de la pile C++ du fil PRINCIPAL (les piles grandissent vers le bas -- une variable
+    // locale prise ici, tout au début, est à l'adresse la plus haute que le programme utilisera sur ce fil).
+    // Voir le commentaire de jvm::jme_currentFiberStackTop : quand aucune fibre ne tourne, c'est cette borne
+    // qui sert à scanner conservativement la pile C++ active (locales de handlers natifs, etc.) pendant un GC.
+    uint8_t mainStackTopProbe;
+    uint8_t *const mainStackTop = &mainStackTopProbe;
     jvm::profileInit();
     // Sans argument : launcher (JME_LAUNCHER=0 pour l'ancien défaut games/assasin.jar).
     const bool launcherOff = getenv("JME_LAUNCHER") && atoi(getenv("JME_LAUNCHER")) == 0;
@@ -294,6 +300,48 @@ int main(int argc, char **argv)
         }
     }
     jvm::midp::init(&rt, &interp);
+    // Ramasse-miettes : marquage-balayage conservateur (voir Heap::collectGarbage dans core/runtime.cpp).
+    // Racines : piles/locales de l'exécution Java active (interp.scanActiveFrames -- fil principal ou fibre en
+    // cours), `statics` de chaque classe chargée, et tout ce que retient nativement la couche MIDP (écrans
+    // lcdui, threads, sons, minuteries -- jvm::midp::gcMarkRoots). JME_GC=0 le désactive (comportement
+    // d'avant l'introduction du GC : le tas ne fait plus jamais que grossir) -- filet de sécurité.
+    if (!getenv("JME_GC") || atoi(getenv("JME_GC")) != 0)
+    {
+        rt.heap().setRootScanner([&rt, &interp, mainStackTop](jvm::Heap::Marker &m) {
+            interp.scanActiveFrames(m);
+            rt.forEachClass([&m](jvm::ClassInfo *ci) {
+                if (!ci->statics.empty())
+                    m.scan(ci->statics.data(), ci->statics.size() * sizeof(jvm::Value));
+            });
+            jvm::midp::gcMarkRoots(m);
+            // Pile C++ RÉELLEMENT active à cet instant (fibre en cours, sinon le fil principal) : couvre les
+            // variables locales des handlers natifs (ex. un `Obj*` fraîchement alloué pas encore écrit dans
+            // un champ Java -- voir le commentaire complet dans natives.cpp). Bornée à kStackScanWindow
+            // (généreux : des centaines d'appels C++ imbriqués) plutôt que de remonter jusqu'au sommet réel
+            // de la pile (8 Mo) : plus la fenêtre est large, plus elle contient de vieilles cases de pile
+            // ABANDONNÉES par des appels déjà retournés (jamais réécrites depuis, car un appel plus récent au
+            // même niveau n'a pas eu besoin d'autant de place) qui gardent encore le bit à bit d'un ANCIEN
+            // `Obj*` -- ces cases sont scannées comme n'importe quelle autre et gardent alors l'objet vivant
+            // pour toujours, même longtemps après que plus rien (Java ou C++) ne le référence réellement.
+            // Mesuré sur games/os_pacman.jar : sans cette borne, le GC ne récupérait quasiment plus rien après
+            // quelques cycles (0 octet récupéré) malgré un tas exigu qui finissait quand même par s'épuiser --
+            // une fenêtre de 256 Ko (des centaines de frames C++, bien plus que la profondeur d'un handler
+            // natif) restitue une vraie collecte tout en couvrant tous les cas réels observés.
+            static constexpr size_t kStackScanWindow = 256 * 1024;
+            uint8_t *stackTop = mainStackTop;
+            jvm::jme_currentFiberStackTop(stackTop);
+            uint8_t currentSpProbe;
+            uint8_t *sp = &currentSpProbe;
+            if (stackTop > sp && static_cast<size_t>(stackTop - sp) > kStackScanWindow)
+                stackTop = sp + kStackScanWindow;
+            // Alignement sur 8 octets (Marker::scan lit des mots de 8 octets) : arrondi vers le haut, en
+            // perdant au plus 7 octets tout en bas de la région -- négligeable, une vraie référence stockée
+            // dans une variable C++ y est de toute façon naturellement alignée.
+            sp = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(sp) + 7) & ~uintptr_t(7));
+            if (sp < stackTop)
+                m.scan(sp, static_cast<size_t>(stackTop - sp));
+        });
+    }
     jvm::midp::setAppProperty("MIDlet-Name", manifest.midletName);
     jvm::midp::setAppProperty("MIDlet-Version", manifest.midletVersion);
     jvm::midp::setAppProperty("MIDlet-Vendor", manifest.midletVendor);

@@ -773,6 +773,15 @@ static void native_TimerTask_init(NativeContext *ctx)
                 regN("java/util/Timer.scheduleAtFixedRate:(Ljava/util/TimerTask;JJ)V", n_Timer_schedulePeriodic);
                 regN("java/util/Timer.cancel:()V", n_Timer_cancel);
             }
+
+            void gcMarkIoRoots(Heap::Marker &m)
+            {
+                for (const JmeTimerTask &t : g_timerTasks)
+                {
+                    m.markObj(t.timer);
+                    m.markObj(t.task);
+                }
+            }
         } // namespace detail
     } // namespace midp
 } // namespace jvm

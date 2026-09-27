@@ -346,6 +346,45 @@ void jme_threadForget(Obj *r)
     }
 }
 
+// GC : borne HAUTE de la pile C++ RÉELLEMENT active en ce moment -- celle de la fibre en cours si une fibre
+// tourne (son `ucontext` a littéralement échangé le registre SP dessus), sinon aucune (le fil principal est
+// couvert séparément par src/app/main.cpp, qui connaît sa propre pile). Indispensable : un handler natif
+// (ex. img_createWH) qui alloue un objet, le garde un instant dans une variable C++ LOCALE (avant de
+// l'écrire dans un champ/tableau Java), puis alloue ENCORE avant de s'en servir, expose cette variable à
+// AUCUNE racine Java -- seul un balayage conservateur de la pile C++ elle-même la voit. Sans ça, un cycle GC
+// déclenché par cette deuxième allocation pouvait libérer puis RÉUTILISER la mémoire du premier objet
+// pendant que le handler s'apprêtait encore à écrire dedans -- corruption du tas (repéré avec
+// JME_GC_STRESS=1 : `arrayLen` d'un bloc libre devenu un entier négatif, interprété en taille énorme).
+bool jme_currentFiberStackTop(uint8_t *&top)
+{
+    if (!g_currentFiber)
+        return false;
+    top = reinterpret_cast<uint8_t *>(g_currentFiber->stack.data() + g_currentFiber->stack.size());
+    return true;
+}
+
+void jme_gcScanThreadingRoots(Heap::Marker &m)
+{
+    for (Obj *r : g_threads)
+        m.markObj(r);
+    for (auto &kv : schedMap())
+    {
+        m.markObj(kv.first);
+        m.markObj(kv.second.waitObj);
+    }
+    // Fibres SUSPENDUES : leur arène (`aBase`/`aOff`) contient alors leurs VRAIES locales+pile Java figées.
+    // La fibre ACTIVE (g_currentFiber) est exclue -- pendant qu'elle tourne, `swapArena` a échangé ses champs
+    // avec ceux de l'appelant (typiquement une arène "à vide", rien à perdre à l'ignorer ici) ; sa vraie
+    // arène active est déjà scannée via `Interpreter::scanActiveFrames` par l'appelant de cette fonction.
+    for (auto &kv : fiberMap())
+    {
+        JmeFiber *f = kv.second;
+        if (!f || f == g_currentFiber)
+            continue;
+        m.scan(f->aBase, f->aOff);
+    }
+}
+
 namespace
 {
 void n_Object_init(NativeContext *) {}

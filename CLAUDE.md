@@ -791,3 +791,71 @@ rattrapable. Test de régression :
 `SDL_TEXTINPUT`, via `midp::setTextInput`) à la trame `n` : permet de traverser en headless les écrans de
 saisie (nom de joueur...) qu'aucun softkey/clic scripté ne peut remplir. Sans effet quand la variable est
 absente (comportement inchangé sur les 50 jeux de test).
+
+## Ramasse-miettes (session du 27/09) — marquage-balayage conservateur, sans compaction
+
+Le tas était un allocateur bump PUR : `reset()` (jamais appelé par l'app réelle, seulement par les tests)
+était la SEULE récupération. Un GC réel est maintenant en place (`src/core/runtime.h`/`.cpp`, classe `Heap`).
+
+- **Principe** : marquage-balayage NON DÉPLAÇANT (pas de compaction — un `Obj` embarque un `std::string` non
+  relocalisable par `memcpy`, et de très nombreux `Obj*` bruts vivent côté C++ natif : caches lcdui, fibres,
+  threads, sons... les déplacer casserait tout sans réécrire chaque référence). Les objets morts rejoignent
+  une **liste de blocs libres** (premier ajustement, fusion des blocs adjacents à chaque cycle) réutilisée par
+  `allocObj` avant de faire grossir le tas.
+- **Marquage CONSERVATEUR** : les `Value` n'ont pas de tag de type (un `long`/`double` partage le même mot
+  qu'une référence), donc impossible de savoir avec certitude, en regardant une pile Java ou une structure C++
+  native, quels mots sont de VRAIES références. Chaque mot de 8 octets d'une région scannée est testé comme
+  candidat contre `liveSet_` (l'ensemble des adresses d'objets ACTUELLEMENT alloués, reconstruit au début de
+  chaque cycle en parcourant les segments par en-têtes) : un entier qui coïncide par hasard avec une adresse
+  réelle ne fait que le garder vivant un cycle de trop (fuite bénigne) — **jamais** de corruption, puisqu'un
+  mot n'est déréférencé QUE s'il correspond à une entrée de `liveSet_` (l'ordre de la vérification est
+  crucial : membership AVANT tout déréférencement, pas l'inverse — un buggy `Value::fromInt(42)` scanné et
+  interprété comme `Obj* 0x2a` déréférencé en premier plantait immédiatement).
+- **Racines** : piles/locales Java de l'exécution active (`Interpreter::scanActiveFrames`, arène courante),
+  celles de CHAQUE fibre suspendue (`jme_gcScanThreadingRoots`, natives.cpp — la fibre ACTIVE est couverte
+  autrement, voir plus bas), `statics` de chaque classe chargée (`Runtime::forEachClass`), tout ce que retient
+  nativement la couche MIDP (écrans lcdui, caches d'images, sons, minuteries — un `gcMark<Module>Roots` par
+  fichier `midp_*.cpp`, orchestrés par `midp::gcMarkRoots`), et les caches internes du `Heap` lui-même
+  (`internTable_`/`classCache_`, marqués directement dans `collectGarbage()`).
+- **Piège trouvé et corrigé en cours de route (le plus important)** : un handler natif qui alloue un objet, le
+  garde un instant dans une variable C++ **locale** (avant de l'écrire dans un champ/tableau Java), puis
+  alloue ENCORE avant de s'en servir (ex. `img_createWH` : `Obj *buf = newArray(...)` puis d'autres allocations
+  avant que `buf` ne soit rattaché à l'Image) n'exposait cette variable à AUCUNE racine — seul un balayage de
+  la pile C++ elle-même la voit. Sans ça, un cycle GC déclenché par la deuxième allocation pouvait libérer PUIS
+  RÉUTILISER la mémoire du premier objet pendant que le handler s'apprêtait encore à écrire dedans (repéré avec
+  `JME_GC_STRESS=1` : corruption silencieuse du tas, `free(): invalid pointer` ou segfault bien plus tard,
+  loin du vrai site fautif — la signature classique documentée plus haut dans ce fichier pour d'autres bugs).
+  Corrigé en scannant conservativement la pile C++ RÉELLEMENT active (celle de la fibre en cours si une fibre
+  tourne — son `ucontext` a littéralement échangé le registre SP dessus, voir `jme_currentFiberStackTop` — sinon
+  celle du fil principal), mais **bornée à 256 Ko** (`kStackScanWindow`, `src/app/main.cpp`) plutôt que de
+  remonter jusqu'au sommet réel (8 Mo) : une fenêtre trop large contient de vieilles cases de pile ABANDONNÉES
+  par des appels déjà retournés (jamais réécrites depuis) qui gardent le bit à bit d'un ANCIEN `Obj*` — mesuré
+  sur `games/os_pacman.jar`, ça faisait quasiment tout garder vivant pour toujours (0 octet récupéré par
+  cycle) malgré un tas exigu qui finissait quand même par s'épuiser. 256 Ko (des centaines d'appels C++
+  imbriqués, bien plus que la profondeur d'un handler natif) restitue une vraie collecte.
+- **Second piège corrigé** : `allocFromFreeList` découpait un bloc libre trop généreusement — quand le
+  reliquat après découpe était trop petit pour héberger lui-même un en-tête `Obj` valide, il était donné "en
+  plus" à l'objet alloué SANS agrandir sa taille déclarée (`cellCount`) : l'objet occupait alors physiquement
+  plus d'octets que ce que `sizeof(Obj) + cellCount*sizeof(Value)` rapportait, désynchronisant le parcours du
+  tas par en-têtes (le cycle suivant retombait au milieu du reliquat non comptabilisé au lieu du prochain
+  en-tête réel → lecture d'un `std::string` composé d'octets de bourrage → SIGSEGV dans le hachage de la table
+  d'internement). Corrigé : un bloc dont le reliquat serait `> 0` et `< sizeof(Obj)` est simplement IGNORÉ
+  (bloc gardé intact, recherche du suivant) plutôt que de casser l'invariant taille-déclarée == taille-occupée.
+- **Validation** : `JME_GC_STRESS=1` force un cycle GC complet à CHAQUE allocation (le pire cas possible —
+  fait apparaître en quelques trames un marquage incomplet qui, en fonctionnement normal, ne se manifesterait
+  qu'après un long moment de jeu) ; `JME_GC_DEBUG=1` (avec `JME_GC_STRESS`) ajoute des vérifications de bornes
+  (objet/bloc libre qui déborderait de son segment → `abort()` immédiat avec diagnostic, au lieu d'une
+  corruption qui ne se manifeste que bien plus tard). Testé sous stress sur 9 jeux variés (dont Prince of
+  Persia, Assassin's Creed 2, Gangstar 2, Đột Kích) : plus aucun crash après les deux corrections ci-dessus.
+  Sortie **pixel-identique aux 50 jeux de test** en fonctionnement normal (défaut : le GC déclenche rarement
+  sous un tas non plafonné). Efficacité démontrée sous tas plafonné (`JME_HEAP=512 JME_HEAP_MAX=768`, 8000
+  trames) : `games/mission.jar` récupère 80-190 Ko de VRAIES ordures par cycle (StringBuffer/concaténations
+  de score, petits tableaux temporaires...) et tient largement plus longtemps qu'avant. Un jeu dont le tas
+  s'épuise malgré le GC (ex. `prince.jar`, quasi rien à récupérer) a un working-set réellement trop gros pour
+  le plafond — aucun GC ne peut inventer de la mémoire pour de l'état légitimement vivant (images mises en
+  cache, notamment).
+- **`JME_GC=0`** désactive le GC entièrement (comportement d'avant son introduction : le tas ne fait plus
+  jamais que grossir) — filet de sécurité si un jeu se comporte mal après coup.
+- 4 nouveaux tests unitaires (`tests/test_runtime.cpp`) : GC sans racines enregistrées = no-op, récupération +
+  réutilisation d'espace, marquage transitif à travers le graphe d'objets, marquage conservateur retrouvant un
+  pointeur enfoui dans des entiers quelconques.

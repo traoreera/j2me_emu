@@ -134,6 +134,17 @@ namespace jvm
             void registerCoreNatives()
             {
             }
+
+            void gcMarkCoreRoots(Heap::Marker &m)
+            {
+                m.markObj(g_midlet);
+                m.markObj(g_display);
+                m.markObj(g_current);
+                m.markObj(g_screenGfx);
+                for (int i = 0; i < 4; i++)
+                    for (int j = 0; j < 3; j++)
+                        m.markObj(g_fontCache[i][j]);
+            }
         } // namespace detail
     } // namespace midp
 } // namespace jvm

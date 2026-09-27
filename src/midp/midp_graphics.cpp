@@ -1434,6 +1434,17 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.flushGraphics:(IIII)V", gc_flushRegion);
                 regN("javax/microedition/lcdui/Canvas.getKeyStates:()I", gc_getKeyStates);
             }
+
+            void gcMarkGraphicsRoots(Heap::Marker &m)
+            {
+                for (auto &kv : g_subCache)
+                {
+                    m.markObj(std::get<0>(kv.first)); // l'image SOURCE de la sous-image (clé du cache)
+                    m.markObj(kv.second);              // la sous-image mémorisée elle-même
+                }
+                for (auto &kv : g_pathCache)
+                    m.markObj(kv.second);
+            }
         } // namespace detail
     } // namespace midp
 } // namespace jvm

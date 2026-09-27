@@ -298,6 +298,10 @@ namespace jvm
                 regN("javax/microedition/midlet/MIDlet.notifyPaused:()V", mid_notifyPaused);
                 regN("javax/microedition/midlet/MIDlet.resumeRequest:()Z", mid_resumeRequest);
             }
+
+            // GC : ce module ne détient aucun Obj* natif persistant (les natives de Display/MIDlet/Canvas ici
+            // ne font que lire/écrire des champs Java déjà couverts ailleurs -- statics, cellules d'objets).
+            void gcMarkUiRoots(Heap::Marker &) {}
         } // namespace detail
     } // namespace midp
 } // namespace jvm

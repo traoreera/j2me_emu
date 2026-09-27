@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
 
 namespace jvm
 {
@@ -50,6 +52,8 @@ enum class ObjKind : uint8_t
     CharArray,
     BoolArray,
     ObjArray,
+    Free, // bloc libre du tas (PAS un objet Java) -- métadonnées dans arrayLen (taille totale en octets)
+          // et freeNext (maillon suivant de la liste des blocs libres). Voir Heap::collectGarbage.
 };
 
 struct ClassInfo;
@@ -57,11 +61,13 @@ struct ClassInfo;
 struct Obj
 {
     ObjKind kind = ObjKind::Null;
+    bool marked = false;        // bit de marquage du GC (balayage) ; retombe à false après chaque cycle
     ClassInfo *cls = nullptr;   // Instance / Class
     int32_t cellCount = 0;      // nombre de slots Value
     Value *cells = nullptr;     // champs d'instance / données de tableau
-    int32_t arrayLen = 0;
+    int32_t arrayLen = 0;       // taille (tableaux) ; pour un bloc Free : taille TOTALE du span en octets
     std::string str;            // payload String
+    Obj *freeNext = nullptr;    // uniquement significatif quand kind == Free (maillon suivant)
 };
 
 // ---------------------------------------------------------------------
@@ -212,6 +218,53 @@ public:
     bool outOfMemory() const { return oom_; }
     void reset();
 
+    // ------------------------------------------------------------------------------------------------------
+    // Ramasse-miettes (marquage-balayage, sans compaction, marquage CONSERVATEUR).
+    // ------------------------------------------------------------------------------------------------------
+    // Les `Value` n'ont pas de tag de type (un long/double partage le même mot qu'une référence) : impossible
+    // de savoir avec certitude, en regardant une pile Java ou une structure C++ native, quels mots sont de
+    // VRAIES références. Le marquage est donc CONSERVATEUR : chaque mot de 8 octets d'une région scannée est
+    // testé comme candidat pointeur contre l'ensemble des adresses d'objets ACTUELLEMENT alloués (reconstruit
+    // au début de chaque cycle en parcourant les segments) ; un entier/flottant qui coïncide par hasard avec
+    // une adresse d'objet réel ne fait que le maintenir vivant un cycle de trop (fuite bénigne), jamais de
+    // corruption -- aucun mot n'est JAMAIS déréférencé à tort comme un vrai objet en dehors de cet ensemble.
+    // Pas de déplacement d'objets (compaction) : un `Obj` embarque un `std::string` non relocalisable par
+    // `memcpy`, et de très nombreux pointeurs `Obj*` bruts vivent côté C++ natif (caches lcdui, fibres,
+    // threads, sons...) -- les déplacer casserait tout sans réécrire chaque référence. Les objets morts sont
+    // repris dans une liste de blocs libres (premier ajustement, fusion des blocs adjacents) et réutilisés par
+    // `allocObj` avant de faire grossir le tas.
+    class Marker
+    {
+    public:
+        // Scanne conservativement `bytes` octets à partir de `base` (doit être aligné sur 8 octets ; toutes
+        // les régions scannées ici -- tableaux de Value, structures natives -- le sont naturellement sur
+        // une plateforme 64 bits) : tout mot de 8 octets qui correspond à l'adresse d'un objet actuellement
+        // alloué est marqué (et ses propres cellules seront scannées à leur tour).
+        void scan(const void *base, size_t bytes);
+        // Marque directement un Obj* déjà typé (ex. un `std::vector<Obj*>` précis, pas besoin de scanner ses
+        // octets un par un) : plus rapide, même garanties (vérifie l'appartenance avant de suivre).
+        void markObj(Obj *o);
+
+    private:
+        friend class Heap;
+        Marker(Heap *h, std::vector<Obj *> *worklist) : heap_(h), worklist_(worklist) {}
+        Heap *heap_;
+        std::vector<Obj *> *worklist_;
+    };
+    // Appelée pendant un cycle GC pour marquer les racines EXTÉRIEURES au tas : piles/locales Java (fibre
+    // active + fibres suspendues), `statics` de chaque classe chargée, caches natifs (écrans lcdui, threads,
+    // sons, minuteries...). Non enregistrée par défaut (les tests unitaires n'en ont pas besoin) : sans
+    // scanner, `collectGarbage()` ne fait RIEN (jamais de balayage à l'aveugle sans racines connues -- ça
+    // libérerait tout). `src/app/main.cpp`/`midp::init()` l'enregistrent pour l'émulateur réel.
+    using RootScanner = std::function<void(Marker &)>;
+    void setRootScanner(RootScanner fn) { rootScanner_ = std::move(fn); }
+    // Force un cycle GC immédiat (no-op si aucun `RootScanner` n'est enregistré). `allocObj` l'appelle déjà
+    // automatiquement quand la liste des blocs libres et la fin du segment courant ne suffisent plus, avant
+    // de faire grossir le tas -- exposée surtout pour les tests et le diagnostic (`JME_GC_STRESS`).
+    void collectGarbage();
+    size_t gcCount() const { return gcCount_; }
+    size_t lastReclaimed() const { return lastReclaimed_; }
+
 private:
     // Segments de mémoire : le bump allocator défile dans chaque segment et
     // pousse un NOUVEAU segment quand besoin (auto-grow). Les objets ne sont
@@ -222,15 +275,28 @@ private:
     // on peut brider via JME_HEAP_MAX ou revenir à un pool unique figé.
     std::vector<uint8_t *> segs_;
     std::vector<size_t> segCaps_;
+    // Frontière figée de remplissage de chaque segment RETIRÉ (tous sauf le dernier) : au moment où un
+    // nouveau segment est poussé, le `off_` courant (avant de retomber à 0) donne exactement jusqu'où ce
+    // segment contient de vrais en-têtes d'objets/blocs libres consécutifs -- indispensable pour le parcourir
+    // par en-têtes (GC) sans lire la queue jamais initialisée. `segUsed_.size() == segs_.size() - 1` toujours
+    // (le dernier segment, encore en cours de remplissage, utilise `off_` directement).
+    std::vector<size_t> segUsed_;
     size_t initCap_ = 0;    // taille du premier segment (JME_HEAP)
     size_t maxCap_ = 0;     // plafond de capacité totale (JME_HEAP_MAX), 0 = aucun
     size_t capTotal_ = 0;   // capacité totale allouée (init + segments étendus)
-    size_t usedTotal_ = 0;  // octets consommés au total
+    size_t usedTotal_ = 0;  // octets réellement occupés par des objets VIVANTS (diminue après un GC)
     size_t off_ = 0;        // offset courant dans le dernier segment
     bool oom_ = false;
     std::unordered_map<std::string, Obj *> classCache_;
     std::unordered_map<std::string, Obj *> internTable_;
-    std::vector<Obj *> strings_; // garde les strings (bump allocator, jamais libérés)
+    Obj *freeList_ = nullptr;         // liste chaînée des blocs libres (premier ajustement), reconstruite à chaque GC
+    std::unordered_set<Obj *> liveSet_; // adresses d'objets actuellement alloués ; reconstruit au début de chaque GC
+    RootScanner rootScanner_;
+    size_t gcCount_ = 0;
+    size_t lastReclaimed_ = 0;
+
+    void initObj(Obj *o, ObjKind kind, int32_t cells);       // (ré)initialise un en-tête d'objet, adresse déjà choisie
+    Obj *allocFromFreeList(size_t need);                     // premier ajustement ; nullptr si rien d'assez grand
 };
 
 class Runtime
@@ -262,6 +328,16 @@ public:
     jme::JarReader *jar() { return jar_; }
 
     void reportOom();
+
+    // GC : parcourt toutes les classes CHARGÉES (JAR + natives) -- utilisé pour scanner leurs `statics`
+    // comme racines. Callback plutôt qu'un accesseur direct : `classes_` est privé et contient des
+    // `unique_ptr` (pas question d'en exposer la structure interne).
+    template <typename Fn>
+    void forEachClass(Fn &&fn) const
+    {
+        for (const auto &kv : classes_)
+            fn(kv.second.get());
+    }
 
 private:
     Heap heap_;

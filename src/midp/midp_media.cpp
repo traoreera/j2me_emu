@@ -1120,6 +1120,17 @@ namespace jvm
                 regN("javax/microedition/media/control/VolumeControl.setMute:(Z)V", vc_setMute);
                 regN("javax/microedition/media/control/VolumeControl.getAbsoluteLevel:()I", vc_getLevel);
             }
+
+            void gcMarkMediaRoots(Heap::Marker &m)
+            {
+                for (int i = 0; i < kNumSound; i++)
+                    m.markObj(g_snd[i].player);
+                for (const MediaEvt &e : mediaQueueRef())
+                {
+                    m.markObj(e.listener);
+                    m.markObj(e.player);
+                }
+            }
         } // namespace detail
     } // namespace midp
 } // namespace jvm

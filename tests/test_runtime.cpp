@@ -120,6 +120,101 @@ TEST(heap_max_caps_growth_and_reports_oom)
     ASSERT_TRUE(heap.allocObj(ObjKind::Instance, 4) != nullptr);
 }
 
+// ---------------------------------------------------------------------
+// Ramasse-miettes (marquage-balayage conservateur, sans compaction)
+// ---------------------------------------------------------------------
+
+TEST(heap_gc_noop_without_root_scanner)
+{
+    // Sans RootScanner enregistré (le cas de TOUS les autres tests de ce fichier) : collectGarbage() ne doit
+    // RIEN faire -- surtout pas balayer à l'aveugle et tout libérer. Comportement inchangé par rapport à
+    // l'ancien allocateur bump pur.
+    Heap heap(4096);
+    Obj *a = heap.newString("garde-moi");
+    size_t usedBefore = heap.used();
+    heap.collectGarbage();
+    ASSERT_EQ(heap.gcCount(), (size_t)0);
+    ASSERT_EQ(heap.used(), usedBefore);
+    ASSERT_EQ(a->str, std::string("garde-moi"));
+}
+
+TEST(heap_gc_reclaims_unreachable_and_reuses_space)
+{
+    Heap heap(4096);
+    Obj *kept = heap.allocObj(ObjKind::Instance, 2);
+    ASSERT_TRUE(kept != nullptr);
+    heap.setRootScanner([&](Heap::Marker &m) { m.markObj(kept); });
+
+    // Une vingtaine d'objets que PERSONNE ne référence (ni `kept`, ni le scanner) : après un GC ils doivent
+    // disparaître et leur place être réutilisable sans faire grossir le tas.
+    for (int i = 0; i < 20; i++)
+        ASSERT_TRUE(heap.allocObj(ObjKind::Instance, 4) != nullptr);
+    size_t usedBeforeGc = heap.used();
+    size_t capBeforeGc = heap.capacity();
+
+    heap.collectGarbage();
+    ASSERT_EQ(heap.gcCount(), (size_t)1);
+    ASSERT_TRUE(heap.used() < usedBeforeGc); // les 20 objets morts sont partis
+    ASSERT_TRUE(heap.lastReclaimed() > 0);
+    ASSERT_EQ(kept->cellCount, 2); // la racine explicite a survécu et reste utilisable
+
+    // Le prochain allocObj doit pouvoir réutiliser l'espace libéré au lieu de faire grossir le tas.
+    size_t usedAfterGc = heap.used();
+    Obj *reused = heap.allocObj(ObjKind::Instance, 4);
+    ASSERT_TRUE(reused != nullptr);
+    ASSERT_EQ(heap.capacity(), capBeforeGc); // pas de nouveau segment
+    ASSERT_TRUE(heap.used() > usedAfterGc);
+}
+
+TEST(heap_gc_transitive_marking_keeps_referenced_objects_alive)
+{
+    Heap heap(4096);
+    Obj *a = heap.allocObj(ObjKind::Instance, 1); // a.cells[0] -> b
+    Obj *b = heap.allocObj(ObjKind::Instance, 1); // b.cells[0] -> c
+    Obj *c = heap.allocObj(ObjKind::Instance, 0);
+    a->cells[0] = Value::fromRef(b);
+    b->cells[0] = Value::fromRef(c);
+
+    heap.setRootScanner([&](Heap::Marker &m) { m.markObj(a); }); // seul `a` est une racine directe
+
+    for (int i = 0; i < 5; i++)
+        heap.allocObj(ObjKind::Instance, 3); // du "bruit" mort, pour que le GC ait vraiment de quoi nettoyer
+
+    heap.collectGarbage();
+
+    // b et c ne sont atteignables QUE via a -> b -> c (fermeture transitive des cellules) : les trois
+    // doivent survivre, sans jamais avoir bougé (pas de compaction).
+    ASSERT_EQ(a->cellCount, 1);
+    ASSERT_EQ(b->cellCount, 1);
+    ASSERT_EQ(c->cellCount, 0);
+    ASSERT_TRUE(a->cells[0].o == b);
+    ASSERT_TRUE(b->cells[0].o == c);
+}
+
+TEST(heap_gc_conservative_scan_finds_embedded_pointer_and_reclaims_the_rest)
+{
+    Heap heap(4096);
+    Obj *referenced = heap.allocObj(ObjKind::Instance, 0);
+    Obj *unreferencedAddr = heap.allocObj(ObjKind::Instance, 0); // adresse gardée, jamais redéréférencée après le GC
+
+    // Simule une région C++ arbitraire (pile, structure native...) : des entiers anodins et, au milieu, un
+    // VRAI pointeur -- le marquage conservateur doit le trouver sans qu'on lui dise où il est.
+    Value region[4];
+    region[0] = Value::fromInt(42);
+    region[1] = Value::fromRef(referenced);
+    region[2] = Value::fromInt(-7);
+    region[3] = Value::fromInt(0);
+    heap.setRootScanner([&](Heap::Marker &m) { m.scan(region, sizeof(region)); });
+
+    heap.collectGarbage();
+    ASSERT_EQ(referenced->cellCount, 0); // toujours vivant, jamais déplacé
+
+    // `unreferencedAddr` (non racine) doit avoir été repris : une allocation de MÊME taille (aucun autre
+    // objet libre disponible) doit exactement réutiliser son adresse -- preuve concrète de la récupération.
+    Obj *reused = heap.allocObj(ObjKind::Instance, 0);
+    ASSERT_TRUE(reused == unreferencedAddr);
+}
+
 TEST(heap_max_below_initial_is_raised_to_initial)
 {
     Heap heap(512, 100);
