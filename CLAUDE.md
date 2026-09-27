@@ -769,3 +769,25 @@ Mesuré sur `prince_of_persia_th` (100 trames, budget d'instructions fixe, temps
   `FileConnection` (lister un vrai dossier de morceaux) resterait à faire si on veut du contenu jouable, mais
   ce n'est plus un blocage silencieux.
 - Restent : AC III (texte thaï), texte hors Latin-1 (affiché « ? »), pas de GC.
+
+## `newarray`/`anewarray`/`multianewarray` avec une taille NÉGATIVE (27/09)
+
+`newarray`/`anewarray` passaient une taille d'array **négative** directement à `Heap::newArray` sans passer
+par la spec JVM (`NegativeArraySizeException`) : le `int32_t` négatif, réinterprété comme taille, déclenchait
+une tentative d'allocation énorme (gaspille/épuise le tas en essayant de grossir avant d'échouer), PUIS
+échouait « en dur » (`okResult=false`) sans jamais passer par le `catch` de l'appelant — alors que du vrai
+bytecode Java gère couramment ce cas (`try { ... new int[n] ...} catch (NegativeArraySizeException e) {}`)
+pour une taille calculée à partir d'une ressource corrompue/tronquée. Trouvé sur
+`games/ferrari_world_champi_137653_2195.jar` : `CAR.pak` (254 octets, visiblement un modèle de voiture
+tronqué/factice) fait calculer une taille négative, et le jeu s'arrêtait au splash au lieu d'atteindre son
+écran « Enable Sound? ». Corrigé dans `interpreter.cpp` (0xbc/0xbd/0xc5) : une taille négative (n'importe
+laquelle des dimensions pour 0xc5) lève maintenant une vraie `NegativeArraySizeException` via `raiseJava`,
+rattrapable. Test de régression :
+`interpreter_newarray_negative_size_throws_catchable_exception`.
+
+## `JME_AUTOTEXT`/`JME_AUTOTEXTFRAME` (27/09)
+
+`JME_AUTOTEXT="texte"` + `JME_AUTOTEXTFRAME=n` (`src/app/main.cpp`) injectent du texte tapé (comme
+`SDL_TEXTINPUT`, via `midp::setTextInput`) à la trame `n` : permet de traverser en headless les écrans de
+saisie (nom de joueur...) qu'aucun softkey/clic scripté ne peut remplir. Sans effet quand la variable est
+absente (comportement inchangé sur les 50 jeux de test).

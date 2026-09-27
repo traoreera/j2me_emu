@@ -1691,9 +1691,14 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         {
             uint8_t atype = rb(c, pc);
             int count = popInt();
-            if (envDebug() && count < 0)
-                fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
-                        count, atype, cls->name.c_str(), m->name.c_str());
+            if (count < 0)
+            {
+                if (envDebug())
+                    fprintf(stderr, "newarray: count NEGATIF=%d atype=%d dans %s.%s\n",
+                            count, atype, cls->name.c_str(), m->name.c_str());
+                if (raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 2)) NEXT();
+                okResult = false; done = true; break;
+            }
             ObjKind k;
             switch (atype)
             {
@@ -1716,6 +1721,11 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
         {
             rbu16(c, pc);
             int count = popInt();
+            if (count < 0)
+            {
+                if (raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 3)) NEXT();
+                okResult = false; done = true; break;
+            }
             Obj *a = rt_->heap().newArray(ObjKind::ObjArray, count);
             if (!a) { rt_->reportOom(); okResult = false; done = true; break; }
             pushRef(a);
@@ -1847,6 +1857,18 @@ bool Interpreter::execBytecode(ClassInfo *cls, const MethodRecord *m, Obj *thisO
             std::vector<int32_t> sizes(dims);
             for (int i = dims - 1; i >= 0; i--)
                 sizes[i] = popInt();
+            bool negSize = false;
+            for (int32_t sz : sizes)
+                if (sz < 0) { negSize = true; break; }
+            if (negSize)
+            {
+                if (!raiseJava(rt_->classInfoOfName("java/lang/NegativeArraySizeException"), pc - 4))
+                {
+                    okResult = false;
+                    done = true;
+                }
+                break;
+            }
             std::string arrDesc = cp.getClassName(clsIdx); // ex: "[[I", "[[Ljava/lang/String;"
             size_t brackets = arrDesc.find_first_not_of('[');
             char baseChar = (brackets != std::string::npos) ? arrDesc[brackets] : 'I';
