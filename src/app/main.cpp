@@ -447,6 +447,14 @@ int main(int argc, char **argv)
     if (const char *akf = getenv("JME_AUTOKEYFRAME"))
         autoKeyFrame = atoi(akf);
 
+    // JME_AUTOTEXT="texte" + JME_AUTOTEXTFRAME=n : injecte du texte tapé (comme SDL_TEXTINPUT) dans le
+    // TextField/TextBox actif à la trame n -- utile pour traverser en headless les écrans de saisie
+    // (nom de joueur...) qu'aucun softkey/clic ne peut remplir.
+    const char *autoText = getenv("JME_AUTOTEXT");
+    int autoTextFrame = 0;
+    if (const char *atf = getenv("JME_AUTOTEXTFRAME"))
+        autoTextFrame = atoi(atf);
+
     uint32_t holdKey = 0;
     int holdKeyFrame = -1;
     if (const char *hk = getenv("JME_AUTOHOLD"))
@@ -684,7 +692,10 @@ int main(int argc, char **argv)
         for (int i = 0; i < input.pointerCount; i++)
             jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
-        jvm::midp::setTextInput(input.text, input.backspaces);
+        if (autoText && frame == autoTextFrame)
+            jvm::midp::setTextInput(autoText, 0);
+        else
+            jvm::midp::setTextInput(input.text, input.backspaces);
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 
         if (jvm::midp::midletDestroyed())

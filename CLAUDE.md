@@ -758,4 +758,14 @@ Mesuré sur `prince_of_persia_th` (100 trames, budget d'instructions fixe, temps
 - **Gangstar Rio** (`gangstar_rio_city_o_260851.jar`) : « Do you want sound? » → menu → **Instant Play jouable** (HUD, minicarte, joystick tactile). La cause du menu jamais dessiné était `Canvas.showNotify()` jamais appelé (voir plus haut). Séquence de test (rotation 90° : coordonnées du framebuffer 480x800) : `JME_FRAME_TIME=33 JME_AUTOTOUCHES="99,320,1300;99,320,1500;99,320,1700;99,320,1900;99,320,2100;239,250,2700;239,250,2900" JME_MAXFRAMES=4500` (~5 min de CPU, la majorité pour décompresser les niveaux).
 - **`GameCanvas(boolean suppressKeyEvents)`** rangeait son argument dans `GC_FULLSCREEN` : tout `GameCanvas(true)` perdait sa barre de commandes (SnakeWar : écran d'accueil sans moyen d'ouvrir le menu, touche programmable gauche = « Menu »). L'argument n'est plus utilisé pour le plein écran.
 - Gangstar 2 (menu + « Do you want sound? »), SnakeWar (formulaire de configuration), BluWar, 2048, Yas : jouables. `checkers.jar` : JAR incomplet (`images/blackCrown.png` absent), l'`IOException` est légitime.
-- Restent : AC III (texte thaï), texte hors Latin-1 (affiché « ? »), `nmania` (`FileConnection` non émulé), pas de GC.
+- **`nmania` n'était PAS bloqué par `FileConnection`** (correction de la note précédente) : il était juste
+  impossible à faire avancer en headless au-delà de l'écran « What's your name? » (aucun outil pour taper
+  du texte dans un `TextField`/`TextBox` scripté). `JME_AUTOTEXT="texte"` + `JME_AUTOTEXTFRAME=n`
+  (`src/app/main.cpp`) injectent le texte comme si tapé au clavier (`midp::setTextInput`) à la trame `n` — le
+  jeu atteint ensuite son menu principal (Play solo/Skinning/About). Au-delà, il essaie bien de scanner un
+  dossier réel (`Connector.open("file://...")`, `javax.microedition.io.file.FileConnection`, non émulé) pour
+  lister ses chansons/charts — mais le gère PROPREMENT : `ConnectionNotFoundException` est rattrapée et
+  affiche un écran « Failed to load charts! ... Visit settings section... », pas un plantage. Émuler
+  `FileConnection` (lister un vrai dossier de morceaux) resterait à faire si on veut du contenu jouable, mais
+  ce n'est plus un blocage silencieux.
+- Restent : AC III (texte thaï), texte hors Latin-1 (affiché « ? »), pas de GC.
