@@ -859,3 +859,28 @@ Le tas était un allocateur bump PUR : `reset()` (jamais appelé par l'app réel
 - 4 nouveaux tests unitaires (`tests/test_runtime.cpp`) : GC sans racines enregistrées = no-op, récupération +
   réutilisation d'espace, marquage transitif à travers le graphe d'objets, marquage conservateur retrouvant un
   pointeur enfoui dans des entiers quelconques.
+
+## Police 5x7 : audit Latin-1 (session du 27/09) — repli « ? » réellement cassé
+
+En auditant la table de la police à la demande de l'utilisateur (rendu de tous les glyphes 0x00-0xFF dans une
+image pour inspection visuelle), deux bugs réels trouvés dans `src/hal/font.cpp` :
+- **Le repli par défaut vers « ? » ne marchait pas** : `init()` faisait `copyOf(c, '?')` pour les 256 octets
+  AVANT de charger la vraie table ASCII (`kAscii`) dans `g_glyph[0x3F]` -- le « ? » copié était donc encore
+  entièrement VIDE à ce moment-là. Tout caractère jamais explicitement composé (toute la plage C1 0x80-0x9F,
+  et en Latin-1 : ¶ 0xB6, ¼ 0xBC, ½ 0xBD, ¾ 0xBE) restait **invisible** au lieu d'afficher « ? » comme
+  documenté et voulu -- pire qu'un caractère inconnu visible : du texte qui semble amputé de certaines
+  lettres. Confirmé concrètement sur `games/os_retrosnake.jar` (menu polonais, « Prędkość » etc. : les ą ę ć
+  ś ż ź ó ł ń polonais sont hors Latin-1/Latin-2 vs la table ici) -- avant : mots à trous ("PrÄ dkoÅ Ä") ;
+  après : "?" visible à la bonne place ("PrÄ?dkoÅ?Ä?"). Corrigé en chargeant `kAscii` AVANT la boucle de
+  repli (qui saute maintenant volontairement 0x20-0x7E pour ne pas écraser l'ASCII qu'elle vient de charger).
+- **¶ (pilcrow) et les fractions ¼ ½ ¾ n'avaient aucun glyphe dédié** (tombaient dans le même bug ci-dessus) :
+  ajoutés (approximations dessinées à la main, dans le style du reste du fichier -- chiffre/barre/chiffre pour
+  les fractions, trop serré à 5 colonnes pour une vraie diagonale). ¸ (cédille isolée, 0xB8) avait le même
+  trou (jamais gérée) : ajoutée sur le même principe que ´/¨ isolés déjà présents (0xB4/0xA8).
+- Le reste de la table (lettres accentuées composées, marques grave/aigu/circonflexe/tréma/tilde/rond/cédille,
+  Ø/ø, Ð/ð, Þ/þ, ß) a été vérifié un par un contre la vraie table ISO-8859-1 : aucune autre erreur de mapping
+  trouvée. Æ/æ (0xC6/0xE6) restent une simple copie de A/a (perte de la ligature, connu, accepté -- 5 colonnes
+  ne permettent pas grand-chose de mieux).
+- Outil de vérification (non versionné, scratchpad) : petit programme qui appelle `hal::font_glyph()` pour
+  0x00-0xFF et dessine une planche PNG -- à refaire si la police est retouchée à nouveau.
+- Sortie **pixel-identique aux 50 jeux de test**, sauf `os2_retrosnake` (l'amélioration ci-dessus, attendue).
