@@ -18,6 +18,7 @@
 #include "core/runtime.h"
 #include "core/class_file.h"
 
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -396,4 +397,74 @@ TEST(interpreter_dup2_on_long_then_lsub_l2i)
     // Pile après lload_0/dup2/lstore_2 : [now] ; puis lload 4 ; lsub -> now - last
     ASSERT_TRUE(interp.invoke(&ci, &mr, nullptr, args, 6, result));
     ASSERT_EQ(result.i, 60);
+}
+
+// ---------------------------------------------------------------------
+// Opcodes ajoutés (Sperm Race / mobapp-game : float, double, jsr/ret, dup2_x1)
+// ---------------------------------------------------------------------
+
+namespace
+{
+    int runInt(std::vector<uint8_t> code, uint16_t maxStack, uint16_t maxLocals, Value *args, int nargs)
+    {
+        ClassFile cf;
+        ClassInfo ci;
+        MethodRecord mr;
+        wireMethod(cf, ci, mr, std::move(code), maxStack, maxLocals);
+        Runtime rt(64 * 1024);
+        Interpreter interp(&rt);
+        Value result;
+        bool ok = interp.invoke(&ci, &mr, nullptr, args, nargs, result);
+        return ok ? result.i : -99999;
+    }
+} // namespace
+
+TEST(interpreter_float_mul_div_add)
+{
+    // (int)(a*b/b) -> a ; (int)(a+b)
+    Value args[2] = {Value::fromFloat(3.0f), Value::fromFloat(4.0f)};
+    ASSERT_EQ(runInt({0x22, 0x23, 0x6a, 0x23, 0x6e, 0x8b, 0xac}, 3, 2, args, 2), 3); // fmul, fdiv, f2i
+    ASSERT_EQ(runInt({0x22, 0x23, 0x62, 0x8b, 0xac}, 2, 2, args, 2), 7);              // fadd
+    ASSERT_EQ(runInt({0x22, 0x23, 0x66, 0x8b, 0xac}, 2, 2, args, 2), -1);             // fsub
+    ASSERT_EQ(runInt({0x22, 0x76, 0x8b, 0xac}, 1, 2, args, 2), -3);                   // fneg
+    ASSERT_EQ(runInt({0x23, 0x22, 0x72, 0x8b, 0xac}, 2, 2, args, 2), 1);              // 4.0 % 3.0 = 1
+}
+
+TEST(interpreter_double_add_mul)
+{
+    double a = 1.5, b = 2.25;
+    int64_t ab, bb;
+    memcpy(&ab, &a, 8);
+    memcpy(&bb, &b, 8);
+    Value args[4];
+    args[0] = Value::fromLong(ab);
+    args[2] = Value::fromLong(bb);
+    ASSERT_EQ(runInt({0x26, 0x28, 0x63, 0x8e, 0xac}, 4, 4, args, 4), 3); // dadd = 3.75 -> 3
+    ASSERT_EQ(runInt({0x26, 0x28, 0x6b, 0x8e, 0xac}, 4, 4, args, 4), 3); // dmul = 3.375 -> 3
+}
+
+TEST(interpreter_dup2_x1_inserts_pair_under_third_slot)
+{
+    // iconst_1, iconst_2, iconst_3, dup2_x1 -> [2,3,1,2,3] ; iadd,isub,isub,isub = -5
+    ASSERT_EQ(runInt({0x04, 0x05, 0x06, 0x5d, 0x60, 0x64, 0x64, 0x64, 0xac}, 6, 1, nullptr, 0), -5);
+}
+
+TEST(interpreter_pop2_pops_two_slots_for_ints_and_one_long)
+{
+    // Régression (Yet Another Snake) : pop2 sur DEUX int ne retirait qu'un slot -> le tableau visé par
+    // l'iastore suivant était perdu (NPE). iconst_5, iconst_1, iconst_2, pop2, ireturn -> 5.
+    ASSERT_EQ(runInt({0x08, 0x04, 0x05, 0x58, 0xac}, 4, 1, nullptr, 0), 5);
+    // iconst_2 (0x05), iconst_3, iconst_4, pop2, ireturn -> 2 (les deux du dessus sont retirés)
+    ASSERT_EQ(runInt({0x05, 0x06, 0x07, 0x58, 0xac}, 4, 1, nullptr, 0), 2);
+    // un long : iconst_2, lconst_1, pop2, ireturn -> 2
+    ASSERT_EQ(runInt({0x05, 0x0a, 0x58, 0xac}, 4, 1, nullptr, 0), 2);
+}
+
+TEST(interpreter_jsr_ret_subroutine)
+{
+    // iconst_1 ; jsr 9 ; iload_0 ; iadd ; ireturn ; nop ; nop ; astore_1 ; iinc 0,10 ; ret 1
+    std::vector<uint8_t> code = {0x04, 0xa8, 0x00, 0x08, 0x1a, 0x60, 0xac, 0x00, 0x00, 0x4c, 0x84, 0x00, 0x0a, 0xa9, 0x01};
+    // NB : jsr en pc=1, offset +8 -> cible 9 ; adresse de retour = 4 (iload_0)
+    Value args[1] = {Value::fromInt(5)};
+    ASSERT_EQ(runInt(code, 3, 2, args, 1), 16);
 }

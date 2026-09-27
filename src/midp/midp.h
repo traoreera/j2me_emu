@@ -34,6 +34,8 @@ namespace jvm
         // Une frame : dispatch des touches réelles, repaint si demandé, present.
         // keyMaskJust/Released : masques bruts du HAL.
         void tick(uint32_t pressedMask, uint32_t justPressedMask, uint32_t justReleasedMask);
+        // Caractères ASCII tapés (et retours arrière) pendant la trame : à appeler avant tick().
+        void setTextInput(const char *ascii, int backspaces);
 
         // Simule un appui stylet/tactile sur le canvas courant : dispatch
         // pointerPressed puis pointerReleased au point (x, y) (écran logique).

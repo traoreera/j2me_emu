@@ -2,6 +2,9 @@
 // Découpé de l'ancien midp_natives.cpp ; état partagé : midp_internal.h.
 
 #include "midp/midp_internal.h"
+#include <map>
+#include <tuple>
+#include "hal/font.h"
 
 namespace jvm
 {
@@ -66,14 +69,30 @@ namespace jvm
                 return g_screenGfx;
             }
 
+            // Chaque GameCanvas possède son PROPRE tampon hors écran (MIDP 2.0 : « initialement rempli de blanc »),
+            // hors tas Java, dont le pointeur brut est rangé dans la cellule G_BUF de son Graphics. Un tampon
+            // partagé perdait le dessin fait dans le constructeur d'un canvas dès qu'un autre était affiché
+            // (écran d'accueil de SnakeWar, noir).
             static Obj *canvasGfx(Obj *gc)
             {
                 if (gc && gc->cells[GC_GFX].o)
                     return gc->cells[GC_GFX].o;
                 Obj *g = makeGraphics(GM_CANVAS_565, nullptr, screenW(), screenH(), screenW());
+                if (g)
+                {
+                    size_t n = static_cast<size_t>(screenW()) * static_cast<size_t>(screenH());
+                    uint16_t *b = new uint16_t[n];
+                    std::fill(b, b + n, static_cast<uint16_t>(0xFFFF));
+                    g->cells[G_BUF].u = reinterpret_cast<uint64_t>(b);
+                }
                 if (gc)
                     gc->cells[GC_GFX] = Value::fromRef(g);
                 return g;
+            }
+            static uint16_t *canvasBuffer(Obj *gc)
+            {
+                Obj *g = canvasGfx(gc);
+                return g ? reinterpret_cast<uint16_t *>(g->cells[G_BUF].u) : nullptr;
             }
 
             static void hline(Pix &p, int x0, int x1, int y, uint32_t c)
@@ -100,111 +119,22 @@ namespace jvm
                     p.put(x, y, c);
             }
 
-            // Font 5x7 (même table que hal/display.cpp).
-            static const uint8_t kFont5x7[96][5] = {
-                {0x00, 0x00, 0x00, 0x00, 0x00},
-                {0x00, 0x00, 0x4F, 0x00, 0x00},
-                {0x00, 0x07, 0x00, 0x07, 0x00},
-                {0x14, 0x7F, 0x14, 0x7F, 0x14},
-                {0x24, 0x2A, 0x7F, 0x2A, 0x12},
-                {0x23, 0x13, 0x08, 0x64, 0x62},
-                {0x36, 0x49, 0x55, 0x22, 0x50},
-                {0x00, 0x05, 0x03, 0x00, 0x00},
-                {0x00, 0x1C, 0x22, 0x41, 0x00},
-                {0x00, 0x41, 0x22, 0x1C, 0x00},
-                {0x14, 0x08, 0x3E, 0x08, 0x14},
-                {0x08, 0x08, 0x3E, 0x08, 0x08},
-                {0x00, 0x50, 0x30, 0x00, 0x00},
-                {0x08, 0x08, 0x08, 0x08, 0x08},
-                {0x00, 0x60, 0x60, 0x00, 0x00},
-                {0x20, 0x10, 0x08, 0x04, 0x02},
-                {0x3E, 0x51, 0x49, 0x45, 0x3E},
-                {0x00, 0x42, 0x7F, 0x40, 0x00},
-                {0x42, 0x61, 0x51, 0x49, 0x46},
-                {0x21, 0x41, 0x45, 0x4B, 0x31},
-                {0x18, 0x14, 0x12, 0x7F, 0x10},
-                {0x27, 0x45, 0x45, 0x45, 0x39},
-                {0x3C, 0x4A, 0x49, 0x49, 0x30},
-                {0x01, 0x71, 0x09, 0x05, 0x03},
-                {0x36, 0x49, 0x49, 0x49, 0x36},
-                {0x06, 0x49, 0x49, 0x29, 0x1E},
-                {0x00, 0x14, 0x14, 0x00, 0x00},
-                {0x00, 0x40, 0x34, 0x00, 0x00},
-                {0x00, 0x08, 0x14, 0x22, 0x41},
-                {0x14, 0x14, 0x14, 0x14, 0x14},
-                {0x41, 0x22, 0x14, 0x08, 0x00},
-                {0x02, 0x01, 0x51, 0x09, 0x06},
-                {0x32, 0x49, 0x79, 0x41, 0x3E},
-                {0x7E, 0x11, 0x11, 0x11, 0x7E},
-                {0x7F, 0x49, 0x49, 0x49, 0x36},
-                {0x3E, 0x41, 0x41, 0x41, 0x22},
-                {0x7F, 0x41, 0x41, 0x22, 0x1C},
-                {0x7F, 0x49, 0x49, 0x49, 0x41},
-                {0x7F, 0x09, 0x09, 0x09, 0x01},
-                {0x3E, 0x41, 0x49, 0x49, 0x7A},
-                {0x7F, 0x08, 0x08, 0x08, 0x7F},
-                {0x00, 0x41, 0x7F, 0x41, 0x00},
-                {0x20, 0x40, 0x41, 0x3F, 0x01},
-                {0x7F, 0x08, 0x14, 0x22, 0x41},
-                {0x7F, 0x40, 0x40, 0x40, 0x40},
-                {0x7F, 0x02, 0x0C, 0x02, 0x7F},
-                {0x7F, 0x04, 0x08, 0x10, 0x7F},
-                {0x3E, 0x41, 0x41, 0x41, 0x3E},
-                {0x7F, 0x09, 0x09, 0x09, 0x06},
-                {0x3E, 0x41, 0x51, 0x21, 0x5E},
-                {0x7F, 0x09, 0x19, 0x29, 0x46},
-                {0x46, 0x49, 0x49, 0x49, 0x31},
-                {0x01, 0x01, 0x7F, 0x01, 0x01},
-                {0x3F, 0x40, 0x40, 0x40, 0x3F},
-                {0x1F, 0x20, 0x40, 0x20, 0x1F},
-                {0x3F, 0x40, 0x38, 0x40, 0x3F},
-                {0x63, 0x14, 0x08, 0x14, 0x63},
-                {0x07, 0x08, 0x70, 0x08, 0x07},
-                {0x61, 0x51, 0x49, 0x45, 0x43},
-                {0x00, 0x7F, 0x41, 0x41, 0x00},
-                {0x02, 0x04, 0x08, 0x10, 0x20},
-                {0x00, 0x41, 0x41, 0x7F, 0x00},
-                {0x04, 0x02, 0x01, 0x02, 0x04},
-                {0x40, 0x40, 0x40, 0x40, 0x40},
-                {0x00, 0x01, 0x02, 0x04, 0x00},
-                {0x20, 0x54, 0x54, 0x54, 0x78},
-                {0x7F, 0x48, 0x44, 0x44, 0x38},
-                {0x38, 0x44, 0x44, 0x44, 0x20},
-                {0x38, 0x44, 0x44, 0x48, 0x7F},
-                {0x38, 0x54, 0x54, 0x54, 0x18},
-                {0x08, 0x7E, 0x09, 0x01, 0x02},
-                {0x0C, 0x52, 0x52, 0x52, 0x3E},
-                {0x7F, 0x08, 0x04, 0x04, 0x78},
-                {0x00, 0x44, 0x7D, 0x40, 0x00},
-                {0x20, 0x40, 0x44, 0x3D, 0x00},
-                {0x7F, 0x10, 0x28, 0x44, 0x00},
-                {0x00, 0x41, 0x7F, 0x40, 0x00},
-                {0x7C, 0x04, 0x18, 0x04, 0x78},
-                {0x7C, 0x08, 0x04, 0x04, 0x78},
-                {0x38, 0x44, 0x44, 0x44, 0x38},
-                {0x7C, 0x14, 0x14, 0x14, 0x08},
-                {0x08, 0x14, 0x14, 0x18, 0x7C},
-                {0x7C, 0x08, 0x04, 0x04, 0x08},
-                {0x48, 0x54, 0x54, 0x54, 0x20},
-                {0x04, 0x3F, 0x44, 0x40, 0x20},
-                {0x3C, 0x40, 0x40, 0x20, 0x7C},
-                {0x1C, 0x20, 0x40, 0x20, 0x1C},
-                {0x3C, 0x40, 0x30, 0x40, 0x3C},
-                {0x44, 0x28, 0x10, 0x28, 0x44},
-                {0x0C, 0x50, 0x50, 0x50, 0x3C},
-                {0x44, 0x64, 0x54, 0x4C, 0x44},
-                {0x00, 0x08, 0x36, 0x41, 0x00},
-                {0x00, 0x00, 0x7F, 0x00, 0x00},
-                {0x00, 0x41, 0x36, 0x08, 0x00},
-                {0x08, 0x04, 0x08, 0x10, 0x08},
-            };
+            // Police 5x7 partagée avec le HAL (hal/font.cpp, ASCII + Latin-1 composé).
 
-            static int strWidth(const char *s)
+
+            // Échelle de la police : x2 sur les grands écrans (>= 400 px de large), x2 encore pour SIZE_LARGE.
+            static int fontScaleOf(Obj *font)
+            {
+                int base = screenW() >= 400 ? 2 : 1;
+                int size = (font && font->kind == ObjKind::Instance) ? font->cells[F_SIZE].i : 0;
+                return base * (size == 16 ? 2 : 1);
+            }
+            static int strWidth(const char *s, int scale = 1)
             {
                 int w = 0;
                 while (s && *s)
                 {
-                    w += 6;
+                    w += 6 * scale;
                     s++;
                 }
                 return w;
@@ -230,6 +160,12 @@ namespace jvm
             {
                 setInt(ctx, static_cast<int32_t>(static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) & 0xFFFFFF));
             }
+            static void g_getRed(NativeContext *ctx) { setInt(ctx, (static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) >> 16) & 0xFF); }
+            static void g_getGreen(NativeContext *ctx) { setInt(ctx, (static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) >> 8) & 0xFF); }
+            static void g_getBlue(NativeContext *ctx) { setInt(ctx, static_cast<uint32_t>(ctx->thisObj->cells[G_COLOR].u) & 0xFF); }
+            static void g_getDisplayColor(NativeContext *ctx) { setInt(ctx, argInt(ctx, 1) & 0xFFFFFF); } // écran vraies couleurs
+            static void g_strokeGet(NativeContext *ctx) { setInt(ctx, 0); }                                // SOLID
+            static void g_drawSubstring(NativeContext *ctx);
             static void g_setGray(NativeContext *ctx)
             {
                 uint32_t v = static_cast<uint32_t>(argInt(ctx, 1)) & 0xFF;
@@ -391,6 +327,23 @@ namespace jvm
             {
                 ctx->thisObj->cells[G_FONT] = Value::fromRef(argRef(ctx, 1));
             }
+            static void g_drawString(NativeContext *ctx);
+            // drawSubstring(String str, int offset, int len, int x, int y, int anchor)
+            static void g_drawSubstring(NativeContext *ctx)
+            {
+                Obj *s = argRef(ctx, 1);
+                if (!s || s->kind != ObjKind::String)
+                    return;
+                int off = argInt(ctx, 2), len = argInt(ctx, 3);
+                if (off < 0 || len < 0 || (size_t)(off + len) > s->str.size())
+                    return;
+                Obj *sub = g_rt->heap().newString(s->str.substr(off, len));
+                Value a[5] = {Value::fromRef(ctx->thisObj), Value::fromRef(sub), Value::fromInt(argInt(ctx, 4)), Value::fromInt(argInt(ctx, 5)), Value::fromInt(argInt(ctx, 6))};
+                NativeContext c2 = *ctx;
+                c2.args = a;
+                c2.nargs = 5;
+                g_drawString(&c2);
+            }
             static void g_getFont(NativeContext *ctx)
             {
                 Obj *f = ctx->thisObj->cells[G_FONT].o;
@@ -419,30 +372,41 @@ namespace jvm
                 Obj *s = argRef(ctx, 1);
                 int x = argInt(ctx, 2), y = argInt(ctx, 3), anchor = argInt(ctx, 4);
                 const char *text = (s && s->kind == ObjKind::String) ? s->str.c_str() : "";
-                int wlen = strWidth(text);
+                Obj *font = ctx->thisObj->cells[G_FONT].o;
+                const int sc = fontScaleOf(font);
+                const int style = (font && font->kind == ObjKind::Instance) ? font->cells[F_STYLE].i : 0;
+                const int wlen = strWidth(text, sc);
                 if (anchor & 0x01)
                     x -= wlen / 2; // HCENTER
                 else if (anchor & 0x08)
                     x -= wlen; // RIGHT
                 if (anchor & 0x02)
-                    y -= 3; // VCENTER
-                else if (anchor & 0x20)
-                    y -= 6; // BASELINE
+                    y -= 4 * sc; // VCENTER (non standard pour le texte, toléré)
                 else if (anchor & 0x40)
-                    y -= 7; // BOTTOM
+                    y -= 6 * sc; // BASELINE (0x40) : la ligne de base = ascendante de la police
+                else if (anchor & 0x20)
+                    y -= 8 * sc; // BOTTOM (0x20) : hauteur de la police
+                const int x0 = x;
                 while (*text)
                 {
-                    unsigned char ch = static_cast<unsigned char>(*text);
-                    if (ch < 0x20 || ch > 0x7F)
-                        ch = '?';
-                    const uint8_t *glyph = kFont5x7[ch - 0x20];
+                    const uint8_t *glyph = hal::font_glyph(static_cast<unsigned char>(*text));
                     for (int col = 0; col < 5; col++)
                         for (int row = 0; row < 7; row++)
                             if (glyph[col] & (1 << row))
-                                p.put(x + col, y + row, p.color);
-                    x += 6;
+                                for (int dy = 0; dy < sc; dy++)
+                                    for (int dx = 0; dx < sc; dx++)
+                                    {
+                                        p.put(x + col * sc + dx, y + row * sc + dy, p.color);
+                                        if (style & 1) // STYLE_BOLD : double frappe décalée d'un pixel logique
+                                            p.put(x + col * sc + dx + sc, y + row * sc + dy, p.color);
+                                    }
+                    x += 6 * sc;
                     text++;
                 }
+                if (style & 4) // STYLE_UNDERLINED
+                    for (int ux = x0; ux < x; ux++)
+                        for (int dy = 0; dy < sc; dy++)
+                            p.put(ux, y + 7 * sc + dy, p.color);
             }
             static void g_drawChar(NativeContext *ctx)
             {
@@ -507,15 +471,8 @@ namespace jvm
                 // Clamp aux bornes de l'écran réellement configuré (pas un
                 // 800x480 en dur) pour que l'image reste au moins partiellement
                 // visible même sur un profil de résolution différent.
-                int sw = screenW(), sh = screenH();
-                if (x > sw)
-                    x = sw;
-                if (y > sh)
-                    y = sh;
-                if (x + iw <= 0)
-                    x = 1 - iw;
-                if (y + ih <= 0)
-                    y = 1 - ih;
+                // (plus de « clamp » : Pix::put() rogne au clip et à la cible. L'ancien repositionnement d'une image
+                // entièrement hors écran laissait une colonne d'un pixel visible au bord.)
                 Pix p(ctx->thisObj);
                 for (int yy = 0; yy < ih; yy++)
                     for (int xx = 0; xx < iw; xx++)
@@ -555,17 +512,6 @@ namespace jvm
                     h = ih - ys;
                 // Clamp aux bornes de l'écran réellement configuré (cf. même
                 // correction dans g_drawImage juste au-dessus).
-                {
-                    int sw = screenW(), sh = screenH();
-                    if (x > sw)
-                        x = sw;
-                    if (y > sh)
-                        y = sh;
-                }
-                if (x + w <= 0)
-                    x = 1 - w;
-                if (y + h <= 0)
-                    y = 1 - h;
                 if (w <= 0 || h <= 0)
                     return;
 
@@ -714,34 +660,35 @@ namespace jvm
                 }
                 setRef(ctx, f);
             }
-            static void f_getHeight(NativeContext *ctx)
+            static void f_getDefaultFont(NativeContext *ctx)
             {
-                (void)ctx;
-                setInt(ctx, 7);
+                // FACE_SYSTEM(0), STYLE_PLAIN(0), SIZE_MEDIUM(0) : même objet que getFont(0,0,0).
+                Obj *f = g_fontCache[0][1];
+                if (!f)
+                {
+                    f = makeInstance("javax/microedition/lcdui/Font");
+                    if (f)
+                    {
+                        f->cells[F_FACE] = Value::fromInt(0);
+                        f->cells[F_STYLE] = Value::fromInt(0);
+                        f->cells[F_SIZE] = Value::fromInt(0);
+                        g_fontCache[0][1] = f;
+                    }
+                }
+                setRef(ctx, f);
             }
-            static void f_getBaseline(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6);
-            }
+            static void f_getHeight(NativeContext *ctx) { setInt(ctx, 8 * fontScaleOf(ctx->thisObj)); }
+            static void f_getBaseline(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj)); }
             static void f_getFace(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_FACE].i); }
             static void f_getStyle(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_STYLE].i); }
             static void f_getSize(NativeContext *ctx) { setInt(ctx, ctx->thisObj->cells[F_SIZE].i); }
             static void f_stringWidth(NativeContext *ctx)
             {
-                const std::string &s = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : *new std::string("");
-                setInt(ctx, strWidth(s.c_str()));
+                Obj *so = argRef(ctx, 1);
+                setInt(ctx, strWidth((so && so->kind == ObjKind::String) ? so->str.c_str() : "", fontScaleOf(ctx->thisObj)));
             }
-            static void f_charWidth(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6);
-            }
-            static void f_charsWidth(NativeContext *ctx)
-            {
-                (void)ctx;
-                setInt(ctx, 6 * argInt(ctx, 3));
-            }
+            static void f_charWidth(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj)); }
+            static void f_charsWidth(NativeContext *ctx) { setInt(ctx, 6 * fontScaleOf(ctx->thisObj) * argInt(ctx, 3)); }
 
             // ---------------------------------------------------------------------
             // Image natives
@@ -856,9 +803,74 @@ namespace jvm
                     buf->cells[i].u = sb ? sb->cells[i].u : 0;
                 setRef(ctx, makeImage(w, h, true, buf));
             }
+            // Image.createImage(Image src, int x, int y, int w, int h, int transform) : sous-image transformée
+            // (mêmes 8 transformations que drawRegion ; résultat immuable).
+            // Résultats mémorisés : sans GC, un jeu qui recrée la même sous-image à chaque trame (Stalker : police
+            // bitmap découpée à la volée) épuisait le tas et rendait l'émulateur inutilisable. Les images
+            // créées ici sont IMMUABLES : partager l'objet est sans conséquence.
+            static std::map<std::tuple<Obj *, int, int, int, int, int>, Obj *> g_subCache;
+            static void img_createSub(NativeContext *ctx)
+            {
+                Obj *src = argRef(ctx, 0);
+                int x = argInt(ctx, 1), y = argInt(ctx, 2), w = argInt(ctx, 3), h = argInt(ctx, 4), tfm = argInt(ctx, 5);
+                auto ck = std::make_tuple(src, x, y, w, h, tfm);
+                auto cit = g_subCache.find(ck);
+                if (cit != g_subCache.end())
+                {
+                    setRef(ctx, cit->second);
+                    return;
+                }
+                if (!src || src->kind != ObjKind::Instance || w <= 0 || h <= 0 || x < 0 || y < 0 ||
+                    x + w > src->cells[IMG_W].i || y + h > src->cells[IMG_H].i || tfm < 0 || tfm > 7)
+                {
+                    setRef(ctx, nullptr); // (IllegalArgumentException dans une vraie JVM)
+                    return;
+                }
+                bool swap = (tfm >= 4 && tfm <= 7);
+                int Wp = swap ? h : w, Hp = swap ? w : h;
+                int iw = src->cells[IMG_W].i;
+                Obj *sb = src->cells[IMG_BUF].o;
+                Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, Wp * Hp);
+                if (!buf)
+                {
+                    g_rt->reportOom();
+                    setRef(ctx, nullptr);
+                    return;
+                }
+                for (int dy = 0; dy < Hp; dy++)
+                    for (int dx = 0; dx < Wp; dx++)
+                    {
+                        int sx, sy;
+                        switch (tfm)
+                        {
+                        case 1: sx = dx; sy = h - 1 - dy; break;
+                        case 2: sx = w - 1 - dx; sy = dy; break;
+                        case 3: sx = w - 1 - dx; sy = h - 1 - dy; break;
+                        case 4: sx = dy; sy = dx; break;
+                        case 5: sx = dy; sy = h - 1 - dx; break;
+                        case 6: sx = w - 1 - dy; sy = dx; break;
+                        case 7: sx = w - 1 - dy; sy = h - 1 - dx; break;
+                        default: sx = dx; sy = dy; break;
+                        }
+                        buf->cells[dy * Wp + dx].u = sb ? sb->cells[(y + sy) * iw + (x + sx)].u : 0;
+                    }
+                Obj *made = makeImage(Wp, Hp, false, buf);
+                if (made && src && !src->cells[IMG_MUT].i) // source immuable : le cache reste valide
+                    g_subCache[ck] = made;
+                setRef(ctx, made);
+            }
+            static std::map<std::string, Obj *> g_pathCache;
             static void img_createString(NativeContext *ctx)
             {
                 std::string path = (argRef(ctx, 0) && argRef(ctx, 0)->kind == ObjKind::String) ? argRef(ctx, 0)->str : "";
+                {
+                    auto pit = g_pathCache.find(path);
+                    if (pit != g_pathCache.end())
+                    {
+                        setRef(ctx, pit->second); // image immuable déjà décodée : on la réutilise (pas de GC -> pas de re-décodage à chaque appel)
+                        return;
+                    }
+                }
                 while (!path.empty() && path[0] == '/')
                     path.erase(0, 1);
                 jme::JarReader *jar = ctx->rt->jar();
@@ -875,16 +887,16 @@ namespace jvm
                         {
                             if (jvm::jmeDebug())
                                 fprintf(stderr, "[midp] createImage(\"%s\") : decode OK (%zu octets)\n", path.c_str(), n);
+                            g_pathCache[path] = img;
                             setRef(ctx, img);
                             return;
                         }
                     }
                 }
-                fprintf(stderr, "[midp] createImage(\"%s\") : introuvable ou décodage échoué\n", path.c_str());
-                Obj *buf = g_rt->heap().newArray(ObjKind::IntArray, 1);
-                if (buf)
-                    buf->cells[0].u = 0xFFFFFFFF;
-                setRef(ctx, makeImage(1, 1, false, buf));
+                // Spec MIDP : IOException si la ressource est introuvable ou n'est pas une image décodable
+                // (le jeu la rattrape et se replie). Avant : image blanche 1x1 de remplacement.
+                fprintf(stderr, "[midp] createImage(\"%s\") : introuvable ou décodage échoué -> IOException\n", path.c_str());
+                throwJava(ctx, "java/io/IOException");
             }
             static void img_getGraphics(NativeContext *ctx)
             {
@@ -951,15 +963,32 @@ namespace jvm
                     return;
                 g_flushCalls++;
                 auto *fb = hal::display_get_framebuffer();
-                if (fb && fb->pixels)
-                    if (jvm::jmeDebug())
-                        fprintf(stderr, "flushGraphics()\n");
-                std::memcpy(fb->pixels, g_canvas565, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
-                hal::display_present(fb);
+                if (jvm::jmeDebug())
+                    fprintf(stderr, "flushGraphics()\n");
+                if (uint16_t *src = canvasBuffer(ctx->thisObj))
+                    if (fb && fb->pixels)
+                    {
+                        std::memcpy(fb->pixels, src, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
+                        hal::display_present(fb);
+                    }
+                // Sur un vrai téléphone flushGraphics() est synchronisé sur l'affichage : beaucoup de boucles de jeu
+                // n'ont AUCUN Thread.sleep et comptent sur lui pour se cadencer. Ici on cède la main jusqu'à la trame
+                // suivante (une image par trame et par thread, sans brûler tout le budget de CPU en dessins inutiles).
+                jvm::jme_yieldNow();
             }
             static void gc_flushRegion(NativeContext *ctx)
             {
                 gc_flushGraphics(ctx);
+            }
+            // Implémentation par défaut de GameCanvas.paint() (MIDP 2.0) : affiche le tampon hors écran
+            // (celui de getGraphics()). Un GameCanvas qui ne surcharge pas paint() et dessine une fois
+            // dans son constructeur (SnakeWar : écran d'accueil) reste sinon noir.
+            void presentGameCanvasBuffer(Obj *gc)
+            {
+                auto *fb = hal::display_get_framebuffer();
+                if (uint16_t *src = canvasBuffer(gc))
+                    if (fb && fb->pixels)
+                        std::memcpy(fb->pixels, src, static_cast<size_t>(screenH()) * fb->stride * sizeof(uint16_t));
             }
             static void gc_getKeyStates(NativeContext *ctx)
             {
@@ -1007,12 +1036,12 @@ namespace jvm
                             sx = dyy;
                             sy = dxx;
                             break;
-                        case 5:
+                        case 5: // ROT90 : dest = h x w
                             sx = dyy;
-                            sy = w - 1 - dxx;
+                            sy = h - 1 - dxx;
                             break;
-                        case 6:
-                            sx = h - 1 - dyy;
+                        case 6: // ROT270
+                            sx = w - 1 - dyy;
                             sy = dxx;
                             break;
                         case 7:
@@ -1251,14 +1280,14 @@ namespace jvm
                 Obj *src = argRef(ctx, 0);
                 if (!src || src->cellCount < 3 || !src->cells[0].o)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 Obj *data = src->cells[0].o;
                 int pos = src->cells[1].i, lim = src->cells[2].i;
                 if (data->kind != ObjKind::ByteArray || pos < 0 || lim > data->arrayLen || pos >= lim)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 if (jvm::jmeDebug())
@@ -1266,13 +1295,14 @@ namespace jvm
                 uint8_t *buf = static_cast<uint8_t *>(std::malloc(size_t(lim - pos)));
                 if (!buf)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 for (int i = pos; i < lim; i++)
                     buf[i - pos] = static_cast<uint8_t>(data->cells[i].u);
                 Obj *img = decodePng(buf, size_t(lim - pos));
                 std::free(buf);
+                if (!img) { throwJava(ctx, "java/io/IOException"); return; }
                 setRef(ctx, img);
             }
 
@@ -1282,19 +1312,20 @@ namespace jvm
                 int off = argInt(ctx, 1), len = argInt(ctx, 2);
                 if (!data || data->kind != ObjKind::ByteArray || off < 0 || len < 0 || off + len > data->arrayLen)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 uint8_t *buf = static_cast<uint8_t *>(std::malloc(size_t(len ? len : 1)));
                 if (!buf)
                 {
-                    setRef(ctx, nullptr);
+                    throwJava(ctx, "java/io/IOException");
                     return;
                 }
                 for (int i = 0; i < len; i++)
                     buf[i] = static_cast<uint8_t>(data->cells[off + i].u);
                 Obj *img = decodePng(buf, size_t(len));
                 std::free(buf);
+                if (!img) { throwJava(ctx, "java/lang/IllegalArgumentException"); return; }
                 setRef(ctx, img);
             }
             void registerGraphicsNatives()
@@ -1307,6 +1338,12 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.setColor:(I)V", g_setColorI);
                 regN("javax/microedition/lcdui/Graphics.setColor:(III)V", g_setColorRGB);
                 regN("javax/microedition/lcdui/Graphics.getColor:()I", g_getColor);
+                regN("javax/microedition/lcdui/Graphics.getRedComponent:()I", g_getRed);
+                regN("javax/microedition/lcdui/Graphics.getGreenComponent:()I", g_getGreen);
+                regN("javax/microedition/lcdui/Graphics.getBlueComponent:()I", g_getBlue);
+                regN("javax/microedition/lcdui/Graphics.getDisplayColor:(I)I", g_getDisplayColor);
+                regN("javax/microedition/lcdui/Graphics.getStrokeStyle:()I", g_strokeGet);
+                regN("javax/microedition/lcdui/Graphics.drawSubstring:(Ljava/lang/String;IIIII)V", g_drawSubstring);
                 regN("javax/microedition/lcdui/Graphics.setGrayScale:(I)V", g_setGray);
                 regN("javax/microedition/lcdui/Graphics.getGrayScale:()I", g_getColor);
                 regN("javax/microedition/lcdui/Graphics.fillRect:(IIII)V", g_fillRect);
@@ -1329,8 +1366,8 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.drawRoundRect:(IIIIII)V", g_drawRoundRect);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
-                regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
-                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
+                regN("javax/microedition/lcdui/Graphics.drawChar:(CIII)V", g_drawChar);
+                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIIII)V", g_drawChars);
                 regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
                 regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
                 regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);
@@ -1345,8 +1382,8 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.drawRGB:([IIIIIIIZ)V", g_drawRGB);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;II)V", g_drawString);
                 regN("javax/microedition/lcdui/Graphics.drawString:(Ljava/lang/String;III)V", g_drawString);
-                regN("javax/microedition/lcdui/Graphics.drawChar:(CII)V", g_drawChar);
-                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIII)V", g_drawChars);
+                regN("javax/microedition/lcdui/Graphics.drawChar:(CIII)V", g_drawChar);
+                regN("javax/microedition/lcdui/Graphics.drawChars:([CIIIII)V", g_drawChars);
                 regN("javax/microedition/lcdui/Graphics.drawImage:(Ljavax/microedition/lcdui/Image;III)V", g_drawImage);
                 regN("javax/microedition/lcdui/Graphics.drawRegion:(Ljavax/microedition/lcdui/Image;IIIIIIII)V", g_drawRegion);
                 regN("javax/microedition/lcdui/Graphics.setClip:(IIII)V", g_setClipXYWH);
@@ -1359,6 +1396,7 @@ namespace jvm
                 regN("javax/microedition/lcdui/Graphics.getTranslateX:()I", g_getTranslateX);
                 regN("javax/microedition/lcdui/Graphics.getTranslateY:()I", g_getTranslateY);
                 regN("javax/microedition/lcdui/Font.getFont:(III)Ljavax/microedition/lcdui/Font;", f_getFont);
+                regN("javax/microedition/lcdui/Font.getDefaultFont:()Ljavax/microedition/lcdui/Font;", f_getDefaultFont);
                 regN("javax/microedition/lcdui/Font.getHeight:()I", f_getHeight);
                 regN("javax/microedition/lcdui/Font.getBaselinePosition:()I", f_getBaseline);
                 regN("javax/microedition/lcdui/Font.getFace:()I", f_getFace);
@@ -1372,6 +1410,7 @@ namespace jvm
                 regN("javax/microedition/lcdui/Image.createImage:(Ljava/io/InputStream;)Ljavax/microedition/lcdui/Image;", img_createStream);
                 regN("javax/microedition/lcdui/Image.createImage:([BII)Ljavax/microedition/lcdui/Image;", img_createBytes);
                 regN("javax/microedition/lcdui/Image.createImage:(Ljavax/microedition/lcdui/Image;)Ljavax/microedition/lcdui/Image;", img_copy);
+                regN("javax/microedition/lcdui/Image.createImage:(Ljavax/microedition/lcdui/Image;IIIII)Ljavax/microedition/lcdui/Image;", img_createSub);
                 regN("javax/microedition/lcdui/Image.createRGBImage:([IIIZ)Ljavax/microedition/lcdui/Image;", img_createRGB);
                 regN("javax/microedition/lcdui/Image.getGraphics:()Ljavax/microedition/lcdui/Graphics;", img_getGraphics);
                 regN("javax/microedition/lcdui/Image.getWidth:()I", img_getWidth);

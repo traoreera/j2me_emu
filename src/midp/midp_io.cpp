@@ -54,6 +54,11 @@ namespace jvm
                     n = len;
                 if (n < 0)
                     n = 0;
+                // InputStream.read(byte[],off,len) : -1 en fin de flux (0 seulement si len == 0). Renvoyer 0
+                // faisait boucler à l'infini les `while ((r = in.read(buf, o, l)) >= 0) o += r;`
+                // (Warehouse : hang dans readResource).
+                if (n == 0 && len > 0)
+                    return -1;
                 if (data)
                     for (int i = 0; i < n; i++)
                         dst->cells[off + i].u = data->cells[pos + i].u;
@@ -283,6 +288,91 @@ static void native_TimerTask_init(NativeContext *ctx)
                 return in ? streamFill(in, dst, off, len) : -1;
             }
 
+            // DataInputStream.readXxx : EOFException si le flux ne contient plus assez d'octets (les jeux lisent
+            // souvent « jusqu'à l'EOFException »).
+            static bool diNeed(NativeContext *ctx, int n)
+            {
+                Obj *self = ctx->thisObj;
+                Obj *in = self && self->cellCount >= 1 ? self->cells[0].o : nullptr;
+                if (!in || in->cellCount < 3 || in->cells[2].i - in->cells[1].i < n)
+                {
+                    throwJava(ctx, "java/io/EOFException");
+                    return false;
+                }
+                return true;
+            }
+            // ----- java.io.InputStreamReader : décodage octets -> caractères (Latin-1 ou UTF-8 -> Latin-1) -----
+            // cells[0] = InputStream source, cells[1] = 1 si UTF-8.
+            static int isrReadChar(Obj *self)
+            {
+                Obj *in = self && self->cellCount >= 2 ? self->cells[0].o : nullptr;
+                int b = streamByte(in);
+                if (b < 0 || b < 0x80 || !self->cells[1].i)
+                    return b;
+                int need = (b & 0xE0) == 0xC0 ? 1 : ((b & 0xF0) == 0xE0 ? 2 : ((b & 0xF8) == 0xF0 ? 3 : 0));
+                uint32_t cp = need == 1 ? (b & 0x1Fu) : (need == 2 ? (b & 0x0Fu) : (b & 0x07u));
+                for (int k = 0; k < need; k++)
+                {
+                    int b2 = streamByte(in);
+                    if (b2 < 0)
+                        return '?';
+                    cp = (cp << 6) | (b2 & 0x3Fu);
+                }
+                return cp < 256 ? static_cast<int>(cp) : '?';
+            }
+            static void isr_init(NativeContext *ctx)
+            {
+                Obj *self = ctx->thisObj;
+                if (!self || self->cellCount < 2)
+                    return;
+                self->cells[0] = Value::fromRef(argRef(ctx, 1));
+                Obj *enc = ctx->nargs > 2 ? argRef(ctx, 2) : nullptr;
+                std::string e = (enc && enc->kind == ObjKind::String) ? enc->str : "";
+                for (char &c : e) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+                self->cells[1] = Value::fromInt((e == "UTF-8" || e == "UTF8") ? 1 : 0);
+                if (ctx->nargs > 2 && enc && e != "UTF-8" && e != "UTF8" && e != "ISO-8859-1" && e != "ISO8859_1" && e != "US-ASCII" && e != "ASCII")
+                    throwJava(ctx, "java/io/UnsupportedEncodingException");
+            }
+            static void isr_read(NativeContext *ctx) { setInt(ctx, isrReadChar(ctx->thisObj)); }
+            static void isr_readArr(NativeContext *ctx) // read(char[]) / read(char[],off,len)
+            {
+                Obj *a = argRef(ctx, 1);
+                int off = ctx->nargs > 2 ? argInt(ctx, 2) : 0;
+                int len = ctx->nargs > 3 ? argInt(ctx, 3) : (a ? a->arrayLen : 0);
+                if (!a || off < 0 || len < 0 || off + len > a->arrayLen)
+                {
+                    throwJava(ctx, "java/lang/IndexOutOfBoundsException");
+                    return;
+                }
+                if (len == 0)
+                {
+                    setInt(ctx, 0);
+                    return;
+                }
+                int n = 0;
+                for (; n < len; n++)
+                {
+                    int c = isrReadChar(ctx->thisObj);
+                    if (c < 0)
+                        break;
+                    a->cells[off + n] = Value::fromInt(c);
+                }
+                setInt(ctx, n == 0 ? -1 : n);
+            }
+            static void isr_ready(NativeContext *ctx)
+            {
+                Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 2 ? ctx->thisObj->cells[0].o : nullptr;
+                setInt(ctx, (in && in->cellCount >= 3 && in->cells[2].i > in->cells[1].i) ? 1 : 0);
+            }
+            static void isr_skip(NativeContext *ctx)
+            {
+                int64_t n = argLongL(ctx, 1), k = 0;
+                while (k < n && isrReadChar(ctx->thisObj) >= 0)
+                    k++;
+                setLong(ctx, k);
+            }
+            static void isr_close(NativeContext *ctx) { (void)ctx; }
+
             static void di_read(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj)); }
             static void di_readArr(NativeContext *ctx)
             {
@@ -290,9 +380,9 @@ static void native_TimerTask_init(NativeContext *ctx)
                 setInt(ctx, diFill(ctx->thisObj, d, 0, d ? d->arrayLen : 0));
             }
             static void di_readArrII(NativeContext *ctx) { setInt(ctx, diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3))); }
-            static void di_readBoolean(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj) != 0 ? 1 : 0); }
-            static void di_readByte(NativeContext *ctx) { setInt(ctx, static_cast<int8_t>(diByte(ctx->thisObj))); }
-            static void di_readUnsignedByte(NativeContext *ctx) { setInt(ctx, diByte(ctx->thisObj)); }
+            static void di_readBoolean(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, diByte(ctx->thisObj) != 0 ? 1 : 0); }
+            static void di_readByte(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, static_cast<int8_t>(diByte(ctx->thisObj))); }
+            static void di_readUnsignedByte(NativeContext *ctx) { if (diNeed(ctx, 1)) setInt(ctx, diByte(ctx->thisObj)); }
 
             static int64_t diReadN(Obj *self, int n)
             {
@@ -306,27 +396,30 @@ static void native_TimerTask_init(NativeContext *ctx)
                 }
                 return static_cast<int64_t>(v);
             }
-            static void di_readShort(NativeContext *ctx) { setInt(ctx, static_cast<int16_t>(diReadN(ctx->thisObj, 2))); }
-            static void di_readUnsignedShort(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
-            static void di_readChar(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
-            static void di_readInt(NativeContext *ctx) { setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 4))); }
-            static void di_readLong(NativeContext *ctx) { setLong(ctx, diReadN(ctx->thisObj, 8)); }
+            static void di_readShort(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int16_t>(diReadN(ctx->thisObj, 2))); }
+            static void di_readUnsignedShort(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
+            static void di_readChar(NativeContext *ctx) { if (diNeed(ctx, 2)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 2) & 0xFFFF)); }
+            static void di_readInt(NativeContext *ctx) { if (diNeed(ctx, 4)) setInt(ctx, static_cast<int32_t>(diReadN(ctx->thisObj, 4))); }
+            static void di_readLong(NativeContext *ctx) { if (diNeed(ctx, 8)) setLong(ctx, diReadN(ctx->thisObj, 8)); }
             static void di_readFully(NativeContext *ctx)
             {
                 Obj *d = argRef(ctx, 1);
-                if (d)
+                if (d && diNeed(ctx, d->arrayLen))
                     diFill(ctx->thisObj, d, 0, d->arrayLen);
             }
-            static void di_readFullyII(NativeContext *ctx) { diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3)); }
+            static void di_readFullyII(NativeContext *ctx)
+            {
+                if (diNeed(ctx, argInt(ctx, 3)))
+                    diFill(ctx->thisObj, argRef(ctx, 1), argInt(ctx, 2), argInt(ctx, 3));
+            }
 
             static void di_readUTF(NativeContext *ctx)
             {
-                int lenH = diByte(ctx->thisObj), lenL = diByte(ctx->thisObj);
-                if (lenH < 0 || lenL < 0)
-                {
-                    setRef(ctx, g_rt->heap().newString(""));
+                if (!diNeed(ctx, 2))
                     return;
-                }
+                int lenH = diByte(ctx->thisObj), lenL = diByte(ctx->thisObj);
+                if (!diNeed(ctx, (lenH << 8) | lenL))
+                    return;
                 int len = (lenH << 8) | lenL;
                 std::string out;
                 out.reserve(static_cast<size_t>(len) * 2);
@@ -357,8 +450,7 @@ static void native_TimerTask_init(NativeContext *ctx)
                     else
                     {
                         int need = (b < 0xE0) ? 2 : 3;
-                        std::string seq;
-                        seq += static_cast<char>(b);
+                        int bs[3] = {b, 0, 0};
                         int ok = 1;
                         for (int k = 1; k < need; k++)
                         {
@@ -368,10 +460,15 @@ static void native_TimerTask_init(NativeContext *ctx)
                                 ok = 0;
                                 break;
                             }
-                            seq += static_cast<char>(b2);
+                            bs[k] = b2;
                         }
                         if (ok)
-                            out += seq;
+                        {
+                            // Les String du projet sont en Latin-1 : U+0080..U+00FF conservés, le reste -> '?'.
+                            uint32_t cp = (need == 2) ? (((b & 0x1Fu) << 6) | (bs[1] & 0x3Fu))
+                                                      : (((b & 0x0Fu) << 12) | ((bs[1] & 0x3Fu) << 6) | (bs[2] & 0x3Fu));
+                            out += cp < 256 ? static_cast<char>(cp) : '?';
+                        }
                         i += need;
                     }
                 }
@@ -509,10 +606,11 @@ static void native_TimerTask_init(NativeContext *ctx)
                 // (scores, noms, clés de préférences).
                 std::string enc;
                 enc.reserve(str.size());
-                for (char c : str)
+                for (unsigned char c : str)
                 {
-                    if (c == '\0') { enc += '\xC0'; enc += '\x80'; }
-                    else enc += c;
+                    if (c == 0) { enc += '\xC0'; enc += '\x80'; }
+                    else if (c < 0x80) enc += static_cast<char>(c);
+                    else { enc += static_cast<char>(0xC0 | (c >> 6)); enc += static_cast<char>(0x80 | (c & 0x3F)); } // Latin-1 -> 2 octets
                 }
                 dosWriteN(ctx->thisObj, static_cast<int64_t>(enc.size()), 2);
                 for (char c : enc)
@@ -532,6 +630,7 @@ static void native_TimerTask_init(NativeContext *ctx)
             {
                 Obj *name = argRef(ctx, 1);
                 std::string path = (name && name->kind == ObjKind::String) ? name->str : "";
+                const bool absolute = !path.empty() && path[0] == '/';
                 while (!path.empty() && path[0] == '/')
                     path.erase(0, 1);
                 jme::JarReader *jar = ctx->rt->jar();
@@ -541,6 +640,22 @@ static void native_TimerTask_init(NativeContext *ctx)
                     return;
                 }
                 jme::JarEntry e;
+                // Java : un nom SANS « / » initial est relatif au paquetage de la classe (2048 : Logo, dans
+                // game2048/scene, demande "images/logo.png" -> game2048/scene/images/logo.png). On essaie ce chemin
+                // d'abord, puis la racine du JAR (indulgence pour les jeux dont la ressource est à la racine).
+                if (!absolute && ctx->thisObj && ctx->thisObj->kind == ObjKind::Class)
+                {
+                    std::string cn = ctx->thisObj->str;
+                    if (cn.empty() && ctx->thisObj->cls)
+                        cn = ctx->thisObj->cls->name;
+                    size_t sl = cn.rfind('/');
+                    if (sl != std::string::npos)
+                    {
+                        std::string rel = cn.substr(0, sl + 1) + path;
+                        if (jar->findEntry(rel, e))
+                            path = rel;
+                    }
+                }
                 if (!jar->findEntry(path, e) || e.uncompressedSize > 4u * 1024 * 1024)
                 {
                     if (jvm::jmeDebug())
@@ -600,6 +715,14 @@ static void native_TimerTask_init(NativeContext *ctx)
                 regN("java/io/ByteArrayInputStream.mark:(I)V", bais_mark);
                 regN("java/io/ByteArrayInputStream.reset:()V", bais_reset);
                 regN("java/io/DataInputStream.<init>:(Ljava/io/InputStream;)V", dis_init);
+                regN("java/io/InputStreamReader.<init>:(Ljava/io/InputStream;)V", isr_init);
+                regN("java/io/InputStreamReader.<init>:(Ljava/io/InputStream;Ljava/lang/String;)V", isr_init);
+                regN("java/io/InputStreamReader.read:()I", isr_read);
+                regN("java/io/InputStreamReader.read:([C)I", isr_readArr);
+                regN("java/io/InputStreamReader.read:([CII)I", isr_readArr);
+                regN("java/io/InputStreamReader.ready:()Z", isr_ready);
+                regN("java/io/InputStreamReader.skip:(J)J", isr_skip);
+                regN("java/io/InputStreamReader.close:()V", isr_close);
                 regN("java/io/DataInputStream.read:()I", di_read);
                 regN("java/io/DataInputStream.read:([B)I", di_readArr);
                 regN("java/io/DataInputStream.read:([BII)I", di_readArrII);

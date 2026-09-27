@@ -26,10 +26,12 @@ namespace jvm
     const std::vector<Obj *> &jme_threads();
     void jme_threadForget(Obj *r);
     bool jme_threadResume(Obj *r, Interpreter *interp, ClassInfo *cls);
+    void jme_yieldNow(); // suspend la fibre courante jusqu'à la prochaine trame (no-op hors fibre)
 
 
     namespace midp
     {
+        int halKeyToMidp(hal::KeyCode kc); // touche HAL -> code de touche MIDP (défini dans midp_natives.cpp)
         extern int g_fbWrites, g_pixdbg, g_screenPix, g_canvasPix, g_flushCalls;
         namespace detail
         {
@@ -94,7 +96,7 @@ namespace jvm
                 L_H = 3,
                 L_VIS = 4
             };
-            // Sprite (hérite de Layer) : slots 5..12.
+            // Sprite (hérite de Layer) : slots 5..17.
             enum
             {
                 SPR_IMG = 5,
@@ -104,7 +106,12 @@ namespace jvm
                 SPR_FRAME = 9,
                 SPR_TFM = 10,
                 SPR_RX = 11,
-                SPR_RY = 12
+                SPR_RY = 12,
+                SPR_CX = 13, // rectangle de collision (repère de la frame NON transformée)
+                SPR_CY = 14,
+                SPR_CW = 15,
+                SPR_CH = 16,
+                SPR_CSET = 17 // 1 = rectangle défini par le jeu, 0 = frame entière
             };
             // TiledLayer (hérite de Layer) : slots 5..11.
             enum
@@ -143,7 +150,6 @@ namespace jvm
                 F_SIZE = 2
             };
             constexpr int kNumSound = 16;            class Pix;
-            struct JmeUi;
             extern Runtime *g_rt;
             extern Interpreter *g_interp;
             extern Obj *g_midlet;
@@ -181,11 +187,19 @@ namespace jvm
             uint16_t argb565(uint32_t c);
             Obj *screenGraphics();
             void drawRegionRaw(Pix &p, Obj *src, int iw, int xs, int ys, int w, int h, int tfm, int dx, int dy);
-            JmeUi *uiFind(Obj *disp);
-            JmeUi *uiFor(Obj *disp);
-            void uiCmdSetLabel(Obj *cmd, Obj *label);
+            // --- lcdui haut niveau (midp_lcdui.cpp) ---
+            bool lcduiIsScreen(Obj *o);                        // Form / List / Alert / TextBox
+            void lcduiTick(Obj *disp, uint32_t justPressed, uint32_t justReleased);   // entrées + rendu de l'écran courant
+            void lcduiPointer(int kind, int x, int y);         // clic souris sur un écran haut niveau
+            uint32_t lcduiCanvasSoftKeys(Obj *cur, uint32_t justPressed); // touches programmables -> Commands d'un Canvas
+            void presentGameCanvasBuffer(Obj *gc);                  // GameCanvas.paint() par défaut : tampon hors écran -> écran
+            void lcduiCanvasOverlay(Obj *cur);                 // barre de commandes d'un Canvas non plein écran
+            void lcduiSetTextInput(const char *utf8, int backspaces);
+            void lcduiMarkDirty();
+            void lcduiBootstrap(Runtime *rt);                  // constantes List.SELECT_COMMAND / Alert.DISMISS_COMMAND
             void uiDispatchCommand(Obj *cmd, Obj *disp);
-            void uiRenderScreen();
+            void uiCmdSetLabel(Obj *cmd, Obj *label);
+            void registerLcduiNatives();
             int64_t argLongL(NativeContext *ctx, int i);
             int32_t streamFill(Obj *s, Obj *dst, int off, int len);
             void fireTimers();
@@ -213,13 +227,15 @@ namespace jvm
                     th = g->cells[G_TH].i;
                     stride = g->cells[G_STRIDE].i;
                     mode = g->cells[G_MODE].i;
-                    buf = g->cells[G_BUF].o;
                     u565 = nullptr;
                     if (mode == GM_CANVAS_565)
                     {
-                        u565 = g_canvas565;
+                        buf = nullptr;
+                        u565 = reinterpret_cast<uint16_t *>(g->cells[G_BUF].u); // tampon propre au GameCanvas
                         g_canvasPix++;
                     }
+                    else
+                        buf = g->cells[G_BUF].o;
                     if (mode == GM_SCREEN_565)
                         g_screenPix++;
                     if (jvm::pixDbg() && g_pixdbg < 8)
@@ -232,11 +248,13 @@ namespace jvm
 
                 void put(int x, int y, uint32_t argb)
                 {
-                    int rx = x - tx, ry = y - ty;
-                    if (rx < clipX || ry < clipY)
+                    // (x,y) = coordonnées UTILISATEUR (repère translaté) : le clip est exprimé dans ce repère
+                    // (spec MIDP), la cible reçoit (x+tx, y+ty). Avant : x - tx (translation inversée !).
+                    if (x < clipX || y < clipY)
                         return;
-                    if (rx >= clipX + clipW || ry >= clipY + clipH)
+                    if (x >= clipX + clipW || y >= clipY + clipH)
                         return;
+                    int rx = x + tx, ry = y + ty;
                     if (rx < 0 || ry < 0 || rx >= tw || ry >= th)
                         return;
 
@@ -312,18 +330,6 @@ namespace jvm
             // car Canvas réserve cells[0]/cells[1] (GC_FULLSCREEN/GC_GFX) sur lui.
             // ---------------------------------------------------------------------
 
-            struct JmeUi
-            {
-                Obj *disp = nullptr;     // Displayable (List ou Form)
-                Obj *title = nullptr;    // String
-                Obj *listener = nullptr; // CommandListener
-                std::vector<Obj *> commands;
-                bool isList = false;
-                std::vector<Obj *> items; // String pour List/Form
-                int sel = 0;
-                Obj *selectCmd = nullptr; // setSelectCommand (défaut = SELECT_COMMAND)
-                int type = 0;
-            };
             void registerCoreNatives();
             void registerGraphicsNatives();
             void registerGameNatives();

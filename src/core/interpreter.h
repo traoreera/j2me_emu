@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 
 #include "core/runtime.h"
 #include <functional>
@@ -73,6 +74,19 @@ namespace jvm
         // Alloue n octets depuis l'arène de frames (ring bump), aligné sur 8.
         void *frameAlloc(size_t n);
         void frameFree(size_t mark);
+        // Échange l'arène courante avec (base,size,off) : chaque fibre a SA propre arène de frames. Avec une
+        // arène partagée, deux fibres suspendues en pleine chaîne d'appels se marchaient dessus (frameFree
+        // rembobinait sous les frames vivantes de l'autre : locales corrompues, crash sur `putfield`).
+        void swapArena(uint8_t *&base, size_t &size, size_t &off)
+        {
+            std::swap(arena_, base);
+            std::swap(arenaSize_, size);
+            std::swap(arenaOff_, off);
+        }
+        // Limite basse de la pile C++ de l'exécution courante : en deçà, execBytecode lève StackOverflowError au
+        // lieu de laisser une récursion Java infinie faire déborder la pile (SEGV, surtout dans une fibre de 512 Ko).
+        void setStackLow(const char *low) { stackLow_ = low; }
+        const char *stackLow() const { return stackLow_; }
 
     private:
         Runtime *rt_;
@@ -80,6 +94,7 @@ namespace jvm
         size_t arenaSize_;
         size_t arenaOff_ = 0;
         size_t arenaBase_ = 0;
+        const char *stackLow_ = nullptr;
         int64_t instrBudget_ = -1;
         int64_t instrBudgetQuota_ = -1;
         YieldFn yieldFn_;

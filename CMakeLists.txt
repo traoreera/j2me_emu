@@ -16,6 +16,7 @@ add_executable(j2me_emu
     src/hal/display.cpp
     src/hal/input.cpp
     src/hal/png.cpp
+    src/hal/font.cpp
     src/core/class_file.cpp
     src/core/interpreter.cpp
     src/core/runtime.cpp
@@ -25,6 +26,7 @@ add_executable(j2me_emu
     src/midp/midp_graphics.cpp
     src/midp/midp_game.cpp
     src/midp/midp_ui.cpp
+    src/midp/midp_lcdui.cpp
     src/midp/midp_io.cpp
     src/midp/midp_media.cpp
     src/kernel/kernel.cpp
@@ -68,6 +70,7 @@ add_executable(j2me_tests
     src/hal/jar_reader.cpp
     src/hal/file.cpp
     src/hal/png.cpp
+    src/hal/font.cpp
     src/core/class_file.cpp
     src/core/runtime.cpp
     src/core/interpreter.cpp

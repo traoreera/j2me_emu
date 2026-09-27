@@ -4,6 +4,7 @@
 // display (SDL2 côté PC, écran RGB565 côté RP2040).
 
 #include <vector>
+#include <algorithm>
 #include "hal/jar_reader.h"
 #include "hal/display.h"
 #include "hal/input.h"
@@ -46,6 +47,29 @@ static const kernel::audio::Device *pickAudioDevice()
     if (vd && strcmp(vd, "dummy") == 0)
         return &kernel::audio::kStubDevice;
     return &kernel::audio::kSdlDevice;
+}
+
+// Repli quand ni le manifeste ni un .jad ne donnent MIDlet-1 (JAR mal packagé) : première classe
+// du JAR dont la super-classe est javax.microedition.midlet.MIDlet. PC uniquement (index en RAM).
+static std::string findMidletClass(jme::JarReader &jar)
+{
+    std::vector<uint8_t> buf;
+    for (const jme::JarEntry &e : jar.entries())
+    {
+        if (e.name.size() < 7 || e.name.compare(e.name.size() - 6, 6, ".class") != 0 || e.uncompressedSize == 0)
+            continue;
+        buf.resize(e.uncompressedSize);
+        size_t n = jar.extractEntry(e.name, buf.data(), buf.size());
+        jvm::ClassFile cf;
+        if (n && jvm::ClassFile::parse(buf.data(), n, cf) && cf.superClassName() == "javax/microedition/midlet/MIDlet")
+        {
+            std::string c = cf.thisClassName();
+            for (auto &ch : c)
+                if (ch == '/') ch = '.';
+            return c;
+        }
+    }
+    return "";
 }
 
 static_assert(sizeof(void *) == 8, "build 64 bits requis (Pi Zero 2 W : AArch64)");
@@ -140,11 +164,39 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Descripteur d'application "<jeu>.jad" à côté du .jar (facultatif) : certains JAR (ex. Akatis,
+    // packagé par Ant) n'ont pas MIDlet-1 dans le manifeste, il n'est que dans le .jad. Le .jad
+    // complète le manifeste (et ses attributs sont lisibles via getAppProperty, comme sur un vrai téléphone).
+    std::string jadText;
+    {
+        std::string jadPath(jarPath);
+        if (jadPath.size() > 4 && jadPath.compare(jadPath.size() - 4, 4, ".jar") == 0)
+            jadPath.resize(jadPath.size() - 4);
+        jadPath += ".jad";
+        if (FILE *jf = fopen(jadPath.c_str(), "rb"))
+        {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, jf)) > 0)
+                jadText.append(buf, n);
+            fclose(jf);
+            fprintf(stderr, "[jad] descripteur charge : %s\n", jadPath.c_str());
+        }
+    }
     jme::ManifestInfo manifest;
     if (!jar.readManifest(manifest))
     {
-        fprintf(stderr, "MANIFEST.MF invalide ou MIDlet-1 absent\n");
-        return 1;
+        if (jadText.empty() || !jme::parseManifestText(jadText.data(), jadText.size(), manifest))
+        {
+            manifest.mainClass = findMidletClass(jar);
+            if (manifest.mainClass.empty())
+            {
+                fprintf(stderr, "MANIFEST.MF invalide ou MIDlet-1 absent (ni .jad voisin, ni classe MIDlet)\n");
+                return 1;
+            }
+            fprintf(stderr, "[manifest] MIDlet-1 absent : classe MIDlet detectee = %s\n", manifest.mainClass.c_str());
+            manifest.valid = true;
+        }
     }
 
     printf("MIDlet: %s (%s) - classe principale: %s\n",
@@ -184,6 +236,15 @@ int main(int argc, char **argv)
     };
     kernel::driverRegister(&audioDrv);
     kernel::kernelBoot(0);
+    hal::display_set_title(("J2ME Emu - " + manifest.midletName).c_str());
+    // JME_AUDIO_TEST=1 : bip de 0,8 s à 440 Hz au démarrage (vérifie la chaîne audio de bout en bout).
+    if (const char *at = getenv("JME_AUDIO_TEST"))
+        if (atoi(at) != 0)
+            kernel::audio::playTone(440.f, 800, 0.5f);
+    float masterVol = 1.0f, volBeforeMute = 1.0f;
+    bool muted = false;
+    int osdFrames = 0;
+    char osdText[32] = "";
 
     size_t heapSize = jvm::Heap::kDefaultPoolSize;
     if (const char *hs = getenv("JME_HEAP"))
@@ -204,6 +265,10 @@ int main(int argc, char **argv)
     }
     jvm::Runtime rt(heapSize, heapMax);
     jvm::Interpreter interp(&rt);
+    {
+        char stackProbe;
+        interp.setStackLow(&stackProbe - 6 * 1024 * 1024); // pile principale : 8 Mo par défaut, on garde 2 Mo de marge
+    }
     rt.setJar(&jar);
 
     jvm::initNatives();
@@ -235,23 +300,27 @@ int main(int argc, char **argv)
     {
         static uint8_t mfBuf[16384];
         size_t n = jar.extractEntry("META-INF/MANIFEST.MF", mfBuf, sizeof(mfBuf));
-        std::string mf(reinterpret_cast<char *>(mfBuf), n);
-        size_t pos = 0;
-        while (pos < mf.size())
+        auto exposeProps = [](const std::string &mf)
         {
-            size_t eol = mf.find('\n', pos);
-            if (eol == std::string::npos) eol = mf.size();
-            std::string line = mf.substr(pos, eol - pos);
-            pos = eol + 1;
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-            size_t colon = line.find(':');
-            if (colon == std::string::npos || colon == 0 || line[0] == ' ') continue;
-            std::string k = line.substr(0, colon), v = line.substr(colon + 1);
-            size_t b = v.find_first_not_of(' ');
-            v = b == std::string::npos ? "" : v.substr(b);
-            if (k == "MIDlet-Name" || k == "MIDlet-Version" || k == "MIDlet-Vendor") continue;
-            jvm::midp::setAppProperty(k, v);
-        }
+            size_t pos = 0;
+            while (pos < mf.size())
+            {
+                size_t eol = mf.find('\n', pos);
+                if (eol == std::string::npos) eol = mf.size();
+                std::string line = mf.substr(pos, eol - pos);
+                pos = eol + 1;
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                size_t colon = line.find(':');
+                if (colon == std::string::npos || colon == 0 || line[0] == ' ') continue;
+                std::string k = line.substr(0, colon), v = line.substr(colon + 1);
+                size_t b = v.find_first_not_of(' ');
+                v = b == std::string::npos ? "" : v.substr(b);
+                if (k == "MIDlet-Name" || k == "MIDlet-Version" || k == "MIDlet-Vendor") continue;
+                jvm::midp::setAppProperty(k, v);
+            }
+        };
+        exposeProps(std::string(reinterpret_cast<char *>(mfBuf), n));
+        exposeProps(jadText); // le .jad prime sur le manifeste
         for (const auto &kv : confProps)
             jvm::midp::setAppProperty(kv.first, kv.second);
     }
@@ -292,8 +361,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // startApp()
-    if (!interp.invokeVirtual(mainCls, "startApp", "()V", midlet, &thisV, 1, res))
+    // startApp() : appel synchrone, sans fibre ni yield -> garde-fou anti-boucle infinie (1,5 G d'instructions,
+    // largement au-delà d'un démarrage réel) pour ne jamais figer toute la fenêtre.
+    interp.setInstrBudget(1500000000LL);
+    bool startOk = interp.invokeVirtual(mainCls, "startApp", "()V", midlet, &thisV, 1, res);
+    interp.setInstrBudget(-1);
+    if (!startOk)
     {
         fprintf(stderr, "Echec startApp\n");
     }
@@ -588,6 +661,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < input.pointerCount; i++)
             jvm::midp::pointerEvent(input.pointer[i].kind, input.pointer[i].x, input.pointer[i].y);
 
+        jvm::midp::setTextInput(input.text, input.backspaces);
         jvm::midp::tick(input.pressed, input.justPressed, input.justReleased);
 
         if (jvm::midp::midletDestroyed())
@@ -597,7 +671,35 @@ int main(int argc, char **argv)
         if (maxFrames > 0 && frame >= maxFrames)
             break;
 
-        hal::display_present(hal::display_get_framebuffer());
+        // Volume maître : F9/F10 (PgBas/PgHaut) par pas de 10 %, F8 = muet. Petit OSD ~1,5 s.
+        if (input.volumeStep || input.muteToggle)
+        {
+            if (input.muteToggle)
+            {
+                muted = !muted;
+            }
+            if (input.volumeStep)
+            {
+                muted = false;
+                masterVol = std::max(0.0f, std::min(1.0f, masterVol + 0.1f * input.volumeStep));
+            }
+            kernel::audio::setMasterVolume(muted ? 0.0f : masterVol);
+            snprintf(osdText, sizeof osdText, muted ? "MUET" : "VOL %d%%", (int)(masterVol * 100 + 0.5f));
+            osdFrames = 45;
+        }
+        if (osdFrames > 0)
+        {
+            osdFrames--;
+            hal::Framebuffer *ofb = hal::display_get_framebuffer();
+            int tw = (int)strlen(osdText) * 6 + 4;
+            if (ofb->width >= tw + 4)
+            {
+                hal::display_fill_rect(2, 2, tw, 11, 0x0000);
+                hal::display_draw_text(4, 4, osdText, muted ? 0xF800 : 0xFFFF);
+            }
+        }
+
+        hal::display_flip();
 
         // Rythme de trame adaptatif : on ne dort que le temps restant du
         // budget de trame (au lieu d'un SDL_Delay(16) fixe qui s'ajoutait

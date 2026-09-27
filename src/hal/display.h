@@ -23,10 +23,13 @@ namespace hal
     bool display_init(const DisplayConfig *cfg);
     void display_shutdown();
     Framebuffer *display_get_framebuffer();
-    void display_present(const Framebuffer *fb);
+    void display_present(const Framebuffer *fb); // marque l'image « à afficher » (peu coûteux, appelable souvent)
+    void display_flip();                         // affiche réellement (1 fois par trame : boucle principale, launcher)
     // Rotation d'affichage (0 ou 90 = vue tournée de 90° anti-horaire), lue de
     // JME_ROTATE. Pour les jeux 480x800 dessinés de côté (téléphone tenu en paysage).
     int display_rotation();
+    void display_toggle_fullscreen();          // F11 / Alt+Entrée
+    void display_set_title(const char *title); // titre de la fenêtre (nom du jeu)
     // Coordonnées fenêtre -> écran logique (rotation, letterbox et échelle inclus).
     void display_window_to_logical(int wx, int wy, int &lx, int &ly);
     void display_clear(uint16_t color = 0x0000);

@@ -203,7 +203,7 @@ namespace launcher
             hal::display_fill_rect(0, kH - kBottom, kW, kBottom, bar);
             hal::display_draw_text_scaled(10, kH - kBottom + 7,
                                           "HAUT/BAS choisir  ENTREE jouer  F12 menu  CTRL+Q quitter", dim, 1);
-            hal::display_present(hal::display_get_framebuffer());
+            hal::display_flip();
             SDL_Delay(16);
         }
         if (const char *dump = getenv("JME_DUMP"))

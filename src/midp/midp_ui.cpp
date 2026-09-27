@@ -89,6 +89,32 @@ namespace jvm
                     return 0;
                 }
             }
+            static void cv_getKeyName(NativeContext *ctx)
+            {
+                int k = argInt(ctx, 1);
+                const char *n = nullptr;
+                char buf[8];
+                if (k >= 48 && k <= 57) { buf[0] = static_cast<char>(k); buf[1] = 0; n = buf; }
+                else if (k == 42) n = "*";
+                else if (k == 35) n = "#";
+                else switch (k)
+                {
+                case -1: n = "UP"; break;
+                case -2: n = "DOWN"; break;
+                case -3: n = "LEFT"; break;
+                case -4: n = "RIGHT"; break;
+                case -5: n = "SELECT"; break;
+                case -6: n = "SOFT1"; break;
+                case -7: n = "SOFT2"; break;
+                case -8: n = "CLEAR"; break;
+                default: n = "UNKNOWN"; break;
+                }
+                setRef(ctx, g_rt->heap().newString(n));
+            }
+            static void ui_vibrate(NativeContext *ctx) { setInt(ctx, 1); }
+            static void ui_displayColor(NativeContext *ctx) { setInt(ctx, argInt(ctx, 1) == 0 ? 0xFFFFFF : 0x000000); }
+            static void ui_platformRequest(NativeContext *ctx) { setInt(ctx, 0); }
+            static void ui_checkPermission(NativeContext *ctx) { setInt(ctx, 1); }
             static void cv_getGameAction(NativeContext *ctx) { setInt(ctx, cv_gameActionFor(argInt(ctx, 1))); }
             // Inverse de cv_gameActionFor : renvoie le keyCode canonique pour une
             // action donnée (même confusion action/keyCode corrigée ici).
@@ -143,32 +169,6 @@ namespace jvm
             {
                 setRef(ctx, g_current);
             }
-            static void d_setCurrent(NativeContext *ctx)
-            {
-                Obj *d = argRef(ctx, 1);
-                if (d && d->kind == ObjKind::Instance)
-                {
-                    if (jvm::jmeDebug())
-                        fprintf(stderr, "DISPLAY.setCurrent(%s)\n", d->cls ? d->cls->name.c_str() : "?");
-                    if (g_current != d)
-                    {
-                        g_current = d;
-                        g_paintRequested = true;
-                        for (int i = 0; i < screenW() * screenH(); i++)
-                            g_canvas565[i] = 0;
-                        if (auto *fb = hal::display_get_framebuffer())
-                            for (int i = 0; i < fb->width * fb->height; i++)
-                                fb->pixels[i] = 0;
-                    }
-                }
-            }
-            static void d_setCurrentAlert(NativeContext *ctx)
-            {
-                Obj *alert = argRef(ctx, 1);
-                Obj *next = argRef(ctx, 2);
-                g_current = (alert && alert->kind == ObjKind::Instance) ? alert : next;
-                g_paintRequested = true;
-            }
             static void d_isColor(NativeContext *ctx)
             {
                 (void)ctx;
@@ -191,7 +191,6 @@ namespace jvm
                 g_paintRequested = true;
             }
             static void d_callSerially(NativeContext *ctx) { (void)ctx; }
-            static void d_setCurrentItem(NativeContext *ctx) { (void)ctx; }
 
             // ---------------------------------------------------------------------
             // MIDlet natives
@@ -204,12 +203,6 @@ namespace jvm
             static void mid_getAppProperty(NativeContext *ctx)
             {
                 const std::string &key = (argRef(ctx, 1) && argRef(ctx, 1)->kind == ObjKind::String) ? argRef(ctx, 1)->str : "";
-                // Propriété absente : chaîne VIDE (et non null comme le veut la spec
-                // MIDP). Les jeux Gameloft lisent des attributs du .jad (ex. "HAS-BLOOD")
-                // qu'un .jar seul n'a pas, et enchaînent `.equals("yes")` sans test
-                // de null : renvoyer null les fait planter (NPE dès le démarrage d'AC III),
-                // une chaîne vide les fait simplement prendre la branche "non".
-                // `PROP:Nom=valeur` dans <jeu>.conf permet de fournir la vraie valeur.
                 for (const auto &kv : g_appProps)
                     if (kv.first == key)
                     {
@@ -217,8 +210,25 @@ namespace jvm
                         return;
                     }
                 if (jvm::jmeDebug())
-                    fprintf(stderr, "[midp] getAppProperty(\"%s\") absent -> \"\"\n", key.c_str());
-                setRef(ctx, g_rt->heap().newString(""));
+                    fprintf(stderr, "[midp] getAppProperty(\"%s\") absent\n", key.c_str());
+                // Propriété absente : `null` (spec MIDP) -- sauf pour les jeux qui l'enchaînent sans test de
+                // null : les Gameloft lisent des attributs du .jad (« HAS-BLOOD », « Blood-Censor »...) que
+                // le .jar seul n'a pas et font `.equals("yes")` : `null` les fait planter (NPE dès le
+                // démarrage d'AC III), une chaîne vide les fait prendre la branche « non ». À l'inverse
+                // nmania (`Commit`) fait `.charAt(0)` sur la valeur sans test d'égalité et ne tolère PAS la
+                // chaîne vide. Règle : chaîne vide si l'éditeur est Gameloft ou si JME_PROP_EMPTY=1
+                // (`.conf`), `null` sinon. `PROP:Nom=valeur` dans <jeu>.conf fournit la vraie valeur.
+                static const bool forceEmpty = getenv("JME_PROP_EMPTY") && atoi(getenv("JME_PROP_EMPTY")) != 0;
+                std::string vendor;
+                for (const auto &kv : g_appProps)
+                    if (kv.first == "MIDlet-Vendor")
+                        vendor = kv.second;
+                for (char &c : vendor)
+                    c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                if (forceEmpty || vendor.find("gameloft") != std::string::npos)
+                    setRef(ctx, g_rt->heap().newString(""));
+                else
+                    setRef(ctx, nullptr);
             }
             static void mid_notifyDestroyed(NativeContext *ctx)
             {
@@ -244,267 +254,6 @@ namespace jvm
                 (void)ctx;
                 setInt(ctx, 1);
             }
-            static std::vector<JmeUi> g_ui;
-            static std::vector<std::pair<Obj *, Obj *>> g_cmdLabels; // Command -> label String
-            Obj *g_listSelectCommand = nullptr;                      // bootstrap SELECT_COMMAND
-
-            JmeUi *uiFind(Obj *disp)
-            {
-                for (auto &u : g_ui)
-                    if (u.disp == disp)
-                        return &u;
-                return nullptr;
-            }
-            JmeUi *uiFor(Obj *disp)
-            {
-                if (JmeUi *u = uiFind(disp))
-                    return u;
-                g_ui.push_back({});
-                JmeUi *u = &g_ui.back();
-                u->disp = disp;
-                u->sel = 0;
-                return u;
-            }
-            void uiCmdSetLabel(Obj *cmd, Obj *label)
-            {
-                if (!cmd)
-                    return;
-                for (auto &kv : g_cmdLabels)
-                    if (kv.first == cmd)
-                    {
-                        kv.second = label;
-                        return;
-                    }
-                g_cmdLabels.push_back({cmd, label});
-            }
-            static Obj *uiCmdLabel(Obj *cmd)
-            {
-                for (auto &kv : g_cmdLabels)
-                    if (kv.first == cmd)
-                        return kv.second;
-                return nullptr;
-            }
-            static void uiItemsFromArray(JmeUi *u, Obj *arr)
-            {
-                if (!arr || arr->kind != ObjKind::ObjArray)
-                    return;
-                for (int i = 0; i < arr->arrayLen; i++)
-                    u->items.push_back(arr->cells[i].o);
-            }
-            static const char *uiString(Obj *s)
-            {
-                return (s && s->kind == ObjKind::String) ? s->str.c_str() : "";
-            }
-
-            // ----- Displayable ---------------------------------------------------
-            static void ui_disp_setTitle(NativeContext *ctx)
-            {
-                uiFor(ctx->thisObj)->title = argRef(ctx, 1);
-            }
-            static void ui_disp_getTitle(NativeContext *ctx)
-            {
-                setRef(ctx, uiFor(ctx->thisObj)->title);
-            }
-            static void ui_disp_addCommand(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                Obj *c = argRef(ctx, 1);
-                if (c)
-                    u->commands.push_back(c);
-            }
-            static void ui_disp_setCommandListener(NativeContext *ctx)
-            {
-                uiFor(ctx->thisObj)->listener = argRef(ctx, 1);
-            }
-
-            // ----- Command -------------------------------------------------------
-            static void ui_cmd_init3(NativeContext *ctx) { uiCmdSetLabel(ctx->thisObj, argRef(ctx, 1)); }
-            static void ui_cmd_init4(NativeContext *ctx) { uiCmdSetLabel(ctx->thisObj, argRef(ctx, 1)); }
-            static void ui_cmd_getLabel(NativeContext *ctx) { setRef(ctx, uiCmdLabel(ctx->thisObj)); }
-
-            // ----- List ----------------------------------------------------------
-            static void ui_list_init2(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                u->isList = true;
-                u->title = argRef(ctx, 1);
-                u->type = argInt(ctx, 2);
-                u->items.clear();
-                u->selectCmd = nullptr;
-                u->sel = 0;
-            }
-            static void ui_list_init4(NativeContext *ctx)
-            {
-                ui_list_init2(ctx);
-                JmeUi *u = uiFind(ctx->thisObj);
-                if (u)
-                    uiItemsFromArray(u, argRef(ctx, 3));
-            }
-            static void ui_list_append(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                u->items.push_back(argRef(ctx, 1));
-                setInt(ctx, static_cast<int32_t>(u->items.size()) - 1);
-            }
-            static void ui_list_getSel(NativeContext *ctx)
-            {
-                JmeUi *u = uiFind(ctx->thisObj);
-                setInt(ctx, u ? u->sel : 0);
-            }
-            static void ui_list_setSel(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                int v = argInt(ctx, 1);
-                u->sel = v < 0 ? 0 : v;
-            }
-            static void ui_list_getString(NativeContext *ctx)
-            {
-                JmeUi *u = uiFind(ctx->thisObj);
-                int i = argInt(ctx, 1);
-                setRef(ctx, (u && i >= 0 && i < static_cast<int>(u->items.size())) ? u->items[i] : nullptr);
-            }
-            static void ui_list_setSelectCmd(NativeContext *ctx)
-            {
-                uiFor(ctx->thisObj)->selectCmd = argRef(ctx, 1);
-            }
-            static void ui_list_size(NativeContext *ctx)
-            {
-                JmeUi *u = uiFind(ctx->thisObj);
-                setInt(ctx, u ? static_cast<int32_t>(u->items.size()) : 0);
-            }
-
-            // ----- Form -----------------------------------------------------------
-            static void ui_form_init(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                u->isList = false;
-                u->title = argRef(ctx, 1);
-                u->items.clear();
-                u->sel = 0;
-            }
-            static void ui_form_append(NativeContext *ctx)
-            {
-                JmeUi *u = uiFor(ctx->thisObj);
-                u->items.push_back(argRef(ctx, 1));
-                setInt(ctx, static_cast<int32_t>(u->items.size()) - 1);
-            }
-            static void ui_form_size(NativeContext *ctx)
-            {
-                JmeUi *u = uiFind(ctx->thisObj);
-                setInt(ctx, u ? static_cast<int32_t>(u->items.size()) : 0);
-            }
-
-            // ----- Dispatch commandAction(Command, Displayable) sur le listener ----
-            void uiDispatchCommand(Obj *cmd, Obj *disp)
-            {
-                if (!cmd || !disp || !g_interp)
-                    return;
-                JmeUi *u = uiFind(disp);
-                if (!u || !u->listener)
-                    return;
-                Value args[3];
-                args[0] = Value::fromRef(u->listener);
-                args[1] = Value::fromRef(cmd);
-                args[2] = Value::fromRef(disp);
-                Value res;
-                if (jvm::jmeDebug())
-                {
-                    Obj *lab = uiCmdLabel(cmd);
-                    fprintf(stderr, "UI commandAction cmd=%s disp=%s\n",
-                            lab ? uiString(lab) : "?",
-                            disp->cls ? disp->cls->name.c_str() : "?");
-                }
-                g_interp->invokeVirtual(u->listener->cls, "commandAction",
-                                        "(Ljavax/microedition/lcdui/Command;Ljavax/microedition/lcdui/Displayable;)V",
-                                        u->listener, args, 3, res);
-            }
-
-            // ----- Rendu List/Form dans le framebuffer (RGB565, hal fb) ----------
-            static void uiRenderBar(int x, int y, int w, int h, uint16_t color)
-            {
-                auto *fb = hal::display_get_framebuffer();
-                if (!fb || !fb->pixels)
-                    return;
-                for (int r = y; r < y + h; r++)
-                {
-                    if (r < 0 || r >= fb->height)
-                        continue;
-                    for (int c = x; c < x + w; c++)
-                    {
-                        if (c < 0 || c >= fb->width)
-                            continue;
-                        fb->pixels[r * fb->stride + c] = color;
-                    }
-                }
-            }
-            void uiRenderScreen()
-            {
-                if (!g_current || g_current->kind != ObjKind::Instance)
-                    return;
-                JmeUi *u = uiFind(g_current);
-                if (!u)
-                    return;
-                auto *fb = hal::display_get_framebuffer();
-                if (!fb || !fb->pixels)
-                    return;
-                const int W = fb->width, H = fb->height;
-                // Fond noir, titre blanc, items avec barre de sélection inversée.
-                for (int i = 0; i < W * H; i++)
-                    fb->pixels[i] = 0x0000;
-                int y = 4;
-                if (u->title)
-                {
-                    const char *t = uiString(u->title);
-                    hal::display_draw_text(4, y, t, 0xFFFF);
-                    y += 12;
-                }
-                if (u->isList)
-                {
-                    const int n = static_cast<int>(u->items.size());
-                    if (u->sel >= n)
-                        u->sel = n > 0 ? n - 1 : 0;
-                    for (int i = 0; i < n; i++)
-                    {
-                        const char *t = uiString(u->items[i]);
-                        if (i == u->sel)
-                        {
-                            uiRenderBar(2, y - 1, W - 4, 9, 0x7BEF);
-                            hal::display_draw_text(4, y, t, 0x0000);
-                        }
-                        else
-                        {
-                            hal::display_draw_text(4, y, t, 0xFFFF);
-                        }
-                        y += 10;
-                    }
-                }
-                else
-                {
-                    for (Obj *item : u->items)
-                    {
-                        if (item && item->kind == ObjKind::String)
-                        {
-                            const char *t = uiString(item);
-                            hal::display_draw_text(4, y, t, 0xFFFF);
-                            y += 10;
-                        }
-                        else if (item && item->kind == ObjKind::Instance)
-                        {
-                            // Item : tente getLabel() via notre registre Command --
-                            // hors sujet ici, on saute proprement.
-                            y += 10;
-                        }
-                    }
-                }
-                // Barre softkeys : 1re commande à gauche, dernière à droite.
-                if (!u->commands.empty())
-                {
-                    const char *sl = uiString(uiCmdLabel(u->commands.front()));
-                    const char *sr = uiString(uiCmdLabel(u->commands.back()));
-                    hal::display_draw_text(2, H - 9, sl, 0xFFFF);
-                    hal::display_draw_text(W - 2 - static_cast<int>(strlen(sr)) * 6, H - 9, sr, 0xFFFF);
-                }
-            }
             void registerUiNatives()
             {
                 regN("com/nokia/mid/ui/DeviceControl.setLights:(II)V", ui_noop);
@@ -512,6 +261,9 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.getWidth:()I", cv_getWidth);
                 regN("javax/microedition/lcdui/Canvas.getHeight:()I", cv_getHeight);
                 regN("javax/microedition/lcdui/Canvas.isDoubleBuffered:()Z", cv_isDoubleBuffered);
+                regN("javax/microedition/lcdui/Canvas.hasPointerEvents:()Z", cv_isDoubleBuffered); // toujours vrai : souris/tactile
+                regN("javax/microedition/lcdui/Canvas.hasPointerMotionEvents:()Z", cv_isDoubleBuffered);
+                regN("javax/microedition/lcdui/Canvas.hasRepeatEvents:()Z", cv_isDoubleBuffered);
                 regN("javax/microedition/lcdui/Canvas.repaint:()V", cv_repaint);
                 regN("javax/microedition/lcdui/Canvas.repaint:(IIII)V", cv_repaintRegion);
                 regN("javax/microedition/lcdui/Canvas.serviceRepaints:()V", cv_service);
@@ -519,6 +271,11 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.hideNotify:()V", cv_hideNotify);
                 regN("javax/microedition/lcdui/Canvas.getGameAction:(I)I", cv_getGameAction);
                 regN("javax/microedition/lcdui/Canvas.getKeyCode:(I)I", cv_getKeyCode);
+                regN("javax/microedition/lcdui/Canvas.getKeyName:(I)Ljava/lang/String;", cv_getKeyName);
+                regN("javax/microedition/lcdui/Display.vibrate:(I)Z", ui_vibrate);
+                regN("javax/microedition/lcdui/Display.getColor:(I)I", ui_displayColor);
+                regN("javax/microedition/midlet/MIDlet.platformRequest:(Ljava/lang/String;)Z", ui_platformRequest);
+                regN("javax/microedition/midlet/MIDlet.checkPermission:(Ljava/lang/String;)I", ui_checkPermission);
                 regN("javax/microedition/lcdui/Canvas.keyPressed:(I)V", ui_noop);
                 regN("javax/microedition/lcdui/Canvas.keyReleased:(I)V", ui_noop);
                 regN("javax/microedition/lcdui/Canvas.keyRepeated:(I)V", ui_noop);
@@ -527,9 +284,6 @@ namespace jvm
                 regN("javax/microedition/lcdui/Canvas.pointerDragged:(II)V", ui_noop);
                 regN("javax/microedition/lcdui/Display.getDisplay:(Ljavax/microedition/midlet/MIDlet;)Ljavax/microedition/lcdui/Display;", d_getDisplay);
                 regN("javax/microedition/lcdui/Display.getCurrent:()Ljavax/microedition/lcdui/Displayable;", d_getCurrent);
-                regN("javax/microedition/lcdui/Display.setCurrent:(Ljavax/microedition/lcdui/Displayable;)V", d_setCurrent);
-                regN("javax/microedition/lcdui/Display.setCurrent:(Ljavax/microedition/lcdui/Alert;Ljavax/microedition/lcdui/Displayable;)V", d_setCurrentAlert);
-                regN("javax/microedition/lcdui/Display.setCurrentItem:(Ljavax/microedition/lcdui/Item;)V", d_setCurrentItem);
                 regN("javax/microedition/lcdui/Display.isColor:()Z", d_isColor);
                 regN("javax/microedition/lcdui/Display.numColors:()I", d_numColors);
                 regN("javax/microedition/lcdui/Display.numAlphaLevels:()I", d_numAlpha);
@@ -543,53 +297,6 @@ namespace jvm
                 regN("javax/microedition/midlet/MIDlet.notifyDestroyed:()V", mid_notifyDestroyed);
                 regN("javax/microedition/midlet/MIDlet.notifyPaused:()V", mid_notifyPaused);
                 regN("javax/microedition/midlet/MIDlet.resumeRequest:()Z", mid_resumeRequest);
-                regN("javax/microedition/lcdui/Alert.<init>:(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V", ui_noop);
-                regN("javax/microedition/lcdui/Alert.<init>:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/Alert.setTimeout:(I)V", ui_noop);
-                regN("javax/microedition/lcdui/Alert.setString:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/AlertType.<init>:()V", ui_noop);
-                regN("javax/microedition/lcdui/Command.<init>:(Ljava/lang/String;II)V", ui_cmd_init3);
-                regN("javax/microedition/lcdui/Command.<init>:(Ljava/lang/String;Ljava/lang/String;II)V", ui_cmd_init4);
-                regN("javax/microedition/lcdui/Command.getLabel:()Ljava/lang/String;", ui_cmd_getLabel);
-                regN("javax/microedition/lcdui/Item.getLabel:()Ljava/lang/String;", ui_noop);
-                regN("javax/microedition/lcdui/Item.setLabel:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/Form.<init>:(Ljava/lang/String;)V", ui_form_init);
-                regN("javax/microedition/lcdui/Form.<init>:(Ljava/lang/String;Ljavax/microedition/lcdui/Item;)V", ui_form_init);
-                regN("javax/microedition/lcdui/Form.append:(Ljavax/microedition/lcdui/Item;)I", ui_form_append);
-                regN("javax/microedition/lcdui/Form.append:(Ljava/lang/String;)I", ui_form_append);
-                regN("javax/microedition/lcdui/Form.size:()I", ui_form_size);
-                regN("javax/microedition/lcdui/Form.set:(ILjavax/microedition/lcdui/Item;)V", ui_noop);
-                regN("javax/microedition/lcdui/List.<init>:(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V", ui_list_init4);
-                regN("javax/microedition/lcdui/List.<init>:(Ljava/lang/String;I)V", ui_list_init2);
-                regN("javax/microedition/lcdui/List.setSelectedIndex:(IZ)V", ui_list_setSel);
-                regN("javax/microedition/lcdui/List.setSelectCommand:(Ljavax/microedition/lcdui/Command;)V", ui_list_setSelectCmd);
-                regN("javax/microedition/lcdui/List.append:(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I", ui_list_append);
-                regN("javax/microedition/lcdui/List.getSelectedIndex:()I", ui_list_getSel);
-                regN("javax/microedition/lcdui/List.size:()I", ui_list_size);
-                regN("javax/microedition/lcdui/List.getString:(I)Ljava/lang/String;", ui_list_getString);
-                regN("javax/microedition/lcdui/TextBox.<init>:(Ljava/lang/String;Ljava/lang/String;II)V", ui_noop);
-                regN("javax/microedition/lcdui/TextBox.setString:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/TextBox.getString:()Ljava/lang/String;", ui_noop);
-                regN("javax/microedition/lcdui/TextField.<init>:(Ljava/lang/String;Ljava/lang/String;II)V", ui_noop);
-                regN("javax/microedition/lcdui/TextField.setString:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/TextField.getString:()Ljava/lang/String;", ui_noop);
-                regN("javax/microedition/lcdui/StringItem.<init>:(Ljava/lang/String;Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/StringItem.setText:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/StringItem.getText:()Ljava/lang/String;", ui_noop);
-                regN("javax/microedition/lcdui/ImageItem.<init>:(Ljava/lang/String;Ljavax/microedition/lcdui/Image;ILjava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/Gauge.<init>:(Ljava/lang/String;ZII)V", ui_noop);
-                regN("javax/microedition/lcdui/Gauge.setValue:(I)V", ui_noop);
-                regN("javax/microedition/lcdui/Gauge.getValue:()I", ui_noop);
-                regN("javax/microedition/lcdui/ChoiceGroup.<init>:(Ljava/lang/String;I[Ljava/lang/String;Ljavax/microedition/lcdui/Image;)V", ui_noop);
-                regN("javax/microedition/lcdui/ChoiceGroup.append:(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I", ui_noop);
-                regN("javax/microedition/lcdui/ChoiceGroup.getSelectedIndex:()I", ui_noop);
-                regN("javax/microedition/lcdui/ChoiceGroup.size:()I", ui_noop);
-                regN("javax/microedition/lcdui/Ticker.<init>:(Ljava/lang/String;)V", ui_noop);
-                regN("javax/microedition/lcdui/Displayable.setTitle:(Ljava/lang/String;)V", ui_disp_setTitle);
-                regN("javax/microedition/lcdui/Displayable.getTitle:()Ljava/lang/String;", ui_disp_getTitle);
-                regN("javax/microedition/lcdui/Displayable.addCommand:(Ljavax/microedition/lcdui/Command;)V", ui_disp_addCommand);
-                regN("javax/microedition/lcdui/Displayable.setCommandListener:(Ljavax/microedition/lcdui/CommandListener;)V", ui_disp_setCommandListener);
-                regN("javax/microedition/lcdui/Displayable.isShown:()Z", ui_true);
             }
         } // namespace detail
     } // namespace midp

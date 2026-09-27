@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <string>
 #include <cctype>
+#include <cstdio>
 
 namespace hal
 {
@@ -59,9 +60,14 @@ static KeyMask g_justReleased = 0;
 static bool g_quitRequested = false;
 static bool g_menuRequested = false;
 static int g_wheel = 0;
+static std::string g_textBuf;
+static int g_backspaceCount = 0;
+static int g_volStep = 0;
+static bool g_muteToggle = false;
 
 bool input_init()
 {
+    SDL_StartTextInput(); // SDL_TEXTINPUT : champs de saisie (TextField/TextBox)
     return true;
 }
 
@@ -75,6 +81,10 @@ void input_poll(InputState *out)
     g_justReleased = 0;
     out->pointerCount = 0;
     g_wheel = 0;
+    g_textBuf.clear();
+    g_backspaceCount = 0;
+    g_volStep = 0;
+    g_muteToggle = false;
 
     // Fenêtre -> écran logique (le rendu étire le framebuffer sur toute la
     // fenêtre : un clic à (wx,wy) vise le pixel wx*fbW/winW).
@@ -104,6 +114,14 @@ void input_poll(InputState *out)
             toLogical(e.motion.windowID, e.motion.x, e.motion.y, lx, ly);
             pushPointer(PointerEvent::DRAG, lx, ly);
         }
+        if (e.type == SDL_TEXTINPUT)
+        {
+            for (const char *c = e.text.text; *c; c++)
+                if (static_cast<unsigned char>(*c) < 0x80)
+                    g_textBuf += *c;
+        }
+        if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_BACKSPACE)
+            g_backspaceCount++;
         if (e.type == SDL_MOUSEWHEEL)
             g_wheel += e.wheel.y > 0 ? 1 : (e.wheel.y < 0 ? -1 : 0);
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
@@ -113,6 +131,18 @@ void input_poll(InputState *out)
                 g_quitRequested = true;
                 g_menuRequested = true;
             }
+            if (down && !e.key.repeat)
+            {
+                SDL_Keycode k = e.key.keysym.sym;
+                if (k == SDLK_F11 || (k == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))
+                    display_toggle_fullscreen();
+                if (k == SDLK_F8)
+                    g_muteToggle = true;
+            }
+            if (down && (e.key.keysym.sym == SDLK_F9 || e.key.keysym.sym == SDLK_PAGEDOWN))
+                g_volStep -= 1;
+            if (down && (e.key.keysym.sym == SDLK_F10 || e.key.keysym.sym == SDLK_PAGEUP))
+                g_volStep += 1;
             if (down && e.key.keysym.sym == SDLK_q && (e.key.keysym.mod & KMOD_CTRL))
                 g_quitRequested = true;
             auto it = g_keyMap.find(e.key.keysym.sym);
@@ -136,6 +166,10 @@ void input_poll(InputState *out)
     out->quit = g_quitRequested;
     out->exitToMenu = g_menuRequested;
     out->wheel = g_wheel;
+    std::snprintf(out->text, sizeof(out->text), "%s", g_textBuf.c_str());
+    out->backspaces = g_backspaceCount;
+    out->volumeStep = g_volStep;
+    out->muteToggle = g_muteToggle;
 }
 
 bool input_applyKeyMap(const char *spec)

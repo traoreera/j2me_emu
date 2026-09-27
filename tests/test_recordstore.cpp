@@ -27,9 +27,13 @@ namespace
             initNatives();
             rt.registerNativeClass("java/lang/Object", "", {}, {});
             rt.registerNativeClass("javax/microedition/rms/RecordStore", "java/lang/Object", {},
-                                   {{"__name", "Ljava/lang/String;"}});
+                                   {{"__name", "Ljava/lang/String;"}, {"__open", "I"}});
             rt.registerNativeClass("javax/microedition/rms/RecordEnumerationImpl", "java/lang/Object", {},
-                                   {{"store", "Ljava/lang/String;"}, {"ids", "[I"}, {"pos", "I"}});
+                                   {{"store", "Ljava/lang/String;"}, {"ids", "[I"}, {"pos", "I"}, {"keep", "I"},
+                                    {"filter", "Ljava/lang/Object;"}, {"cmp", "Ljava/lang/Object;"}});
+            for (const char *ex : {"java/lang/Throwable", "javax/microedition/rms/RecordStoreNotFoundException",
+                                   "javax/microedition/rms/InvalidRecordIDException", "javax/microedition/rms/RecordStoreNotOpenException"})
+                rt.registerNativeClass(ex, "java/lang/Object", {}, {});
             char tmpl[] = "/tmp/j2me_test_rms_XXXXXX";
             dir = mkdtemp(tmpl);
             setRmsDir(dir);
@@ -40,6 +44,7 @@ namespace
             std::string cmd = "rm -rf '" + dir + "'";
             (void)system(cmd.c_str());
         }
+        Obj *lastException = nullptr; // exception levée par le dernier appel (throwJava)
         Value call(const char *key, Obj *self, std::vector<Value> args)
         {
             NativeFn fn = findNative(key);
@@ -52,6 +57,7 @@ namespace
             ctx.thisObj = self;
             ctx.result = &res;
             fn(&ctx);
+            lastException = ctx.exception;
             return res;
         }
         Obj *open(const std::string &name)
@@ -155,4 +161,31 @@ TEST(recordstore_enumeration_walks_ids_in_order)
     Obj *first = fx.call("javax/microedition/rms/RecordEnumerationImpl.nextRecord:()[B", en, {}).o;
     ASSERT_TRUE(first != nullptr);
     ASSERT_EQ((int)first->cells[0].u, 10);
+}
+
+TEST(recordstore_open_missing_without_create_throws)
+{
+    Fixture fx;
+    Obj *rs = fx.call("javax/microedition/rms/RecordStore.openRecordStore:(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;",
+                      nullptr, {Value::fromRef(fx.rt.heap().newString("nope")), Value::fromInt(0)}).o;
+    ASSERT_TRUE(fx.lastException != nullptr);
+    ASSERT_TRUE(rs == nullptr);
+}
+
+TEST(recordstore_delete_record_keeps_ids_stable_and_persists_sparse_format)
+{
+    Fixture fx;
+    Obj *rs = fx.open("sparse");
+    ASSERT_EQ(fx.add(rs, {1}), 1);
+    ASSERT_EQ(fx.add(rs, {2}), 2);
+    ASSERT_EQ(fx.add(rs, {3}), 3);
+    fx.call("javax/microedition/rms/RecordStore.deleteRecord:(I)V", rs, {Value::fromRef(nullptr), Value::fromInt(2)});
+    ASSERT_TRUE(fx.lastException == nullptr);
+    ASSERT_EQ(fx.add(rs, {4}), 4); // l'id 2 n'est jamais réutilisé
+    ASSERT_EQ(fx.call("javax/microedition/rms/RecordStore.getNumRecords:()I", rs, {}).i, 3);
+    fx.call("javax/microedition/rms/RecordStore.getRecordSize:(I)I", rs, {Value::fromRef(nullptr), Value::fromInt(2)});
+    ASSERT_TRUE(fx.lastException != nullptr); // id supprimé = InvalidRecordIDException
+    std::vector<uint8_t> got = readFile(fx.dir + "/sparse.rms");
+    ASSERT_EQ((int)got[0], 0xF2); // format v2 (ids creux)
+    ASSERT_EQ((int)got[3], 0xFF);
 }
