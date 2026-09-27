@@ -475,6 +475,36 @@ static void native_TimerTask_init(NativeContext *ctx)
                 setRef(ctx, g_rt->heap().newString(out));
             }
 
+            // DataInputStream.available() : déclarée dans regClass mais jamais enregistrée (même trou que
+            // skip(J)J ci-dessous, trouvé en même temps) -- délègue au flux enveloppé comme skip/skipBytes.
+            static void di_available(NativeContext *ctx)
+            {
+                Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 1 ? ctx->thisObj->cells[0].o : nullptr;
+                setInt(ctx, (in && in->cellCount >= 3) ? (in->cells[2].i - in->cells[1].i) : 0);
+            }
+            // InputStream.skip(long) hérité par DataInputStream : `skipBytes(int)` ci-dessous est la méthode
+            // DataInput propre à DataInputStream, mais du bytecode réel appelle aussi `skip(long)` directement
+            // sur une DataInputStream (ex. Call of Duty 4 : `Game_COD4.<init>` en dépend pour se resynchroniser
+            // dans une ressource avant un `Image.createImage([BII)` -- sans cette registration l'appel tombait
+            // sur le `[stub]` générique (no-op, renvoie toujours 0 skippé), désynchronisant la lecture et
+            // faisant échouer `createImage` puis l'instanciation du MIDlet tout entier). Même délégation vers
+            // le flux enveloppé que `di_skipBytes`, juste en `long`.
+            static void di_skip(NativeContext *ctx)
+            {
+                Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 1 ? ctx->thisObj->cells[0].o : nullptr;
+                if (!in || in->cellCount < 3)
+                {
+                    setLong(ctx, 0);
+                    return;
+                }
+                int64_t n = argLongL(ctx, 1);
+                int32_t avail = in->cells[2].i - in->cells[1].i;
+                int64_t k = (n > avail) ? avail : n;
+                if (k < 0)
+                    k = 0;
+                in->cells[1] = Value::fromInt(in->cells[1].i + static_cast<int32_t>(k));
+                setLong(ctx, k);
+            }
             static void di_skipBytes(NativeContext *ctx)
             {
                 Obj *in = ctx->thisObj && ctx->thisObj->cellCount >= 1 ? ctx->thisObj->cells[0].o : nullptr;
@@ -739,6 +769,8 @@ static void native_TimerTask_init(NativeContext *ctx)
                 regN("java/io/DataInputStream.readUTF:()Ljava/lang/String;", di_readUTF);
                 regN("java/io/DataInputStream.close:()V", is_close);
                 regN("java/io/DataInputStream.skipBytes:(I)I", di_skipBytes);
+                regN("java/io/DataInputStream.skip:(J)J", di_skip);
+                regN("java/io/DataInputStream.available:()I", di_available);
                 regN("java/io/DataInputStream.mark:(I)V", dis_mark);
                 regN("java/io/DataInputStream.reset:()V", dis_reset);
                 regN("java/io/ByteArrayOutputStream.<init>:()V", baos_init);

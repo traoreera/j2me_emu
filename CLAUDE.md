@@ -884,3 +884,44 @@ image pour inspection visuelle), deux bugs réels trouvés dans `src/hal/font.cp
 - Outil de vérification (non versionné, scratchpad) : petit programme qui appelle `hal::font_glyph()` pour
   0x00-0xFF et dessine une planche PNG -- à refaire si la police est retouchée à nouveau.
 - Sortie **pixel-identique aux 50 jeux de test**, sauf `os2_retrosnake` (l'amélioration ci-dessus, attendue).
+
+## Session « 30 jeux Gameloft/tir culte » (27/09) — DataInputStream.skip(J)J manquant
+
+Jeux de test supplémentaires : `games/os3_*.jar` (30 JAR de titres commerciaux Gameloft/Ubisoft/EA/Glu, tous
+téléchargés depuis dedomil.net -- licences non précisées, usage de test local uniquement, dossier `games/`
+non versionné). Assassin's Creed : les 4 titres Gameloft J2ME existants sont déjà dans le dépôt (II, Brotherhood,
+III, Revelations) ; les autres résultats de recherche pour « Assassin's Creed » (Unity, Identity, Altaïr's
+Chronicles HD) se sont révélés être des jeux Android/Symbian, pas J2ME (aucun lien JAR réel sur le site source,
+ou une image `.sisx` Symbian déguisée en `.jar`). Mission Impossible : un seul titre J2ME existe
+(`Mission Impossible III`, déjà `mission.jar`) — pas de « série » à compléter. Le reste du lot est du tir culte :
+Modern Combat 2/4, N.O.V.A. 3, Duke Nukem Mobile 3D, Doom RPG/Doom II RPG, Terminator Salvation/Revenge,
+Predator: The Duel, Alien vs Predator: Requiem, 4 Splinter Cell, 2 Brothers in Arms, 3 Rainbow Six, 3 Call of
+Duty, 2 Medal of Honor, James Bond: Casino Royale, Delta Force, Far Cry 2, Ghost Recon: Future Soldier, Metal
+Gear Acid, Resident Evil: Degeneration.
+
+- **`DataInputStream.skip(long)` et `.available()` n'étaient jamais enregistrés** (`midp_io.cpp`) :
+  `InputStream.skip(J)J`/`available()` existent bien (`is_skip`/`is_available`), mais `DataInputStream` est un
+  simple ENROBAGE (`cells[0]` = le flux réel) — appeler `skip`/`available` directement dessus (hérités
+  d'`InputStream`, jamais redéclarés dans la sous-classe côté API MIDP réelle, donc du bytecode Java légitime
+  les appelle sur l'instance `DataInputStream`) tombait sur le `[stub]` générique : no-op, renvoie toujours 0.
+  Pour `skip()`, ça désynchronise silencieusement la position de lecture — le flux ne saute PAS les octets que
+  l'appelant croit avoir sautés, donc les lectures suivantes tombent sur les mauvais octets. Trouvé sur
+  `games/os3_call_of_duty_4_modern_warfare.jar` : `Game_COD4.<init>` fait `skip()` sur une ressource avant un
+  `Image.createImage([BII)`, qui échouait alors sur des données mal alignées → **l'instanciation du MIDlet
+  échouait entièrement** (écran noir permanent). Corrigé (`di_skip`/`di_available`, même principe de délégation
+  vers le flux enrobé que `di_skipBytes` déjà existant) : COD4 démarre maintenant directement sur son menu
+  principal (Nouvelle partie/Meilleurs scores/Réglages/Instructions/À propos/Quitter). Effet de bord positif
+  sur `games/gangstar_rio_city_o_260851.jar` : atteint son logo Gameloft nettement plus tôt (même nombre de
+  trames) — son chargement de ressources utilisait aussi ce chemin et n'était plus artificiellement ralenti.
+- Test de fumée sur les 30 : tous produisent un rendu non-noir dès les premières trames. Menus/écrans déjà
+  pleinement affichés sans aucune correction : N.O.V.A. 3 (Quick Play/Story Mode/Options), Modern Combat 4
+  ("Press 5 to continue"), Duke Nukem Mobile 3D (écran de chargement), Rainbow Six: Raven Shield (titre),
+  Delta Force (artwork), Resident Evil: Degeneration (logo éditeur Glu), Assassin's... pardon, AVP-Requiem
+  (semble déjà en jeu/HUD). Le reste (Brothers in Arms x2, Call of Duty: Black Ops/World at War, James Bond,
+  Medal of Honor x2, Modern Combat 2, Predator, Rainbow Six Lockdown/Vegas, Splinter Cell x4, Terminator x2)
+  reste bloqué sur un écran noir/splash après les touches simulées génériques — pas creusé au-delà pour ce lot
+  (pas de nouveau bug systémique trouvé en dehors du `DataInputStream` ci-dessus ; probablement des écrans
+  d'accueil qui attendent une touche précise ou un temps de chargement plus long que les 400 trames testées).
+- Sortie **pixel-identique aux 50 jeux de test précédents** en fonctionnement isolé/série (les divergences vues
+  sous forte charge concurrente dans le script de comparaison étaient du bruit de contention machine, pas des
+  régressions — confirmé en rejouant chaque cas signalé seul).

@@ -653,7 +653,7 @@ namespace jvm
                      {{"<init>", "([B)V"}, {"<init>", "([BII)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"available", "()I"}, {"skip", "(J)J"}, {"close", "()V"}, {"markSupported", "()Z"}, {"mark", "(I)V"}, {"reset", "()V"}},
                      {{"data", "[B"}, {"pos", "I"}, {"limit", "I"}});
 regClass(rt, "java/io/DataInputStream", "java/lang/Object",
-                 {{"<init>", "(Ljava/io/InputStream;)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"readBoolean", "()Z"}, {"readByte", "()B"}, {"readUnsignedByte", "()I"}, {"readShort", "()S"}, {"readUnsignedShort", "()I"}, {"readChar", "()C"}, {"readInt", "()I"}, {"readLong", "()J"}, {"readFully", "([B)V"}, {"readFully", "([BII)V"}, {"readUTF", "()Ljava/lang/String;"}, {"skipBytes", "(I)I"}, {"available", "()I"}, {"close", "()V"}, {"mark", "(I)V"}, {"reset", "()V"}},
+                 {{"<init>", "(Ljava/io/InputStream;)V"}, {"read", "()I"}, {"read", "([B)I"}, {"read", "([BII)I"}, {"readBoolean", "()Z"}, {"readByte", "()B"}, {"readUnsignedByte", "()I"}, {"readShort", "()S"}, {"readUnsignedShort", "()I"}, {"readChar", "()C"}, {"readInt", "()I"}, {"readLong", "()J"}, {"readFully", "([B)V"}, {"readFully", "([BII)V"}, {"readUTF", "()Ljava/lang/String;"}, {"skipBytes", "(I)I"}, {"skip", "(J)J"}, {"available", "()I"}, {"close", "()V"}, {"mark", "(I)V"}, {"reset", "()V"}},
                  {{"in", "Ljava/io/InputStream;"}, {"markpos", "I"}});
             regClass(rt, "java/io/OutputStream", "java/lang/Object",
                      {{"write", "(I)V"}, {"write", "([B)V"}, {"write", "([BII)V"}, {"flush", "()V"}, {"close", "()V"}},
